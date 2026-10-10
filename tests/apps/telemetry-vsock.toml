@@ -1,0 +1,18 @@
+[[task]]
+name = "supervisor"
+supervisor = true
+sends = ["telemetry"]
+
+[[task]]
+name = "crasher"
+
+[[task]]
+name = "uplink"
+program = "virtio-vsock"
+devices = ["virtio-vsock"]
+dma_pages = 32
+
+[[task]]
+name = "telemetry"
+events = true
+sends = ["uplink"]

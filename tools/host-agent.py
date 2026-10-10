@@ -7,6 +7,8 @@ Sources:
   host-agent.py -                          stdin (tests/run.sh output: the part after the
                                            "--- build/telemetry.log ---" marker is used)
   host-agent.py --socket build/tel.sock    a Unix socket (QEMU -chardev socket,...,server=on)
+  host-agent.py --listen-vsock 5000        accept the guest's vsock connection (CID 2, port 5000)
+  ... --save FILE                          also copy the raw stream to FILE as it arrives
 
 Checks (--check makes any failure the exit status):
   - every line is a JSON object with an "event"
@@ -25,12 +27,44 @@ from collections import Counter
 MARKER = "--- build/telemetry.log ---\n"
 
 
+def stream_lines(sock, save):
+    """Lines from a connected socket until the peer goes away, copied to `save` if given."""
+    out = open(save, "w", encoding="utf-8") if save else None
+    pending = b""
+    while True:
+        try:
+            data = sock.recv(65536)
+        except (ConnectionResetError, OSError):
+            data = b""
+        if not data:
+            break
+        if out:
+            out.write(data.decode("utf-8", "replace"))
+            out.flush()
+        pending += data
+        *lines, pending = pending.split(b"\n")
+        for line in lines:
+            yield line.decode("utf-8", "replace")
+    if pending:
+        yield pending.decode("utf-8", "replace")
+
+
 def lines_from(args):
+    if args.listen_vsock:
+        listener = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((socket.VMADDR_CID_ANY, args.listen_vsock))
+        listener.listen(1)
+        if args.save:
+            open(args.save, "w").close()  # truncate, and tell anyone waiting that we listen
+        conn, (cid, port) = listener.accept()
+        print(f"host-agent: guest CID {cid} connected from port {port}", file=sys.stderr)
+        yield from stream_lines(conn, args.save)
+        return
     if args.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(args.socket)
-        with sock.makefile("r", encoding="utf-8", errors="replace") as f:
-            yield from f
+        yield from stream_lines(sock, args.save)
         return
     text = sys.stdin.read() if args.source == "-" else open(args.source, encoding="utf-8", errors="replace").read()
     if MARKER in text:
@@ -42,6 +76,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", nargs="?", default="build/telemetry.log")
     p.add_argument("--socket")
+    p.add_argument("--listen-vsock", type=int, metavar="PORT")
+    p.add_argument("--save", metavar="FILE")
     p.add_argument("--check", action="store_true")
     p.add_argument("--quiet", action="store_true", help="only the summary, not each event")
     p.add_argument("--expect-heartbeats", type=int, default=0)
@@ -54,6 +90,7 @@ def main():
     last_seq = 0
     dropped_reported = 0
     gap_total = 0
+    unexplained = 0
     last_heartbeat = None
     worst_interval = 0
 
@@ -78,9 +115,10 @@ def main():
             if seq <= last_seq:
                 problems.append(f"line {n}: sequence went backwards ({last_seq} -> {seq})")
             gap_total += seq - last_seq - 1
-            if gap_total > dropped_reported:
-                problems.append(f"line {n}: {gap_total - dropped_reported} events missing without a dropped record")
-                dropped_reported = gap_total  # report each shortfall once
+            if gap_total > dropped_reported + unexplained:
+                missing = gap_total - dropped_reported - unexplained
+                problems.append(f"line {n}: {missing} events missing without a dropped record")
+                unexplained += missing
             last_seq = seq
         if event == "heartbeat":
             t = record["t"]

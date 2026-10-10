@@ -23,6 +23,7 @@ struct Out {
     buf: [u8; 4096],
     len: usize,
     console: u64,
+    link_name: &'static str,
 }
 
 impl Out {
@@ -37,7 +38,7 @@ impl Out {
                 Err(e) if console::is_dead(e) => {
                     let old = self.console;
                     self.console = loop {
-                        match lookup("virtio-console") {
+                        match lookup(self.link_name) {
                             Ok(id) if id != old => break id,
                             _ => sleep(1),
                         }
@@ -185,8 +186,11 @@ fn heartbeat(out: &mut Out, n: u64) {
 }
 
 fn main() -> u64 {
-    let console = lookup("virtio-console").expect("no virtio-console task");
-    let mut out = Out { buf: [0; 4096], len: 0, console };
+    // The host link is the task named "uplink" (any driver with the console interface), or
+    // else the virtio console.
+    let console = lookup("uplink").or_else(|_| lookup("virtio-console")).expect("no uplink task");
+    let link_name = if lookup("uplink").is_ok() { "uplink" } else { "virtio-console" };
+    let mut out = Out { buf: [0; 4096], len: 0, console, link_name };
     let mut msg = [0u8; 512];
     let mut next_heartbeat = uptime() + HEARTBEAT_TICKS;
     let mut heartbeats = 0;

@@ -10,18 +10,26 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
 QEMU           := qemu-system-x86_64
+, := ,
 ACCEL          := tcg
+# Telemetry uplink: "console" (virtio console -> build/telemetry.log) or "vsock" (vhost-vsock:
+# needs /dev/vhost-vsock, i.e. the kvm group; tools/host-agent.py --listen-vsock receives it).
+TRANSPORT      := console
 CPU_FLAGS      := $(if $(filter kvm,$(ACCEL)),-enable-kvm -cpu host,-cpu max)
-# The virtio console carries telemetry to the host (build/telemetry.log); COM1 stays the boot log.
+# The virtio console carries telemetry to the host (build/telemetry.log, or build/console.log when
+# vsock does); COM1 stays the boot log.
+CONSOLE_LOG    := $(if $(filter vsock,$(TRANSPORT)),build/console.log,build/telemetry.log)
+VSOCK_FLAGS    := $(if $(filter vsock,$(TRANSPORT)),-device vhost-vsock-pci$(,)guest-cid=3)
 QEMU_FLAGS     := -M q35 $(CPU_FLAGS) -m 128M -cdrom $(ISO) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
                   -device virtio-serial-pci,id=vser,disable-legacy=on \
-                  -chardev file,id=tel,path=build/telemetry.log -device virtconsole,chardev=tel,bus=vser.0
+                  -chardev file,id=tel,path=$(CONSOLE_LOG) -device virtconsole,chardev=tel,bus=vser.0 \
+                  $(VSOCK_FLAGS)
 
 USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(USER_FEATURES)")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
