@@ -91,10 +91,27 @@ pub fn start() -> ! {
     enter_user(rip, rsp)
 }
 
-/// Timer interrupt: charge the tick to the running process.
+/// Timer interrupt: charge the tick to the running process, then preempt it.
 pub fn tick(frame: &mut TrapFrame) {
     debug_assert!(frame.from_user(), "timer tick in kernel mode");
-    TABLE.lock().current().ticks += 1;
+    let mut table = TABLE.lock();
+    table.current().ticks += 1;
+    preempt(&mut table, frame);
+}
+
+/// `sched_yield()`: give up the rest of this time slice.
+pub fn yield_now(frame: &mut TrapFrame) {
+    frame.rax = 0;
+    preempt(&mut TABLE.lock(), frame);
+}
+
+/// Save the running process's registers, put it back in the ready queue, and resume the next
+/// ready process (which is the same one if nothing else is ready).
+fn preempt(table: &mut Table, frame: &mut TrapFrame) {
+    let p = table.current();
+    p.context = *frame;
+    p.state = State::Ready;
+    switch_to_next(table, frame);
 }
 
 pub fn current_pid() -> u64 {
@@ -133,7 +150,9 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
         if let Some(p) = table.procs[i].as_mut().filter(|p| p.state == State::Ready) {
             p.state = State::Running;
             *frame = p.context;
-            p.space.activate();
+            if i != table.current {
+                p.space.activate(); // reloading CR3 flushes the TLB, so skip it when staying put
+            }
             table.current = i;
             return;
         }

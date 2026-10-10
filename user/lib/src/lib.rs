@@ -11,6 +11,7 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
 pub const SYS_WRITE: u64 = 1;
+pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
 
@@ -31,6 +32,10 @@ pub fn write(bytes: &[u8]) -> u64 {
 
 pub fn getpid() -> u64 {
     syscall2(SYS_GETPID, 0, 0)
+}
+
+pub fn yield_now() {
+    syscall2(SYS_SCHED_YIELD, 0, 0);
 }
 
 pub fn exit(code: u64) -> ! {

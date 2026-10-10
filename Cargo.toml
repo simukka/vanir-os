@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "user/lib", "user/hello", "user/spinner"]
+members = ["kernel", "user/lib", "user/hello", "user/spinner", "user/isolation"]
 
 [profile.dev]
 panic = "abort"

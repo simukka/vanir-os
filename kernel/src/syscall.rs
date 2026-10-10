@@ -5,6 +5,7 @@ use crate::{process, serial};
 use crate::usercopy::{self, copy_from_user};
 
 pub const SYS_WRITE: u64 = 1;
+pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
 
@@ -15,7 +16,8 @@ pub fn dispatch(frame: &mut TrapFrame) {
     match frame.rax {
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi),
         SYS_GETPID => frame.rax = process::current_pid(),
-        // May switch processes: `frame` then holds the next process's registers.
+        // These switch processes: `frame` then holds the next process's registers.
+        SYS_SCHED_YIELD => process::yield_now(frame),
         SYS_EXIT => process::exit(frame, frame.rdi),
         _ => frame.rax = ERROR,
     }

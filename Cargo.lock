@@ -28,6 +28,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "isolation"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
 name = "limine"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
