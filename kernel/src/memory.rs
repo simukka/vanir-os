@@ -189,6 +189,24 @@ pub fn copy_between(from: &AddressSpace, src: u64, to: &AddressSpace, dst: u64, 
     Ok(())
 }
 
+/// Copy kernel bytes to user address `dst` in `to`, through the direct map. All or nothing.
+pub fn copy_to_user_space(to: &AddressSpace, dst: u64, src: &[u8]) -> Result<(), BadAddress> {
+    let len = src.len() as u64;
+    if !to.check_range(dst, len, true) {
+        return Err(BadAddress);
+    }
+    let mut done = 0;
+    while done < len {
+        let d = dst + done;
+        let chunk = (len - done).min(PAGE_SIZE - (d & (PAGE_SIZE - 1)));
+        let phys = to.translate(d, true).unwrap();
+        let bytes = &src[done as usize..(done + chunk) as usize];
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys_to_virt(phys), bytes.len()) };
+        done += chunk;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct BadAddress;
 

@@ -14,6 +14,7 @@
 
 use core::arch::asm;
 use core::fmt;
+use core::mem::size_of;
 use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
@@ -27,7 +28,6 @@ pub struct Task {
     /// CPU budget in timer ticks; 0 = unlimited. A process that uses it up is killed.
     pub budget_ticks: u64,
     /// Told when other tasks die, and may restart them.
-    #[allow(dead_code)] // used by the supervisor syscalls
     pub supervisor: bool,
     /// Indices of the tasks this one may send IPC messages to.
     pub sends: &'static [usize],
@@ -74,6 +74,32 @@ impl State {
     }
 }
 
+/// How a process ended, as reported to the supervisor (`DeathRecord`).
+#[derive(Clone, Copy, Default)]
+struct Death {
+    rip: u64,
+    cr2: u64,
+    error_code: u64,
+    /// Not yet delivered to the supervisor.
+    unreported: bool,
+}
+
+/// What the supervisor's `recv` gets when a task dies: sender 0, op `NOTIFY_DEATH`.
+#[repr(C)]
+struct DeathRecord {
+    id: u64,
+    /// 1 exited, 2 faulted, 3 over CPU budget.
+    kind: u64,
+    /// Exit code, or the fault's vector.
+    code: u64,
+    rip: u64,
+    cr2: u64,
+    error_code: u64,
+    ticks: u64,
+}
+
+pub const NOTIFY_DEATH: u64 = 1;
+
 struct Process {
     /// Index in the task table and the process table.
     slot: usize,
@@ -86,6 +112,7 @@ struct Process {
     context: TrapFrame,
     state: State,
     ticks: u64,
+    death: Death,
 }
 
 impl Process {
@@ -123,6 +150,7 @@ struct Table {
     current: usize,
     /// Frames in use before any task was loaded; every task's memory is freed when it ends.
     baseline_frames: u64,
+    supervisor: Option<usize>,
 }
 
 impl Table {
@@ -150,24 +178,19 @@ impl Table {
 }
 
 static TABLE: Mutex<Table> =
-    Mutex::new(Table { procs: [const { None }; MAX_PROCESSES], current: 0, baseline_frames: 0 });
+    Mutex::new(Table { procs: [const { None }; MAX_PROCESSES], current: 0, baseline_frames: 0, supervisor: None });
 
 /// Load every task, then enter the first one. Never returns.
 pub fn start() -> ! {
     assert!(!TASKS.is_empty() && TASKS.len() <= MAX_PROCESSES, "need 1..={MAX_PROCESSES} tasks");
     let mut table = TABLE.lock();
     table.baseline_frames = memory::frames_in_use();
+    table.supervisor = TASKS.iter().position(|t| t.supervisor);
     for (slot, task) in TASKS.iter().enumerate() {
-        let space = AddressSpace::new();
-        let entry = elf::load(task.image, &space)
-            .unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
-        for page in 1..=USER_STACK_PAGES {
-            space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
-        }
-        let context = initial_context(entry, USER_STACK_TOP);
+        let (space, context) = load(task);
         let space = Some(space);
-        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0 };
-        println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), entry);
+        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0, death: Death::default() };
+        println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), p.context.rip);
         table.procs[slot] = Some(p);
     }
 
@@ -179,6 +202,16 @@ pub fn start() -> ! {
     drop(table);
     println!("[kernel] entering ring 3");
     enter_user(rip, rsp)
+}
+
+/// A fresh address space with `task` loaded and its stack mapped, and its starting registers.
+fn load(task: &Task) -> (AddressSpace, TrapFrame) {
+    let space = AddressSpace::new();
+    let entry = elf::load(task.image, &space).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
+    for page in 1..=USER_STACK_PAGES {
+        space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
+    }
+    (space, initial_context(entry, USER_STACK_TOP))
 }
 
 /// Timer interrupt: charge the tick to the running process, then preempt it, or kill it if it
@@ -219,14 +252,26 @@ pub fn kill(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     let p = table.current();
     println!("[kernel] {} killed by vector {}", p.describe(), frame.vector);
+    let cr2 = if frame.vector == 14 { x86_64::registers::control::Cr2::read_raw() } else { 0 };
+    p.death = Death { rip: frame.rip, cr2, error_code: frame.error_code, unreported: false };
     end_current(&mut table, frame, State::Faulted(frame.vector));
 }
 
-/// The current process has ended: free its memory, fail every IPC waiting on it with DEAD, and
-/// resume the next process.
+/// The current process has ended: free its memory, fail every IPC waiting on it with DEAD, tell
+/// the supervisor, and resume the next process.
 fn end_current(table: &mut Table, frame: &mut TrapFrame, outcome: State) {
     let dead = table.current;
+    if table.supervisor == Some(dead) {
+        // The supervisor is trusted to keep the system running; without it nothing can.
+        println!("[kernel] the supervisor died; stopping");
+        crate::halt(3);
+    }
+    let has_supervisor = table.supervisor.is_some();
     let p = table.current();
+    if !matches!(outcome, State::Faulted(_)) {
+        p.death = Death::default();
+    }
+    p.death.unreported = has_supervisor;
     p.state = outcome;
     p.space = None;
     for p in table.procs.iter_mut().flatten() {
@@ -236,7 +281,56 @@ fn end_current(table: &mut Table, frame: &mut TrapFrame, outcome: State) {
             p.state = State::Ready;
         }
     }
+    if let Some(sup) = table.supervisor
+        && table.get(sup).state == State::RecvBlocked
+    {
+        let (buf, cap) = (table.get(sup).context.rdi, table.get(sup).context.rsi);
+        let mut regs = table.get(sup).context;
+        if report_death(table, sup, buf, cap, &mut regs) {
+            let sup = table.get(sup);
+            sup.context = regs;
+            sup.state = State::Ready;
+        }
+    }
     switch_to_next(table, frame);
+}
+
+/// If a death is waiting to be reported, write its record to the supervisor's buffer and set
+/// `regs` to the `recv` results (sender 0, op NOTIFY_DEATH). Returns whether one was reported.
+fn report_death(table: &mut Table, sup: usize, buf: u64, cap: u64, regs: &mut TrapFrame) -> bool {
+    let Some(dead) = table.procs.iter().flatten().position(|p| p.death.unreported) else { return false };
+    let p = table.get(dead);
+    let (kind, code) = match p.state {
+        State::Exited(code) => (1, code),
+        State::Faulted(vector) => (2, vector),
+        State::OverBudget => (3, 0),
+        _ => unreachable!("only dead processes have deaths to report"),
+    };
+    let record = DeathRecord {
+        id: p.id(),
+        kind,
+        code,
+        rip: p.death.rip,
+        cr2: p.death.cr2,
+        error_code: p.death.error_code,
+        ticks: p.ticks,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(&record as *const DeathRecord as *const u8, size_of::<DeathRecord>())
+    };
+    if cap < bytes.len() as u64 {
+        regs.rax = err::TOO_LONG;
+        return true;
+    }
+    if memory::copy_to_user_space(table.get(sup).space(), buf, bytes).is_err() {
+        regs.rax = err::BAD_BUFFER;
+        return true;
+    }
+    table.get(dead).death.unreported = false;
+    regs.rax = 0;
+    regs.rdx = NOTIFY_DEATH;
+    regs.rsi = bytes.len() as u64;
+    true
 }
 
 /// Save the running process's registers, give it `state` (Ready to preempt it, or a blocked
@@ -348,6 +442,11 @@ pub fn recv(frame: &mut TrapFrame) {
         return;
     }
 
+    // The supervisor hears about deaths before ordinary messages.
+    if table.supervisor == Some(me) && report_death(&mut table, me, buf, cap, frame) {
+        return;
+    }
+
     for step in 1..=MAX_PROCESSES {
         let from = (me + step) % MAX_PROCESSES;
         let Some(sender) = table.procs[from].as_mut() else { continue };
@@ -427,6 +526,59 @@ pub fn lookup(frame: &mut TrapFrame) {
     frame.rax = found.map_or(err::BAD_TARGET, |p| p.id());
 }
 
+// ---- Supervisor ------------------------------------------------------------------------------
+
+/// `restart(id) -> new id`: reload a dead task from its ELF into fresh memory, with zeroed
+/// registers and a new generation. Supervisor only.
+pub fn restart(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if table.supervisor != Some(table.current) {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let id = frame.rdi;
+    let Some(slot) = table.slot_of(id) else {
+        frame.rax = err::BAD_TARGET;
+        return;
+    };
+    let p = table.get(slot);
+    if p.id() != id || !p.state.is_dead() {
+        frame.rax = err::BAD_ARGUMENT; // already restarted, or still alive
+        return;
+    }
+    let (space, context) = load(p.task);
+    p.space = Some(space);
+    p.context = context;
+    p.generation += 1;
+    p.state = State::Ready;
+    p.ticks = 0;
+    p.death = Death::default();
+    frame.rax = p.id();
+}
+
+/// `task_state(id) -> (state, current id)`: 0 running or ready, 1 blocked in IPC, 2 exited,
+/// 3 faulted, 4 over budget. Supervisor only.
+pub fn task_state(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if table.supervisor != Some(table.current) {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let Some(slot) = table.slot_of(frame.rdi) else {
+        frame.rax = err::BAD_TARGET;
+        return;
+    };
+    let p = table.get(slot);
+    frame.rax = match p.state {
+        State::Ready | State::Running => 0,
+        State::SendBlocked(_) | State::ReplyBlocked(_) | State::RecvBlocked => 1,
+        State::Exited(_) => 2,
+        State::Faulted(_) => 3,
+        State::OverBudget => 4,
+    };
+    frame.rdx = p.id();
+}
+
 // ---- The end ---------------------------------------------------------------------------------
 
 /// Nothing can run. If a process is still waiting on a send or a reply, nothing can ever wake
@@ -465,13 +617,15 @@ fn finish(table: &Table) -> ! {
         println!("[kernel] deadlock: processes are waiting on each other");
     }
     // Tasks still waiting in recv hold their memory; only check for leaks when all have ended.
+    let in_use = memory::frames_in_use();
     if table.procs.iter().flatten().all(|p| p.state.is_dead()) {
-        let in_use = memory::frames_in_use();
         if in_use == table.baseline_frames {
             println!("[kernel] frames in use: {} (all task memory freed)", in_use);
         } else {
             println!("[kernel] frames in use: {} (LEAK: {} before tasks)", in_use, table.baseline_frames);
         }
+    } else {
+        println!("[kernel] frames in use: {} ({} before tasks)", in_use, table.baseline_frames);
     }
     crate::halt(status)
 }

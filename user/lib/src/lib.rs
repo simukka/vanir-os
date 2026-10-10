@@ -17,6 +17,8 @@ pub const SYS_EXIT: u64 = 60;
 pub const SYS_SEND: u64 = 100;
 pub const SYS_RECV: u64 = 101;
 pub const SYS_REPLY: u64 = 102;
+pub const SYS_RESTART: u64 = 103;
+pub const SYS_TASK_STATE: u64 = 104;
 pub const SYS_LOOKUP: u64 = 105;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
@@ -104,6 +106,45 @@ pub fn reply(sender: u64, code: u64, data: &[u8]) -> Result<(), u64> {
     if status == 0 { Ok(()) } else { Err(status) }
 }
 
+/// Operation of a kernel notification (sender 0) telling the supervisor a task died; the message
+/// is a `DeathRecord`.
+pub const NOTIFY_DEATH: u64 = 1;
+
+/// How a task ended, as the kernel reports it to the supervisor.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeathRecord {
+    pub id: u64,
+    /// 1 exited, 2 faulted, 3 over CPU budget.
+    pub kind: u64,
+    /// Exit code, or the fault's vector.
+    pub code: u64,
+    pub rip: u64,
+    pub cr2: u64,
+    pub error_code: u64,
+    pub ticks: u64,
+}
+
+impl DeathRecord {
+    pub fn from_bytes(bytes: &[u8]) -> Option<DeathRecord> {
+        (bytes.len() == core::mem::size_of::<DeathRecord>())
+            .then(|| unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DeathRecord) })
+    }
+}
+
+/// Supervisor only: reload a dead task into fresh memory. Returns its new id.
+pub fn restart(id: u64) -> Result<u64, u64> {
+    let (new_id, _, _) = syscall6(SYS_RESTART, [id, 0, 0, 0, 0, 0]);
+    if err::is_error(new_id) { Err(new_id) } else { Ok(new_id) }
+}
+
+/// Supervisor only: (state, current id). State: 0 running/ready, 1 blocked in IPC, 2 exited,
+/// 3 faulted, 4 over budget.
+pub fn task_state(id: u64) -> Result<(u64, u64), u64> {
+    let (state, current, _) = syscall6(SYS_TASK_STATE, [id, 0, 0, 0, 0, 0]);
+    if err::is_error(state) { Err(state) } else { Ok((state, current)) }
+}
+
 /// The id of the task called `name` in the app manifest.
 pub fn lookup(name: &str) -> Result<u64, u64> {
     let (id, _, _) = syscall6(SYS_LOOKUP, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]);
@@ -158,7 +199,7 @@ impl Write for Stdout {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => { let _ = core::fmt::Write::write_fmt(&mut $crate::Stdout, format_args!($($arg)*)); };
+    ($($arg:tt)*) => {{ let _ = core::fmt::Write::write_fmt(&mut $crate::Stdout, format_args!($($arg)*)); }};
 }
 
 #[macro_export]

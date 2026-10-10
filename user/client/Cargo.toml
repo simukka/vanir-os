@@ -18,3 +18,5 @@ bad-buffer = []
 not-allowed = []
 # ask echo to fault while we wait for the reply: DEAD
 crash-server = []
+# kill echo, let the supervisor restart it, then send to its old id: DEAD; new id: ok
+stale-id = []

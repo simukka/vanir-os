@@ -30,6 +30,9 @@ CASES=(
   "ipc-not-allowed | echo-client-spinner | client/not-allowed  |               | 1 | re:task not in .sends.: NOT_ALLOWED"
   "ipc-server-dies | echo-client         | client/crash-server |               | 5 | re:echo\) killed by vector 14[\s\S]*waited: DEAD\n[\s\S]*again: DEAD"
   "ipc-deadlock    | deadlock            |                     |               | 9 | deadlock: processes are waiting on each other"
+  "supervisor-restart | supervised-crasher | | | 5 | re:restarted task 2 \(restart 3,[\s\S]*giving up on task 2 after 3 restarts[\s\S]*spinner\) exited with code 0"
+  "restart-no-leak | supervised-crasher-only | supervisor/restart-3000 | | 5 | re:restarted task 2 \(restart 3000,[\s\S]*giving up on task 2 after 3000 restarts"
+  "stale-id        | supervised-echo     | client/stale-id     |               | 1 | re:send to the old id: DEAD\n[\s\S]*send to the new id: ok"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }

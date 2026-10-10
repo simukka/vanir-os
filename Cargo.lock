@@ -28,6 +28,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
+name = "crasher"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
 name = "deadlock"
 version = "0.1.0"
 dependencies = [
@@ -172,6 +179,13 @@ dependencies = [
 
 [[package]]
 name = "spinner"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
+name = "supervisor"
 version = "0.1.0"
 dependencies = [
  "vanir-user",

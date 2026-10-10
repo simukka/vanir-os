@@ -57,6 +57,28 @@ fn main() -> u64 {
         return if again == Err(err::DEAD) { 0 } else { 1 };
     }
 
+    #[cfg(feature = "stale-id")]
+    {
+        // Kill echo, wait for the supervisor to restart it, then try the id from before.
+        let old = echo;
+        let result = send(old, OP_CRASH, b"", &mut []);
+        println!("client: echo died: {}", name(result.err().unwrap_or(0)));
+        let new = loop {
+            match lookup("echo") {
+                Ok(id) if id != old => break id,
+                _ => vanir_user::yield_now(),
+            }
+        };
+        println!("client: echo is back with id {:#x} (was {:#x})", new, old);
+        let stale = send(old, OP_ECHO, b"hi", &mut [0u8; 2]);
+        println!("client: send to the old id: {}", name(stale.err().unwrap_or(0)));
+        let mut reply = [0u8; 2];
+        let fresh = send(new, OP_ECHO, b"hi", &mut reply);
+        let fresh_ok = fresh == Ok((0, 2)) && &reply == b"hi";
+        println!("client: send to the new id: {}", if fresh_ok { "ok" } else { "FAILED" });
+        return if stale == Err(err::DEAD) && fresh_ok { 0 } else { 1 };
+    }
+
     #[allow(unreachable_code)]
     {
         let mut msg = [0u8; 256];

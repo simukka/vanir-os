@@ -1,0 +1,6 @@
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "crasher"

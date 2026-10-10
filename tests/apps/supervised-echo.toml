@@ -1,0 +1,10 @@
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "echo"
+
+[[task]]
+name = "client"
+sends = ["echo"]
