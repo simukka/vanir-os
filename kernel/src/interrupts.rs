@@ -281,7 +281,12 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         v if v == SYSCALL_VECTOR as u64 => return syscall::dispatch(frame),
         v if v == apic::TIMER_VECTOR as u64 => {
             apic::eoi();
-            return process::tick(frame);
+            apic::tick();
+            // In kernel mode this can only be the idle loop, which checks the clock itself.
+            if frame.from_user() {
+                process::tick(frame);
+            }
+            return;
         }
         // Spurious: from the masked PIC, or the APIC's own. Neither gets an EOI.
         v if v == apic::SPURIOUS_VECTOR as u64 || apic::PIC_VECTORS.contains(&v) => return,

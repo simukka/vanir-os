@@ -4,6 +4,7 @@
 //! it raises lands on a harmless vector instead of looking like a CPU exception.
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::Msr;
 
@@ -53,6 +54,20 @@ pub fn init() {
     write(LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
     write(INITIAL_COUNT, per_tick);
     println!("[kernel] APIC timer: {} Hz ({} counts per tick)", TICK_HZ, per_tick);
+}
+
+/// Timer interrupts since boot. Updated without locks, because the timer can also fire while the
+/// kernel is idle (halted inside the scheduler, holding the process table).
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a timer interrupt.
+pub fn tick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Timer ticks since boot (10 ms each).
+pub fn now() -> u64 {
+    TICKS.load(Ordering::Relaxed)
 }
 
 /// Acknowledge the current interrupt. Not sent for spurious interrupts.

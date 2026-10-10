@@ -16,6 +16,8 @@ pub const SYS_REPLY: u64 = 102;
 pub const SYS_RESTART: u64 = 103;
 pub const SYS_TASK_STATE: u64 = 104;
 pub const SYS_LOOKUP: u64 = 105;
+pub const SYS_SLEEP: u64 = 106;
+pub const SYS_UPTIME: u64 = 107;
 
 const ERROR: u64 = u64::MAX;
 
@@ -31,6 +33,8 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_RECV => process::recv(frame),
         SYS_REPLY => process::reply(frame),
         SYS_LOOKUP => process::lookup(frame),
+        SYS_SLEEP => process::sleep(frame),
+        SYS_UPTIME => process::uptime(frame),
         SYS_RESTART => process::restart(frame),
         SYS_TASK_STATE => process::task_state(frame),
         _ => frame.rax = ERROR,

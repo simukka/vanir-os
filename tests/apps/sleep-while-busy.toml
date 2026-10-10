@@ -1,0 +1,7 @@
+# The sleeper (task 2, 20 ticks) must wake on time while runaway keeps the CPU busy.
+[[task]]
+name = "runaway"
+budget = 60
+
+[[task]]
+name = "sleeper"

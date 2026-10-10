@@ -1,0 +1,7 @@
+[[task]]
+name = "sleeper-a"
+program = "sleeper"
+
+[[task]]
+name = "sleeper-b"
+program = "sleeper"

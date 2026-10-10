@@ -20,6 +20,8 @@ pub const SYS_REPLY: u64 = 102;
 pub const SYS_RESTART: u64 = 103;
 pub const SYS_TASK_STATE: u64 = 104;
 pub const SYS_LOOKUP: u64 = 105;
+pub const SYS_SLEEP: u64 = 106;
+pub const SYS_UPTIME: u64 = 107;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -168,6 +170,19 @@ pub fn task_index(id: u64) -> u64 {
 
 pub fn yield_now() {
     syscall2(SYS_SCHED_YIELD, 0, 0);
+}
+
+/// Timer ticks (10 ms each) per second.
+pub const TICK_HZ: u64 = 100;
+
+/// Wait at least `ticks` timer ticks. Uses no CPU while waiting.
+pub fn sleep(ticks: u64) {
+    syscall2(SYS_SLEEP, ticks, 0);
+}
+
+/// Timer ticks since boot.
+pub fn uptime() -> u64 {
+    syscall2(SYS_UPTIME, 0, 0)
 }
 
 pub fn exit(code: u64) -> ! {

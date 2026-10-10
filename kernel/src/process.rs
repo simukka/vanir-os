@@ -19,7 +19,7 @@ use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
-use crate::{elf, gdt};
+use crate::{apic, elf, gdt};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
@@ -63,6 +63,8 @@ enum State {
     ReplyBlocked(usize),
     /// In `recv`, waiting for a message.
     RecvBlocked,
+    /// In `sleep`, until the clock reaches this tick.
+    Sleeping(u64),
     Exited(u64),
     Faulted(u64),
     OverBudget,
@@ -217,8 +219,8 @@ fn load(task: &Task) -> (AddressSpace, TrapFrame) {
 /// Timer interrupt: charge the tick to the running process, then preempt it, or kill it if it
 /// has used up its CPU budget.
 pub fn tick(frame: &mut TrapFrame) {
-    debug_assert!(frame.from_user(), "timer tick in kernel mode");
     let mut table = TABLE.lock();
+    wake_sleepers(&mut table);
     let p = table.current();
     p.ticks += 1;
     let budget = p.task.budget_ticks;
@@ -227,6 +229,29 @@ pub fn tick(frame: &mut TrapFrame) {
         return end_current(&mut table, frame, State::OverBudget);
     }
     block(&mut table, frame, State::Ready);
+}
+
+/// `sleep(ticks)`: wait at least that many timer ticks (10 ms each). 0 just yields.
+pub fn sleep(frame: &mut TrapFrame) {
+    let ticks = frame.rdi;
+    frame.rax = 0;
+    let state = if ticks == 0 { State::Ready } else { State::Sleeping(apic::now() + ticks) };
+    block(&mut TABLE.lock(), frame, state);
+}
+
+/// `uptime() -> ticks` since boot.
+pub fn uptime(frame: &mut TrapFrame) {
+    frame.rax = apic::now();
+}
+
+/// Make every sleeper whose time has come ready.
+fn wake_sleepers(table: &mut Table) {
+    let now = apic::now();
+    for p in table.procs.iter_mut().flatten() {
+        if matches!(p.state, State::Sleeping(until) if until <= now) {
+            p.state = State::Ready;
+        }
+    }
 }
 
 /// `sched_yield()`: give up the rest of this time slice.
@@ -343,22 +368,36 @@ fn block(table: &mut Table, frame: &mut TrapFrame, state: State) {
 }
 
 /// Resume the next ready process (round-robin after the current one) by loading its saved
-/// registers into `frame` and its address space into CR3. With none ready, stop the machine.
+/// registers into `frame` and its address space into CR3. If none is ready but some are
+/// sleeping, idle until one wakes; if nothing can ever become ready, stop the machine.
 fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
-    for step in 1..=MAX_PROCESSES {
-        let i = (table.current + step) % MAX_PROCESSES;
-        if let Some(p) = table.procs[i].as_mut().filter(|p| p.state == State::Ready) {
-            p.state = State::Running;
-            *frame = p.context;
-            if i != table.current {
-                // Reloading CR3 flushes the TLB, so skip it when staying put.
-                p.space().activate();
+    loop {
+        wake_sleepers(table);
+        for step in 1..=MAX_PROCESSES {
+            let i = (table.current + step) % MAX_PROCESSES;
+            if let Some(p) = table.procs[i].as_mut().filter(|p| p.state == State::Ready) {
+                p.state = State::Running;
+                *frame = p.context;
+                if i != table.current {
+                    // Reloading CR3 flushes the TLB, so skip it when staying put.
+                    p.space().activate();
+                }
+                table.current = i;
+                return;
             }
-            table.current = i;
-            return;
         }
+        if !table.procs.iter().flatten().any(|p| matches!(p.state, State::Sleeping(_))) {
+            finish(table)
+        }
+        idle();
     }
-    finish(table)
+}
+
+/// Halt until the next interrupt. We hold the process table, which is safe because interrupts
+/// taken in kernel mode never touch it: the timer only advances the clock. `sti; hlt` is one
+/// step (the CPU takes no interrupt between the two), so a tick can't slip in before the halt.
+fn idle() {
+    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
 // ---- IPC -------------------------------------------------------------------------------------
@@ -571,7 +610,7 @@ pub fn task_state(frame: &mut TrapFrame) {
     let p = table.get(slot);
     frame.rax = match p.state {
         State::Ready | State::Running => 0,
-        State::SendBlocked(_) | State::ReplyBlocked(_) | State::RecvBlocked => 1,
+        State::SendBlocked(_) | State::ReplyBlocked(_) | State::RecvBlocked | State::Sleeping(_) => 1,
         State::Exited(_) => 2,
         State::Faulted(_) => 3,
         State::OverBudget => 4,
@@ -609,7 +648,7 @@ fn finish(table: &Table) -> ! {
                 status = 4;
                 "DEADLOCKED in send"
             }
-            State::Ready | State::Running => unreachable!(),
+            State::Ready | State::Running | State::Sleeping(_) => unreachable!(),
         };
         println!("[kernel]   {}: {}, {} ticks", p.describe(), outcome, p.ticks);
     }

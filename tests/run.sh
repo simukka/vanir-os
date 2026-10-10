@@ -33,6 +33,8 @@ CASES=(
   "supervisor-restart | supervised-crasher | | | 5 | re:restarted task 2 \(restart 3,[\s\S]*giving up on task 2 after 3 restarts[\s\S]*spinner\) exited with code 0"
   "restart-no-leak | supervised-crasher-only | supervisor/restart-3000 | | 5 | re:restarted task 2 \(restart 3000,[\s\S]*giving up on task 2 after 3000 restarts"
   "stale-id        | supervised-echo     | client/stale-id     |               | 1 | re:send to the old id: DEAD\n[\s\S]*send to the new id: ok"
+  "sleep-idle      | two-sleepers        |                     |               | 1 | re:sleeper 1: woke after 1[0-3] ticks[\s\S]*sleeper 2: woke after 2[0-3] ticks[\s\S]*sleeper-a\): exited 0, [01] ticks\n[\s\S]*sleeper-b\): exited 0, [01] ticks"
+  "sleep-busy      | sleep-while-busy    |                     |               | 5 | re:sleeper 2: woke after 2[0-3] ticks[\s\S]*sleeper\) exited with code 0[\s\S]*runaway\) killed: CPU budget"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
