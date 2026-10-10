@@ -12,4 +12,5 @@ supervisor = true      # optional: this task is told when others die (at most on
 sends = ["echo"]       # optional: tasks this one may send IPC messages to
 ```
 
-Tasks get ids 1, 2, ... in manifest order.
+Tasks get ids 1, 2, ... in manifest order (programs can also find one with `lookup(name)`). The
+build fails on unknown keys, duplicate names, unknown `sends` targets, or more than one supervisor.
