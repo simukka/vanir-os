@@ -429,8 +429,12 @@ pub fn measurements(buf: &mut [u8]) -> Result<(usize, u64), u64> {
 
 /// Client side of the attestation task (`user/attest`).
 pub mod attest {
-    /// Message: a nonce (up to 32 bytes). Reply: one JSON line with the quote.
+    /// Message: a nonce (up to 32 bytes). Reply: one JSON line with the quote, which is over
+    /// SHA-256(nonce || the attest task's X25519 public key for this boot).
     pub const OP_QUOTE: u64 = 1;
+    /// Message: the host's X25519 public key (32 bytes) and the master key sealed to ours (48
+    /// bytes). The attest task opens it and unlocks the storage task. Reply code 0 on success.
+    pub const OP_UNWRAP: u64 = 2;
 }
 
 /// Client side of the telemetry task (`user/telemetry`).

@@ -1,6 +1,7 @@
-//! Block storage test client. Writes `BLOCKS` blocks with a pattern derived from the block number,
-//! flushes, reads them back and checks them; with `check-only`, just checks (a disk written by an
-//! earlier boot). Also checks a read past the end is refused. Talks to the task named "disk"
+//! Block storage test client. If its first block is still empty it writes `BLOCKS` blocks with
+//! a pattern derived from the block number and its task name, flushes, reads them back and checks
+//! them; if an earlier boot already wrote them, it only checks (so the same binary, hence the
+//! same measured boot, covers both boots of a persistence test). `check-only` always just checks. Also checks a read past the end is refused. Talks to the task named "disk"
 //! (the driver, or the storage task in later tests), riding out a restart of it.
 
 #![no_std]
@@ -60,9 +61,10 @@ fn main() -> u64 {
 
     #[allow(unreachable_code)]
     let mut disk = lookup("disk").expect("no disk task");
-    // The storage task may still be waiting for its key: give it 2 s.
+    // The storage task may still be waiting for its key (the host releases it after attesting
+    // the boot): give it 10 s.
     let mut capacity = with_disk(&mut disk, block::capacity);
-    for _ in 0..200 {
+    for _ in 0..1000 {
         if capacity != Err(CODE_LOCKED) {
             break;
         }
@@ -83,8 +85,16 @@ fn main() -> u64 {
     println!("blktest: {} blocks available", capacity);
 
     let mut want = [0u8; BLOCK_SIZE];
-    #[cfg(not(feature = "check-only"))]
-    {
+    let mut first = [0u8; BLOCK_SIZE];
+    let empty = match with_disk(&mut disk, |d| block::read(d, 0, &mut first)) {
+        Ok(()) => first.iter().all(|&b| b == 0),
+        Err(_) => false, // let the checks below report it
+    };
+    if cfg!(feature = "check-only") || !empty {
+        if !cfg!(feature = "check-only") {
+            println!("blktest: {} found data from an earlier boot; checking it", name);
+        }
+    } else {
         for b in 0..BLOCKS {
             pattern(seed, b, &mut want);
             if let Err(e) = with_disk(&mut disk, |d| block::write(d, b, &want)) {

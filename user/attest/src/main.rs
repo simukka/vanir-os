@@ -2,14 +2,25 @@
 //! attestation key, and reply with one JSON line the host can verify (tools/verify-quote.py):
 //! the signed TPMS_ATTEST, the ECDSA signature, the key, the PCR values, and the kernel's
 //! measurement log for PCR 12.
+//!
+//! Key release: at start the task makes an X25519 key pair from TPM randomness and quotes over
+//! SHA-256(nonce || public key), so a verifier knows the key belongs to the attested system. The
+//! host then seals the storage master key to it (X25519, HKDF-SHA256 salted with the nonce,
+//! ChaCha20-Poly1305); OP_UNWRAP opens it here and hands it to the storage task. The master key
+//! is never sent in the clear, and the private key never leaves this task.
 
 #![no_std]
 #![no_main]
 
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use core::fmt::{self, Write};
+use ed25519_compact::x25519;
+use hkdf::Hkdf;
+use sha2::{Digest, Sha256};
 use tpm2::{AttestationKey, Tpm};
-use vanir_user::attest::OP_QUOTE;
-use vanir_user::{err, measurements, println, recv, reply};
+use vanir_user::attest::{OP_QUOTE, OP_UNWRAP};
+use vanir_user::block::{self, code_name};
+use vanir_user::{err, lookup, measurements, println, recv, reply};
 
 vanir_user::entry!(main);
 
@@ -42,13 +53,24 @@ impl Write for Line {
     }
 }
 
-fn quote(tpm: &Tpm, key: &AttestationKey, log: &[u8], entries: usize, nonce: &[u8], out: &mut Line) -> Result<(), tpm2::Error> {
+fn quote(
+    tpm: &Tpm,
+    key: &AttestationKey,
+    kx_public: &[u8; 32],
+    log: &[u8],
+    entries: usize,
+    nonce: &[u8],
+    out: &mut Line,
+) -> Result<(), tpm2::Error> {
+    // Binding the key-exchange public key into the quote.
+    let qualifying: [u8; 32] = Sha256::new().chain_update(nonce).chain_update(kx_public).finalize().into();
     let mut buf = [0u8; tpm2::BUF];
-    let q = tpm.quote(&mut buf, key, nonce, &PCRS)?;
+    let q = tpm.quote(&mut buf, key, &qualifying, &PCRS)?;
     let _ = write!(
         out,
-        "{{\"event\":\"quote\",\"nonce\":\"{}\",\"attest\":\"{}\",\"sig_r\":\"{}\",\"sig_s\":\"{}\",\"ak_x\":\"{}\",\"ak_y\":\"{}\",\"pcrs\":{{",
+        "{{\"event\":\"quote\",\"nonce\":\"{}\",\"kx_pub\":\"{}\",\"attest\":\"{}\",\"sig_r\":\"{}\",\"sig_s\":\"{}\",\"ak_x\":\"{}\",\"ak_y\":\"{}\",\"pcrs\":{{",
         Hex(nonce),
+        Hex(kx_public),
         Hex(q.attest),
         Hex(q.r),
         Hex(q.s),
@@ -70,6 +92,33 @@ fn quote(tpm: &Tpm, key: &AttestationKey, log: &[u8], entries: usize, nonce: &[u
     Ok(())
 }
 
+/// Open the master key the host sealed to our key-exchange key (host public key, then
+/// ciphertext and tag) and give it to the storage task. Returns a reply code (0 = unlocked).
+fn unwrap_and_unlock(secret: &x25519::SecretKey, nonce: &[u8], sealed: &[u8]) -> u64 {
+    let Ok(host) = x25519::PublicKey::from_slice(&sealed[..32]) else { return 2 };
+    let Ok(shared) = host.dh(secret) else { return 2 };
+    let mut key = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(nonce), &*shared).expand(b"vanir key release", &mut key).unwrap();
+    let mut master: [u8; 32] = sealed[32..64].try_into().unwrap();
+    let tag = Tag::try_from(&sealed[64..80]).unwrap();
+    let opened = ChaCha20Poly1305::new(&key.into()).decrypt_inout_detached(&Nonce::default(), nonce, master.as_mut_slice().into(), &tag);
+    if opened.is_err() {
+        println!("attest: the sealed key does not open");
+        return 3;
+    }
+    let Ok(storage) = lookup("disk") else { return 4 };
+    match block::unlock(storage, &master) {
+        Ok(()) => {
+            println!("attest: storage unlocked with the released key");
+            0
+        }
+        Err(e) => {
+            println!("attest: unlock failed: {}", code_name(e));
+            5
+        }
+    }
+}
+
 fn main() -> u64 {
     let mut log = [0u8; 48 * 16];
     let (entries, base) = match measurements(&mut log) {
@@ -88,8 +137,18 @@ fn main() -> u64 {
         }
     };
     println!("attest: attestation key ready (P-256, x {}...)", Hex(&key.x[..8]));
+    let mut seed = [0u8; 32];
+    if let Err(e) = tpm.get_random(&mut seed) {
+        println!("attest: no randomness from the TPM: {:?}", e);
+        return 1;
+    }
+    let kx_secret = x25519::SecretKey::new(seed);
+    let kx_public: [u8; 32] = *kx_secret.recover_public_key().expect("valid scalar");
+    // The nonce of the last quote: key release is bound to it.
+    let mut last_nonce = [0u8; 32];
+    let mut last_nonce_len = None;
 
-    let mut msg = [0u8; 64];
+    let mut msg = [0u8; 128];
     loop {
         let m = match recv(&mut msg) {
             Ok(m) => m,
@@ -98,13 +157,23 @@ fn main() -> u64 {
                 continue;
             }
         };
+        if m.op == OP_UNWRAP {
+            let code = match last_nonce_len {
+                Some(n) if m.len == 80 => unwrap_and_unlock(&kx_secret, &last_nonce[..n], &msg[..80]),
+                _ => 1,
+            };
+            let _ = reply(m.sender, code, &[]);
+            continue;
+        }
         if m.op != OP_QUOTE || m.len > 32 {
             let _ = reply(m.sender, 1, &[]);
             continue;
         }
         let mut line = Line { buf: [0; 4096], len: 0 };
-        match quote(&tpm, &key, &log, entries, &msg[..m.len], &mut line) {
+        match quote(&tpm, &key, &kx_public, &log, entries, &msg[..m.len], &mut line) {
             Ok(()) => {
+                last_nonce[..m.len].copy_from_slice(&msg[..m.len]);
+                last_nonce_len = Some(m.len);
                 let _ = reply(m.sender, 0, &line.buf[..line.len]);
             }
             Err(e) => {

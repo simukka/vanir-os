@@ -10,7 +10,11 @@ Sources:
   host-agent.py --listen-vsock 5000        accept the guest's vsock connection (CID 2, port 5000)
   ... --save FILE                          also copy the raw stream to FILE as it arrives
   ... --attest                             once connected, challenge the guest with a fresh
-                                           nonce ("attest <hex>"); the challenge is logged
+                                           nonce ("attest <hex>"); the challenge is logged; then
+                                           tell it "bye"
+  ... --release-key KEY --reference REF    with --attest: if the quote verifies against REF,
+                                           seal the 32-byte master key KEY (made if missing) to
+                                           the guest and send it; log key_released/key_refused
 
 Checks (--check makes any failure the exit status):
   - every line is a JSON object with an "event"
@@ -22,10 +26,26 @@ Checks (--check makes any failure the exit status):
 """
 import argparse
 import json
+import os
 import secrets
 import socket
 import sys
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vanir_attest import check, compare, seal_key  # noqa: E402
+
+
+def master_key(path):
+    """The storage master key: 32 bytes in `path`, created (mode 0600) if it isn't there."""
+    if not os.path.exists(path):
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+            f.write(secrets.token_bytes(32))
+    with open(path, "rb") as f:
+        key = f.read()
+    if len(key) != 32:
+        sys.exit(f"{path}: need exactly 32 bytes")
+    return key
 
 MARKER = "--- build/telemetry.log ---\n"
 
@@ -62,15 +82,37 @@ def lines_from(args):
             open(args.save, "w").close()  # truncate, and tell anyone waiting that we listen
         conn, (cid, port) = listener.accept()
         print(f"host-agent: guest CID {cid} connected from port {port}", file=sys.stderr)
-        if args.attest:
-            nonce = secrets.token_hex(32)
-            challenge = json.dumps({"event": "challenge", "nonce": nonce})
+        if not args.attest:
+            yield from stream_lines(conn, args.save, append=True)
+            return
+
+        def note(record):
+            line = json.dumps(record)
             if args.save:
                 with open(args.save, "a", encoding="utf-8") as f:
-                    f.write(challenge + "\n")
-            yield challenge
-            conn.sendall(f"attest {nonce}\n".encode())
-        yield from stream_lines(conn, args.save, append=True)
+                    f.write(line + "\n")
+            return line
+
+        nonce = secrets.token_hex(32)
+        yield note({"event": "challenge", "nonce": nonce})
+        conn.sendall(f"attest {nonce}\n".encode())
+        for line in stream_lines(conn, args.save, append=True):
+            yield line
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            event = record.get("event")
+            if event == "quote" and args.release_key:
+                problems = check(record, nonce) + compare(record, json.load(open(args.reference)))
+                if problems:
+                    yield note({"event": "key_refused", "reasons": problems})
+                    conn.sendall(b"bye\n")
+                else:
+                    conn.sendall(f"key {seal_key(master_key(args.release_key), record['kx_pub'], nonce)}\n".encode())
+                    yield note({"event": "key_released"})
+            elif event == "quote" or (event in ("unlocked", "error") and args.release_key):
+                conn.sendall(b"bye\n")
         return
     if args.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -90,6 +132,8 @@ def main():
     p.add_argument("--listen-vsock", type=int, metavar="PORT")
     p.add_argument("--save", metavar="FILE")
     p.add_argument("--attest", action="store_true")
+    p.add_argument("--release-key", metavar="KEY")
+    p.add_argument("--reference", metavar="REF")
     p.add_argument("--check", action="store_true")
     p.add_argument("--quiet", action="store_true", help="only the summary, not each event")
     p.add_argument("--expect-heartbeats", type=int, default=0)

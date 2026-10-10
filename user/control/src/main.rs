@@ -1,13 +1,15 @@
 //! Commands from the control plane, read line by line from the uplink:
 //!
 //!   attest <nonce hex, up to 32 bytes>   -> the attestation task's JSON quote, sent back
+//!   key <hex: host X25519 key, sealed key> -> the attestation task opens it, unlocks storage
+//!   bye                                   -> end this task (the host is done with us)
 //!
 //! Replies go back over the uplink as JSON lines, next to the telemetry stream.
 
 #![no_std]
 #![no_main]
 
-use vanir_user::attest::OP_QUOTE;
+use vanir_user::attest::{OP_QUOTE, OP_UNWRAP};
 use vanir_user::{console, err, lookup, println, send};
 
 vanir_user::entry!(main);
@@ -20,31 +22,44 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
+/// Decode `hex` into `out`; returns the length, or None if it isn't hex or doesn't fit.
+fn unhex(hex: &[u8], out: &mut [u8]) -> Option<usize> {
+    let n = hex.len() / 2;
+    (hex.len() % 2 == 0 && n <= out.len()).then_some(())?;
+    for i in 0..n {
+        out[i] = hex_digit(hex[2 * i])? << 4 | hex_digit(hex[2 * i + 1])?;
+    }
+    Some(n)
+}
+
 /// Run one command line; returns the reply line to send to the host.
 fn handle<'a>(line: &[u8], attest: Option<u64>, out: &'a mut [u8; 4096]) -> &'a [u8] {
+    let error = |out: &'a mut [u8; 4096], msg: &[u8]| -> &'a [u8] {
+        out[..msg.len()].copy_from_slice(msg);
+        &out[..msg.len()]
+    };
+    if let Some(sealed_hex) = line.strip_prefix(b"key ") {
+        let mut sealed = [0u8; 80];
+        let Some(80) = unhex(sealed_hex, &mut sealed) else {
+            return error(out, b"{\"event\":\"error\",\"msg\":\"bad key message\"}\n");
+        };
+        let Some(attest) = attest else {
+            return error(out, b"{\"event\":\"error\",\"msg\":\"no attestation task\"}\n");
+        };
+        return match send(attest, OP_UNWRAP, &sealed, &mut []) {
+            Ok((0, _)) => error(out, b"{\"event\":\"unlocked\"}\n"),
+            _ => error(out, b"{\"event\":\"error\",\"msg\":\"unlock failed\"}\n"),
+        };
+    }
     let Some(nonce_hex) = line.strip_prefix(b"attest ") else {
         let msg = b"{\"event\":\"error\",\"msg\":\"unknown command\"}\n";
         out[..msg.len()].copy_from_slice(msg);
         return &out[..msg.len()];
     };
     let mut nonce = [0u8; 32];
-    let n = nonce_hex.len() / 2;
-    let valid = nonce_hex.len() % 2 == 0 && n <= 32 && (0..n).all(|i| {
-        match (hex_digit(nonce_hex[2 * i]), hex_digit(nonce_hex[2 * i + 1])) {
-            (Some(h), Some(l)) => {
-                nonce[i] = h << 4 | l;
-                true
-            }
-            _ => false,
-        }
-    });
-    let error = |out: &'a mut [u8; 4096], msg: &[u8]| -> &'a [u8] {
-        out[..msg.len()].copy_from_slice(msg);
-        &out[..msg.len()]
-    };
-    if !valid {
+    let Some(n) = unhex(nonce_hex, &mut nonce) else {
         return error(out, b"{\"event\":\"error\",\"msg\":\"bad nonce\"}\n");
-    }
+    };
     let Some(attest) = attest else {
         return error(out, b"{\"event\":\"error\",\"msg\":\"no attestation task\"}\n");
     };
@@ -57,7 +72,7 @@ fn handle<'a>(line: &[u8], attest: Option<u64>, out: &'a mut [u8; 4096]) -> &'a 
 fn main() -> u64 {
     let uplink = lookup("uplink").expect("no uplink task");
     let attest = lookup("attest").ok();
-    let mut line = [0u8; 256];
+    let mut line = [0u8; 512];
     let mut len = 0;
     loop {
         let mut chunk = [0u8; 256];
@@ -76,15 +91,17 @@ fn main() -> u64 {
                 }
                 continue;
             }
-            println!("control: command: {}", core::str::from_utf8(&line[..len]).unwrap_or("?"));
+            let shown = &line[..len.min(24)];
+            println!("control: command: {}...", core::str::from_utf8(shown).unwrap_or("?"));
+            if &line[..len] == b"bye" {
+                return 0;
+            }
             let mut out = [0u8; 4096];
             let reply = handle(&line[..len], attest, &mut out);
             if let Err(e) = console::write(uplink, reply) {
                 println!("control: reply failed: {}", err::name(e));
             }
             len = 0;
-            #[cfg(feature = "one-shot")]
-            return 0;
         }
     }
 }

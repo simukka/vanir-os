@@ -1,0 +1,32 @@
+# Storage unlocked by key release after attestation: the host sends the master key, sealed to
+# the attested attest task, which opens it and unlocks "disk".
+[[task]]
+name = "uplink"
+program = "virtio-vsock"
+devices = ["virtio-vsock"]
+dma_pages = 32
+
+[[task]]
+name = "attest"
+tpm = true
+sends = ["disk"]
+
+[[task]]
+name = "control"
+sends = ["uplink", "attest"]
+
+[[task]]
+name = "blockdev"
+program = "virtio-blk"
+devices = ["virtio-blk"]
+dma_pages = 16
+
+[[task]]
+name = "disk"
+program = "storage"
+sends = ["blockdev"]
+
+[[task]]
+name = "client-a"
+program = "blktest"
+sends = ["disk"]

@@ -10,7 +10,3 @@ bench = false
 
 [dependencies]
 vanir-user = { path = "../lib" }
-
-[features]
-# For tests: exit after answering one command.
-one-shot = []

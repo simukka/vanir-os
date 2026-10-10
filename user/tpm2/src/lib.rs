@@ -17,6 +17,7 @@ const CC_CREATE_PRIMARY: u32 = 0x131;
 const CC_QUOTE: u32 = 0x158;
 const CC_PCR_READ: u32 = 0x17e;
 const CC_FLUSH_CONTEXT: u32 = 0x165;
+const CC_GET_RANDOM: u32 = 0x17b;
 const RH_ENDORSEMENT: u32 = 0x4000_000b;
 const RS_PW: u32 = 0x4000_0009;
 const ALG_SHA256: u16 = 0x000b;
@@ -272,6 +273,18 @@ impl Tpm {
             return Err(Error::Malformed);
         }
         r.sized()?.try_into().map_err(|_| Error::Malformed)
+    }
+
+    /// Fill `out` (up to 32 bytes) from the TPM's random number generator.
+    pub fn get_random(&self, out: &mut [u8]) -> Result<(), Error> {
+        let mut buf = [0u8; BUF];
+        let mut r = self.call(&mut buf, ST_NO_SESSIONS, CC_GET_RANDOM, |w| w.u16(out.len() as u16))?;
+        let bytes = r.sized()?;
+        if bytes.len() != out.len() {
+            return Err(Error::Malformed);
+        }
+        out.copy_from_slice(bytes);
+        Ok(())
     }
 
     /// Free a transient object (the attestation key) inside the TPM.
