@@ -5,8 +5,9 @@
 #   1 = every process exited 0, 3 = some process exited non-zero, 5 = some process was killed,
 #   7 = kernel fault or panic.
 #
-# Expected text is a fixed string, or with an "re:" prefix a Perl regex matched against the
-# whole output (so [\s\S]* can span lines and check ordering).
+# Expected text is a fixed string; with an "re:" prefix, a Perl regex matched against the whole
+# output (so [\s\S]* can span lines and check ordering); with "cmd:", a shell command that gets
+# the output on stdin and must succeed.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -40,7 +41,8 @@ CASES=(
   "device-msix     | devprobe            | devprobe/poke-msix  |               | 5 | re:BAR 1 \(MSI-X\) visible to us: false[\s\S]*devprobe\) killed by vector 14"
   "dma-region      | dma                 |                     |               | 1 | re:start 0: 16 KiB at 0x2000000000, physical (0x[0-9a-f]+), all zero: true[\s\S]*restarted task 2[\s\S]*start 1: 16 KiB at 0x2000000000, physical \1, all zero: true[\s\S]*region ok after restart"
   "dma-none        | dma-none            |                     |               | 1 | dmatest: no DMA region: BAD_ARGUMENT"
-  "device-irq      | console             |                     |               | 1 | re:transmit true done, signalled by interrupt \(bits 0x1\)[\s\S]*--- build/telemetry.log ---\nhello host, from the virtio-console driver"
+  "console-write   | console             |                     |               | 1 | cmd:tools/check_lines.py 'line ' 200 | grep -q '(0 resent)'"
+  "console-restart | console-restart     | virtio-console/crash-after-50 | | 1 | cmd:out=\$(cat); tools/check_lines.py 'line ' 200 <<<\"\$out\" && grep -q 'driver restarted 1 times' <<<\"\$out\""
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
@@ -61,6 +63,9 @@ for case in "${CASES[@]}"; do
 
   if [[ "$want_text" == re:* ]]; then
     grep -Pzq -- "${want_text#re:}" <<<"$out"; text_ok=$?
+  elif [[ "$want_text" == cmd:* ]]; then
+    check_out=$(bash -c "${want_text#cmd:}" <<<"$out" 2>&1); text_ok=$?
+    [ "$text_ok" -eq 0 ] || echo "    check: $check_out"
   else
     grep -qF -- "$want_text" <<<"$out"; text_ok=$?
   fi

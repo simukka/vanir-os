@@ -11,3 +11,7 @@ bench = false
 [dependencies]
 vanir-user = { path = "../lib" }
 virtio = { path = "../virtio" }
+
+[features]
+# First start only: fault right after submitting the 50th write (a write is in flight).
+crash-after-50 = []

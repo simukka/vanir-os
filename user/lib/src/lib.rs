@@ -188,6 +188,36 @@ pub fn dma_info() -> Result<(u64, u64, u64), u64> {
     if err::is_error(addr) { Err(addr) } else { Ok((addr, phys, len)) }
 }
 
+/// Client side of the console driver's IPC interface (`user/virtio-console`).
+pub mod console {
+    use super::{err, send, yield_now};
+
+    /// Write the message's bytes to the host. Replied once the device has taken them.
+    pub const OP_WRITE: u64 = 1;
+    pub const CODE_OK: u64 = 0;
+    /// Every transmit slot is in flight; try again.
+    pub const CODE_BUSY: u64 = 1;
+    pub const CODE_BAD_OP: u64 = 2;
+
+    /// Send `bytes` (at most 4 KiB) to the host through the driver task `driver`, retrying while
+    /// it is busy. Fails with the kernel error (e.g. `err::DEAD` if the driver died) or the
+    /// driver's code.
+    pub fn write(driver: u64, bytes: &[u8]) -> Result<(), u64> {
+        loop {
+            match send(driver, OP_WRITE, bytes, &mut []) {
+                Ok((CODE_OK, _)) => return Ok(()),
+                Ok((CODE_BUSY, _)) => yield_now(),
+                Ok((code, _)) => return Err(code),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn is_dead(e: u64) -> bool {
+        e == err::DEAD
+    }
+}
+
 /// The id of the task called `name` in the app manifest.
 pub fn lookup(name: &str) -> Result<u64, u64> {
     let (id, _, _) = syscall6(SYS_LOOKUP, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]);
@@ -256,6 +286,11 @@ pub struct LineWriter {
 impl LineWriter {
     pub const fn new() -> LineWriter {
         LineWriter { buf: [0; 256], len: 0 }
+    }
+
+    /// What has been written so far (and not flushed).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
     }
 
     pub fn flush(&mut self) {

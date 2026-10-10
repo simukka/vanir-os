@@ -174,6 +174,11 @@ impl Transport {
         let (desc, desc_pa) = dma.alloc(16 * n, 16)?;
         let (avail, avail_pa) = dma.alloc(6 + 2 * n, 2)?;
         let (used, used_pa) = dma.alloc(6 + 8 * n, 4)?;
+        // The region is zeroed at (re)start, but a device still running from before the reset
+        // may have written into it since. Start the rings from a clean slate.
+        for (addr, len) in [(desc, 16 * n), (avail, 6 + 2 * n), (used, 6 + 8 * n)] {
+            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, len as usize) };
+        }
         mmio_write(self.common + QUEUE_DESC, desc_pa);
         mmio_write(self.common + QUEUE_DRIVER, avail_pa);
         mmio_write(self.common + QUEUE_DEVICE, used_pa);
