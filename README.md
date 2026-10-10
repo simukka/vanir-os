@@ -3,7 +3,8 @@
 A minimal x86-64 kernel in Rust, booted by [Limine](https://github.com/limine-bootloader/limine), that runs
 isolated ring-3 processes. It provides serial output, GDT/TSS, IDT, an ELF loader, a page-table tree
 per process, a 100 Hz local APIC timer with round-robin preemption, synchronous IPC between
-processes, a supervisor task that restarts failed ones, and `int 0x80` syscalls.
+processes, a supervisor task that restarts failed ones, unprivileged device-driver tasks (virtio
+console and vsock), and telemetry streamed to a host agent.
 
 ## Processes
 
@@ -48,6 +49,59 @@ do and may call `restart(id)`, which reloads the task's ELF into fresh memory wi
 generation. The policy lives in the supervisor, not the kernel. If the supervisor itself dies, the
 kernel halts.
 
+## Drivers
+
+Device drivers are ordinary tasks. The kernel discovers PCI devices at boot and a manifest grants
+one to a task (`devices = ["virtio-console"]`). The driver gets:
+
+- the device's register BARs mapped into its address space (uncached), except the BAR holding the
+  MSI-X table: the kernel programs interrupt routing itself;
+- read-only access to the device's PCI configuration space;
+- a physically contiguous DMA region (`dma_pages`), the same physical pages for the life of the
+  task slot and zeroed on every restart;
+- the device's interrupts as notifications in `recv` (sender 0, `NOTIFY_IRQ`). A driver with work
+  in flight passes `RECV_EXPECT_IRQ` so the kernel idles for it instead of ending the run.
+
+A crashing driver is restarted by the supervisor like any task; it resets the device and carries
+on, and its clients see `DEAD` and retry against the new id (`console-restart`).
+
+**Limit:** there is no IOMMU yet. A driver programs its device with physical addresses, so a
+malicious driver could make the device read or write any memory, kernel included. Driver tasks are
+isolated from mistakes (bad pointers, crashes, runaway loops), not from malice. QEMU can emulate
+Intel VT-d (`-device intel-iommu`) to close this later.
+
+## Telemetry
+
+The kernel logs events at its control points into a 128-entry ring: task start, exit, fault
+(vector, `rip`, `cr2`), CPU-budget kill, restart, refused IPC sends. The task with `events = true`
+(`user/telemetry`) forwards them as newline-delimited JSON through the uplink driver, with a
+heartbeat every second and any `log` lines other tasks send it (the supervisor reports its
+decisions):
+
+```json
+{"seq":5,"t":1,"task":"crasher","id":"2","event":"fault","vector":14,"rip":"0x400182","cr2":"0x10"}
+{"seq":6,"t":2,"task":"crasher","id":"2.1","event":"restart","previous":"2"}
+{"t":3,"event":"log","from":"supervisor","msg":"giving up on task 2 after 3 restarts"}
+{"t":5,"event":"dropped","count":37}
+{"t":102,"event":"heartbeat","n":1,"frames":89,"irqs":3,"events":11,"tasks":[{"task":"supervisor","id":"1","state":"blocked","ticks":2}]}
+```
+
+`t` is in 10 ms ticks since boot; ids are `slot` or `slot.generation`. Kernel events carry `seq`;
+if the ring wraps before telemetry reads it, a `dropped` record says how many were lost.
+
+The uplink is the virtio console by default (QEMU writes it to `build/telemetry.log`), or vsock
+with `TRANSPORT=vsock` and a manifest whose `uplink` task runs `virtio-vsock`. `tools/host-agent.py`
+reads either, checks it (valid JSON, sequence gaps all covered by `dropped`, heartbeat spacing) and
+summarises it:
+
+```sh
+tools/host-agent.py build/telemetry.log                         # console uplink
+tools/host-agent.py --listen-vsock 5000 &                       # vsock uplink: listen first,
+make run TRANSPORT=vsock ACCEL=kvm APP=tests/apps/telemetry-vsock.toml   # then boot
+```
+
+vsock needs `/dev/vhost-vsock` (the `kvm` group) and KVM.
+
 ## Syscalls
 
 Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
@@ -64,6 +118,18 @@ Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
 | `restart(id)` | 103 | supervisor only → new id |
 | `task_state(id)` | 104 | supervisor only → `(state, current id)` |
 | `lookup(name, len)` | 105 | → id of the task with that manifest name |
+| `sleep(ticks)` | 106 | uses no CPU while waiting |
+| `uptime()` | 107 | ticks (10 ms) since boot |
+| `task_name(id, buf, cap)` | 108 | → length of the task's manifest name |
+| `device_bar(device, bar)` | 110 | → `(address, size)` of a granted device's mapped BAR |
+| `pci_config_read(device, offset)` | 111 | read-only, granted devices only |
+| `dma_info()` | 112 | → `(address, physical address, length)` of the DMA region |
+| `read_events(buf, cap)` | 113 | event reader only → `(count, dropped)` |
+| `stats(buf, cap)` | 114 | event reader only: uptime, memory, interrupts, per-task state |
+
+`recv` flags (in `rdx`): `RECV_EXPECT_IRQ` (1), `RECV_TIMEOUT` (2, ticks in `r10`; then sender 0,
+`NOTIFY_TIMER`). Kernel notifications come as sender 0 with op `NOTIFY_DEATH` (1, supervisor),
+`NOTIFY_IRQ` (2, drivers) or `NOTIFY_TIMER` (3).
 
 ## Protections
 
@@ -83,6 +149,8 @@ Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
 | IPC `sends` allowlist | tasks talking to services they were not given | `ipc-not-allowed` |
 | Kernel-checked IPC copies | a bad buffer in a message crashing the kernel or the server | `ipc-bad-buffer` |
 | Restart generations in task ids | clients silently reaching a restarted server | `stale-id` |
+| Device grants; MSI-X table not mapped | drivers touching other devices or redirecting interrupts | `device-no-grant`, `device-msix` |
+| Per-slot DMA regions, zeroed on restart | a dead driver's device scribbling on reused memory | `dma-region` |
 | Frames freed on death | memory exhaustion from restart loops | `restart-no-leak` |
 
 ## System dependencies
@@ -117,6 +185,7 @@ make run                              # boot in QEMU, serial output on the termi
 make test                             # boot every scenario in tests/run.sh; prints PASS/FAIL each
 make test ACCEL=kvm                   # same, under KVM (needs access to /dev/kvm)
 make run APP=tests/apps/budget.toml   # choose the app manifest
+make run TRANSPORT=vsock ACCEL=kvm ... # add a vhost-vsock device (see Telemetry)
 make run USER_FEATURES=hello/poke-kernel   # turn on a test feature (see tests/run.sh)
 make run-debug                        # also log interrupts and CPU resets to qemu.log
 make clean                            # remove build outputs (make distclean also removes limine/)
@@ -145,7 +214,10 @@ kernel/src/interrupts.rs  IDT and the shared trap entry path
 kernel/src/memory.rs      frame allocator, per-process page tables, kernel MMIO mappings
 kernel/src/elf.rs         ELF loader (per-segment permissions, W^X)
 kernel/src/usercopy.rs    copy_from_user with page-fault recovery
-kernel/src/process.rs     task and process tables, scheduler, budgets, IPC, supervisor calls
+kernel/src/process.rs     task and process tables, scheduler, budgets, IPC, supervisor and device calls
+kernel/src/pci.rs         PCI discovery, BAR sizing, MSI-X setup (device kinds in pci_kinds.rs)
+kernel/src/irq.rs         device interrupts to task notifications
+kernel/src/events.rs      kernel event log
 kernel/src/syscall.rs     int 0x80 dispatch
 user/lib/                 shared user runtime: _start, syscall wrappers, println!
 user/hello/               greeting plus the attack tests (features)
@@ -157,8 +229,18 @@ user/client/              IPC client for echo (features for the error cases)
 user/deadlock/            two copies send to each other at once
 user/supervisor/          restarts failed tasks up to a limit
 user/crasher/             faults as soon as it starts
+user/sleeper/             checks sleep wakes on time
+user/devprobe/            checks device grants
+user/dmatest/             checks the DMA region across a restart
+user/virtio/              virtio 1.x PCI transport and split virtqueues for drivers
+user/virtio-console/      console driver (OP_WRITE); crash-after-50 test feature
+user/virtio-vsock/        vsock driver: one stream to host CID 2 port 5000
+user/chatter/             writes 200 numbered lines through the console driver
+user/telemetry/           event log + heartbeats -> JSON lines -> uplink
 apps/                     app manifests (the default image, and the format)
 tests/apps/               the manifests the tests boot
+tools/host-agent.py       receives and checks telemetry (file, stdin, Unix socket, vsock)
+tools/check_lines.py      checks numbered lines arrived in order
 user/linker.ld            user programs are ELF, linked at 0x400000
 tests/run.sh              boots each scenario and checks QEMU status and output
 ```
