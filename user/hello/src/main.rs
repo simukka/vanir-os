@@ -7,8 +7,42 @@ use vanir_user::{ERROR, write};
 
 vanir_user::entry!(main);
 
+fn print_banner() {
+    // An Oxide-inspired palette for a dark terminal.
+    const GREEN: &[u8] = b"\x1b[38;2;0;216;146m";
+    const MUTED: &[u8] = b"\x1b[38;2;100;110;115m";
+    const TEXT: &[u8] = b"\x1b[38;2;222;222;222m";
+    const RESET: &[u8] = b"\x1b[0m";
+
+    write(RESET);
+    write(b"\n");
+    write(GREEN);
+
+    write(
+        br"  \\\          ///    V A N I R
+   \\\        ///     OPERATING SYSTEM
+    \\\      ///
+     \\\    ///
+      \\\  ///
+       \\\///
+
+",
+    );
+
+    write(MUTED);
+    write(b"  ----------------------------------------------------\n");
+
+    write(GREEN);
+    write(b"  [ RING 3 ]  ");
+
+    write(TEXT);
+    write(b"hello from ring three\n\n");
+
+    write(RESET);
+}
+
 fn main() -> u64 {
-    write(b"hello from ring 3\n");
+    print_banner();
 
     #[cfg(feature = "bad-pointer")]
     {
