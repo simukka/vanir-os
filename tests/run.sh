@@ -18,6 +18,7 @@ CASES=(
   "exec-stack     | hello         | exec-stack   |               | 5 | error=0x15"
   "write-code     | hello         | write-code   |               | 5 | error=0x7"
   "smap           | hello         |              | smap-selftest | 7 | #PF page fault in kernel mode"
+  "timer-ticks    | spinner       |              |               | 1 | re:pid 1 \(spinner\): exited 0, [1-9][0-9]* ticks"
   "fault-isolated | hello spinner | poke-kernel  |               | 5 | re:hello\) killed by vector 14[\s\S]*spinner B 9\n[\s\S]*spinner\) exited with code 0"
 )
 

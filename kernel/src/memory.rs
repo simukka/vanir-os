@@ -24,6 +24,8 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -108,8 +110,17 @@ impl AddressSpace {
     }
 }
 
+/// Map one page of device registers into the kernel half: uncached, non-executable, kernel-only.
+/// Shared by every address space because the kernel half's lower-level tables are shared.
+pub fn map_kernel_mmio(virt: u64, phys: u64) {
+    let leaf = walk(unsafe { KERNEL_PML4 }, virt, PRESENT | WRITABLE);
+    assert!(*leaf & PRESENT == 0, "kernel page {virt:#x} already mapped");
+    let nx = if cpu::nx_enabled() { NO_EXECUTE } else { 0 };
+    *leaf = phys | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | nx;
+}
+
 /// Walk PML4 -> PDPT -> PD to the page-table entry for `virt`, creating missing tables with
-/// `table_flags` (OR-ed into existing entries too). Returns the leaf entry.
+/// `table_flags`. Returns the leaf entry.
 fn walk(pml4: u64, virt: u64, table_flags: u64) -> &'static mut u64 {
     let mut table_phys = pml4;
     for level in (1..=3).rev() {
@@ -122,7 +133,6 @@ fn walk(pml4: u64, virt: u64, table_flags: u64) -> &'static mut u64 {
             *entry = alloc_frame() | table_flags;
         }
         assert!(*entry & HUGE == 0, "huge page in the way at {virt:#x}");
-        *entry |= table_flags;
         table_phys = *entry & ADDR_MASK;
     }
     &mut table(table_phys)[((virt >> 12) & 0x1ff) as usize]

@@ -9,6 +9,7 @@
 
 #[macro_use]
 mod serial;
+mod apic;
 mod cpu;
 mod elf;
 mod gdt;
@@ -51,7 +52,6 @@ extern "C" fn kmain() -> ! {
     assert!(BASE_REVISION.is_supported(), "Limine base revision 3 not supported");
 
     cpu::enable_protections();
-    mask_legacy_pic();
     gdt::init();
     interrupts::init();
     println!("[kernel] GDT, TSS and IDT loaded");
@@ -59,16 +59,9 @@ extern "C" fn kmain() -> ! {
     let hhdm = HHDM_REQUEST.get_response().expect("no HHDM response");
     let memmap = MEMMAP_REQUEST.get_response().expect("no memory map response");
     memory::init(hhdm.offset(), memmap.entries());
+    apic::init();
 
     process::start()
-}
-
-/// We install no IRQ handlers, so keep the 8259 PICs fully masked before user code sets IF=1.
-fn mask_legacy_pic() {
-    unsafe {
-        Port::<u8>::new(0x21).write(0xff);
-        Port::<u8>::new(0xa1).write(0xff);
-    }
 }
 
 /// Stop the machine. Under QEMU with `isa-debug-exit`, `code` becomes the exit status

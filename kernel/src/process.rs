@@ -91,6 +91,12 @@ pub fn start() -> ! {
     enter_user(rip, rsp)
 }
 
+/// Timer interrupt: charge the tick to the running process.
+pub fn tick(frame: &mut TrapFrame) {
+    debug_assert!(frame.from_user(), "timer tick in kernel mode");
+    TABLE.lock().current().ticks += 1;
+}
+
 pub fn current_pid() -> u64 {
     TABLE.lock().current().pid
 }

@@ -11,7 +11,7 @@ use x86_64::instructions::tables::lidt;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::DescriptorTablePointer;
 
-use crate::{gdt, process, serial, syscall, usercopy};
+use crate::{apic, gdt, process, serial, syscall, usercopy};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -135,7 +135,9 @@ TRAP_NOERR 28
 TRAP_ERR   29
 TRAP_ERR   30
 TRAP_NOERR 31
-TRAP_NOERR 128
+.irp n, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,64,128,255
+TRAP_NOERR \n
+.endr
 
 .section .rodata
 .balign 8
@@ -144,16 +146,30 @@ trap_stub_table:
 .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     .quad trap_stub_\n
 .endr
+.global trap_stub_pic_table
+trap_stub_pic_table:
+.irp n, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
+    .quad trap_stub_\n
+.endr
 .global trap_stub_syscall
 trap_stub_syscall:
     .quad trap_stub_128
+.global trap_stub_timer
+trap_stub_timer:
+    .quad trap_stub_64
+.global trap_stub_spurious
+trap_stub_spurious:
+    .quad trap_stub_255
 "#,
     handler = sym trap_handler,
 );
 
 unsafe extern "C" {
     static trap_stub_table: [u64; 32];
+    static trap_stub_pic_table: [u64; 16];
     static trap_stub_syscall: u64;
+    static trap_stub_timer: u64;
+    static trap_stub_spurious: u64;
 }
 
 /// A 64-bit IDT gate descriptor.
@@ -207,6 +223,11 @@ pub fn init() {
         idt[8] = Gate::new(stubs[8], 0, gdt::DOUBLE_FAULT_IST as u8 + 1);
         // DPL 3 so ring 3 may execute `int 0x80`; every other vector #GPs if user code tries.
         idt[SYSCALL_VECTOR as usize] = Gate::new(unsafe { trap_stub_syscall }, 3, 0);
+        for (i, &stub) in unsafe { &trap_stub_pic_table }.iter().enumerate() {
+            idt[apic::PIC_VECTORS.start as usize + i] = Gate::new(stub, 0, 0);
+        }
+        idt[apic::TIMER_VECTOR as usize] = Gate::new(unsafe { trap_stub_timer }, 0, 0);
+        idt[apic::SPURIOUS_VECTOR as usize] = Gate::new(unsafe { trap_stub_spurious }, 0, 0);
         idt
     });
 
@@ -256,9 +277,15 @@ const EXCEPTION_NAMES: [&str; 32] = [
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
     crate::cpu::clac();
 
-    if frame.vector == SYSCALL_VECTOR as u64 {
-        syscall::dispatch(frame);
-        return;
+    match frame.vector {
+        v if v == SYSCALL_VECTOR as u64 => return syscall::dispatch(frame),
+        v if v == apic::TIMER_VECTOR as u64 => {
+            apic::eoi();
+            return process::tick(frame);
+        }
+        // Spurious: from the masked PIC, or the APIC's own. Neither gets an EOI.
+        v if v == apic::SPURIOUS_VECTOR as u64 || apic::PIC_VECTORS.contains(&v) => return,
+        _ => {}
     }
 
     if frame.vector == 14 && !frame.from_user() && usercopy::fixup(frame) {
