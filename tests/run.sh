@@ -43,6 +43,8 @@ CASES=(
   "dma-none        | dma-none            |                     |               | 1 | dmatest: no DMA region: BAD_ARGUMENT"
   "console-write   | console             |                     |               | 1 | cmd:tools/check_lines.py 'line ' 200 | grep -q '(0 resent)'"
   "console-restart | console-restart     | virtio-console/crash-after-50 | | 1 | cmd:out=\$(cat); tools/check_lines.py 'line ' 200 <<<\"\$out\" && grep -q 'driver restarted 1 times' <<<\"\$out\""
+  "telemetry       | telemetry           | telemetry/exit-after-3-heartbeats | | 5 | cmd:out=\$(cat); tools/host-agent.py - --check --quiet --expect-heartbeats 3 --expect fault=4 --expect restart=3 --expect log=1 <<<\"\$out\" && grep -q '\"msg\":\"giving up on task 2 after 3 restarts\"' <<<\"\$out\""
+  "telemetry-flood | telemetry-flood     | telemetry/exit-after-3-heartbeats supervisor/restart-3000 | | 5 | cmd:tools/host-agent.py - --check --quiet --expect-heartbeats 3 --expect dropped=1"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }

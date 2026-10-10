@@ -43,7 +43,6 @@ pub fn pending(slot: usize) -> bool {
 }
 
 /// Device interrupts since boot.
-#[allow(dead_code)] // reported by telemetry
 pub fn count() -> u64 {
     COUNT.load(Ordering::Relaxed)
 }

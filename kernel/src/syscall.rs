@@ -18,9 +18,12 @@ pub const SYS_TASK_STATE: u64 = 104;
 pub const SYS_LOOKUP: u64 = 105;
 pub const SYS_SLEEP: u64 = 106;
 pub const SYS_UPTIME: u64 = 107;
+pub const SYS_TASK_NAME: u64 = 108;
 pub const SYS_DEVICE_BAR: u64 = 110;
 pub const SYS_PCI_CONFIG_READ: u64 = 111;
 pub const SYS_DMA_INFO: u64 = 112;
+pub const SYS_READ_EVENTS: u64 = 113;
+pub const SYS_STATS: u64 = 114;
 
 const ERROR: u64 = u64::MAX;
 
@@ -41,6 +44,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_DEVICE_BAR => process::device_bar(frame),
         SYS_PCI_CONFIG_READ => process::pci_config_read(frame),
         SYS_DMA_INFO => process::dma_info(frame),
+        SYS_TASK_NAME => process::task_name(frame),
+        SYS_READ_EVENTS => process::read_events(frame),
+        SYS_STATS => process::stats(frame),
         SYS_RESTART => process::restart(frame),
         SYS_TASK_STATE => process::task_state(frame),
         _ => frame.rax = ERROR,

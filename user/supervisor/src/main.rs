@@ -5,7 +5,8 @@
 #![no_std]
 #![no_main]
 
-use vanir_user::{DeathRecord, NOTIFY_DEATH, err, println, recv, restart, task_index};
+use core::fmt::Write;
+use vanir_user::{DeathRecord, LineWriter, NOTIFY_DEATH, err, lookup, println, recv, restart, task_index, telemetry};
 
 vanir_user::entry!(main);
 
@@ -17,7 +18,18 @@ const MAX_RESTARTS: u32 = 3000;
 /// Log every event up to this many restarts of a task, then only every 500th.
 const VERBOSE_RESTARTS: u32 = 5;
 
+/// Print a decision, and send it to the telemetry task if there is one we may talk to.
+fn report(telemetry: Option<u64>, args: core::fmt::Arguments) {
+    let mut line = LineWriter::new();
+    let _ = line.write_fmt(args);
+    println!("supervisor: {}", core::str::from_utf8(line.as_bytes()).unwrap_or("?"));
+    if let Some(t) = telemetry {
+        let _ = telemetry::log(t, line.as_bytes()); // best effort: telemetry may be gone
+    }
+}
+
 fn main() -> u64 {
+    let telemetry = lookup("telemetry").ok();
     let mut restarts = [0u32; 16];
     let mut buf = [0u8; 256];
     loop {
@@ -54,14 +66,14 @@ fn main() -> u64 {
             _ => {}
         }
         if *count >= MAX_RESTARTS {
-            println!("supervisor: giving up on task {} after {} restarts", task, *count);
+            report(telemetry, format_args!("giving up on task {} after {} restarts", task, *count));
             continue;
         }
         *count += 1;
         match restart(d.id) {
             Ok(id) if verbose => println!("supervisor: restarted task {} (restart {}, id {:#x})", task, *count, id),
             Ok(_) => {}
-            Err(e) => println!("supervisor: restart of task {} failed: {}", task, err::name(e)),
+            Err(e) => report(telemetry, format_args!("restart of task {} failed: {}", task, err::name(e))),
         }
     }
 }

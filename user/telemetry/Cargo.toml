@@ -1,0 +1,16 @@
+[package]
+name = "telemetry"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "telemetry"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# For tests: exit after the third heartbeat, so the run can end.
+exit-after-3-heartbeats = []

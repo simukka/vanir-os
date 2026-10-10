@@ -26,11 +26,12 @@ fn main() {
         .map(|t| t.get("name").and_then(Value::as_str).unwrap_or_else(|| panic!("{app}: task without name")))
         .collect();
     let mut supervisors = 0;
+    let mut readers = 0;
     let mut out = String::from("pub static TASKS: &[Task] = &[\n");
     for (task, name) in tasks.iter().zip(&names) {
         let task = task.as_table().unwrap();
         for key in task.keys() {
-            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages"];
+            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events"];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
         let program = task.get("program").and_then(Value::as_str).unwrap_or(name);
@@ -39,6 +40,8 @@ fn main() {
         assert!((0..=256).contains(&dma_pages), "{app}: {name}: dma_pages must be 0..=256");
         let supervisor = task.get("supervisor").is_some_and(|v| v.as_bool().expect("supervisor: bool"));
         supervisors += supervisor as u32;
+        let events = task.get("events").is_some_and(|v| v.as_bool().expect("events: bool"));
+        readers += events as u32;
         let sends: Vec<usize> = match task.get("sends") {
             None => vec![],
             Some(v) => v
@@ -74,11 +77,12 @@ fn main() {
         writeln!(
             out,
             "    Task {{ name: {name:?}, image: include_bytes!({path:?}), budget_ticks: {budget}, \
-             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages} }},"
+             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events} }},"
         )
         .unwrap();
     }
     assert!(supervisors <= 1, "{app}: at most one supervisor");
+    assert!(readers <= 1, "{app}: at most one task may read the event log");
     out.push_str("];\n");
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/tasks.rs"), out).unwrap();

@@ -19,7 +19,7 @@ use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
-use crate::{apic, elf, gdt, irq, pci};
+use crate::{apic, elf, events, gdt, irq, pci};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
@@ -35,6 +35,8 @@ pub struct Task {
     pub devices: &'static [usize],
     /// Size of the task's DMA region in pages (0 = none).
     pub dma_pages: u64,
+    /// May read the kernel event log and system statistics.
+    pub events: bool,
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
@@ -126,6 +128,11 @@ struct DeathRecord {
 pub const NOTIFY_DEATH: u64 = 1;
 /// `recv` from sender 0 with this op: device interrupts; the length register holds the bits.
 pub const NOTIFY_IRQ: u64 = 2;
+/// `recv` from sender 0 with this op: the timeout given with `RECV_TIMEOUT` expired.
+pub const NOTIFY_TIMER: u64 = 3;
+/// `recv` flag (in rdx): give up after r10 ticks with a `NOTIFY_TIMER` notification.
+pub const RECV_TIMEOUT: u64 = 2;
+
 /// `recv` flag (in rdx): this task has device work in flight and an interrupt will come, so the
 /// kernel should idle for it rather than conclude that nothing can ever run again.
 pub const RECV_EXPECT_IRQ: u64 = 1;
@@ -148,6 +155,8 @@ struct Process {
     ticks: u64,
     death: Death,
     grants: Grants,
+    /// While blocked in a `recv` with `RECV_TIMEOUT`: the tick it gives up.
+    recv_deadline: Option<u64>,
 }
 
 impl Process {
@@ -253,7 +262,19 @@ pub fn start() -> ! {
         let (space, context) = load(task, &grants);
         let space = Some(space);
         let death = Death::default();
-        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0, death, grants };
+        let p = Process {
+            slot,
+            generation: 0,
+            task,
+            space,
+            context,
+            state: State::Ready,
+            ticks: 0,
+            death,
+            grants,
+            recv_deadline: None,
+        };
+        events::log(events::TASK_START, p.id(), 0, 0, 0);
         println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), p.context.rip);
         table.procs[slot] = Some(p);
     }
@@ -321,6 +342,7 @@ pub fn tick(frame: &mut TrapFrame) {
     let budget = p.task.budget_ticks;
     if budget != 0 && p.ticks >= budget {
         println!("[kernel] {} killed: CPU budget of {} ticks used up", p.describe(), budget);
+        events::log(events::OVER_BUDGET, p.id(), budget, 0, 0);
         return end_current(&mut table, frame, State::OverBudget);
     }
     block(&mut table, frame, State::Ready);
@@ -370,6 +392,13 @@ fn wake_sleepers(table: &mut Table) {
         if matches!(p.state, State::Sleeping(until) if until <= now) {
             p.state = State::Ready;
         }
+        if p.state == State::RecvBlocked && p.recv_deadline.is_some_and(|d| d <= now) {
+            p.recv_deadline = None;
+            p.context.rax = 0;
+            p.context.rdx = NOTIFY_TIMER;
+            p.context.rsi = 0;
+            p.state = State::Ready;
+        }
     }
 }
 
@@ -388,6 +417,7 @@ pub fn exit(frame: &mut TrapFrame, code: u64) {
     let mut table = TABLE.lock();
     let p = table.current();
     println!("[kernel] {} exited with code {} (called from CPL {})", p.describe(), code, frame.cs & 3);
+    events::log(events::EXIT, p.id(), code, 0, 0);
     end_current(&mut table, frame, State::Exited(code));
 }
 
@@ -398,6 +428,7 @@ pub fn kill(frame: &mut TrapFrame) {
     println!("[kernel] {} killed by vector {}", p.describe(), frame.vector);
     let cr2 = if frame.vector == 14 { x86_64::registers::control::Cr2::read_raw() } else { 0 };
     p.death = Death { rip: frame.rip, cr2, error_code: frame.error_code, unreported: false };
+    events::log(events::FAULT, p.id(), frame.vector, frame.rip, cr2);
     end_current(&mut table, frame, State::Faulted(frame.vector));
 }
 
@@ -497,6 +528,7 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
             let i = (table.current + step) % MAX_PROCESSES;
             if let Some(p) = table.procs[i].as_mut().filter(|p| p.state == State::Ready) {
                 p.state = State::Running;
+                p.recv_deadline = None; // however it woke, a pending recv timeout is moot
                 *frame = p.context;
                 if i != table.current {
                     // Reloading CR3 flushes the TLB, so skip it when staying put.
@@ -508,7 +540,8 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
             }
         }
         let procs = || table.procs.iter().flatten();
-        let sleeping = procs().any(|p| matches!(p.state, State::Sleeping(_)));
+        // Time will wake sleepers and receivers with a timeout.
+        let sleeping = procs().any(|p| matches!(p.state, State::Sleeping(_)) || (p.state == State::RecvBlocked && p.recv_deadline.is_some()));
         // A blocked recv's flags are still in its saved registers.
         let awaiting_device = procs().any(|p| p.state == State::RecvBlocked && p.context.rdx & RECV_EXPECT_IRQ != 0);
         if !sleeping && !awaiting_device {
@@ -548,6 +581,7 @@ pub fn send(frame: &mut TrapFrame) {
         return fail(frame, err::BAD_TARGET);
     };
     if !table.current().task.sends.contains(&to) {
+        events::log(events::IPC_REFUSED, table.current().id(), target, err::NOT_ALLOWED, 0);
         return fail(frame, err::NOT_ALLOWED);
     }
     let peer = table.get(to);
@@ -559,6 +593,7 @@ pub fn send(frame: &mut TrapFrame) {
     }
     let space = table.current().space();
     if !space.check_range(msg, len, false) || !space.check_range(reply_buf, reply_cap, true) {
+        events::log(events::IPC_REFUSED, table.current().id(), target, err::BAD_BUFFER, 0);
         return fail(frame, err::BAD_BUFFER);
     }
 
@@ -646,6 +681,7 @@ pub fn recv(frame: &mut TrapFrame) {
         frame.rsi = len;
         return;
     }
+    table.current().recv_deadline = (frame.rdx & RECV_TIMEOUT != 0).then(|| apic::now() + frame.r10.max(1));
     block(&mut table, frame, State::RecvBlocked);
 }
 
@@ -721,6 +757,7 @@ pub fn restart(frame: &mut TrapFrame) {
         return;
     };
     let p = table.get(slot);
+    let old_id = p.id();
     if p.id() != id || !p.state.is_dead() {
         frame.rax = err::BAD_ARGUMENT; // already restarted, or still alive
         return;
@@ -738,6 +775,7 @@ pub fn restart(frame: &mut TrapFrame) {
     p.ticks = 0;
     p.death = Death::default();
     frame.rax = p.id();
+    events::log(events::RESTART, p.id(), old_id, 0, 0);
 }
 
 /// `task_state(id) -> (state, current id)`: 0 running or ready, 1 blocked in IPC, 2 exited,
@@ -753,14 +791,19 @@ pub fn task_state(frame: &mut TrapFrame) {
         return;
     };
     let p = table.get(slot);
-    frame.rax = match p.state {
+    frame.rax = state_code(p.state);
+    frame.rdx = p.id();
+}
+
+/// 0 running or ready, 1 blocked (IPC or sleep), 2 exited, 3 faulted, 4 over budget.
+fn state_code(state: State) -> u64 {
+    match state {
         State::Ready | State::Running => 0,
         State::SendBlocked(_) | State::ReplyBlocked(_) | State::RecvBlocked | State::Sleeping(_) => 1,
         State::Exited(_) => 2,
         State::Faulted(_) => 3,
         State::OverBudget => 4,
-    };
-    frame.rdx = p.id();
+    }
 }
 
 // ---- Devices -------------------------------------------------------------------------------
@@ -808,6 +851,92 @@ pub fn pci_config_read(frame: &mut TrapFrame) {
         Some(d) if offset < 256 && offset % 4 == 0 => d.read(offset as u8) as u64,
         _ => err::BAD_ARGUMENT,
     };
+}
+
+// ---- Telemetry --------------------------------------------------------------------------
+
+/// `read_events(buf, cap) -> (count, dropped)`: kernel events after the last ones read, as
+/// `events::Event` records. Only for the task with `events = true`.
+pub fn read_events(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if !table.current().task.events {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let (buf, cap) = (frame.rdi, frame.rsi);
+    let mut out = [events::Event::default(); 32];
+    let max = (cap as usize / events::EVENT_SIZE).min(out.len());
+    if !table.current().space().check_range(buf, (max * events::EVENT_SIZE) as u64, true) {
+        frame.rax = err::BAD_BUFFER;
+        return;
+    }
+    let (count, dropped) = events::read(&mut out[..max]);
+    let bytes = unsafe { core::slice::from_raw_parts(out.as_ptr() as *const u8, count * events::EVENT_SIZE) };
+    memory::copy_to_user_space(table.current().space(), buf, bytes).expect("checked above");
+    frame.rax = count as u64;
+    frame.rdx = dropped;
+}
+
+/// System statistics for heartbeats, as written by `stats(buf)`.
+#[repr(C)]
+struct Stats {
+    uptime_ticks: u64,
+    frames_in_use: u64,
+    device_interrupts: u64,
+    events_logged: u64,
+    tasks: u64,
+    /// Per task: id, state (as `task_state`), CPU ticks.
+    task: [[u64; 3]; MAX_PROCESSES],
+}
+
+/// `stats(buf, cap) -> bytes`: a `Stats` record. Only for the task with `events = true`.
+pub fn stats(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if !table.current().task.events {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let mut stats = Stats {
+        uptime_ticks: apic::now(),
+        frames_in_use: memory::frames_in_use(),
+        device_interrupts: irq::count(),
+        events_logged: events::logged(),
+        tasks: 0,
+        task: [[0; 3]; MAX_PROCESSES],
+    };
+    for p in table.procs.iter().flatten() {
+        stats.task[p.slot] = [p.id(), state_code(p.state), p.ticks];
+        stats.tasks += 1;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(&stats as *const Stats as *const u8, size_of::<Stats>()) };
+    if frame.rsi < bytes.len() as u64 {
+        frame.rax = err::TOO_LONG;
+        return;
+    }
+    match memory::copy_to_user_space(table.current().space(), frame.rdi, bytes) {
+        Ok(()) => frame.rax = bytes.len() as u64,
+        Err(_) => frame.rax = err::BAD_BUFFER,
+    }
+}
+
+/// `task_name(id, buf, cap) -> len`: the manifest name of a task (any generation of its id).
+pub fn task_name(frame: &mut TrapFrame) {
+    let table = TABLE.lock();
+    let Some(slot) = table.slot_of(frame.rdi) else {
+        frame.rax = err::BAD_TARGET;
+        return;
+    };
+    let (buf, cap) = (frame.rsi, frame.rdx);
+    let name = table.procs[slot].as_ref().unwrap().task.name.as_bytes();
+    let space = table.procs[table.current].as_ref().unwrap().space();
+    if cap < name.len() as u64 {
+        frame.rax = err::TOO_LONG;
+        return;
+    }
+    match memory::copy_to_user_space(space, buf, name) {
+        Ok(()) => frame.rax = name.len() as u64,
+        Err(_) => frame.rax = err::BAD_BUFFER,
+    }
 }
 
 // ---- The end ---------------------------------------------------------------------------------

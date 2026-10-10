@@ -22,9 +22,12 @@ pub const SYS_TASK_STATE: u64 = 104;
 pub const SYS_LOOKUP: u64 = 105;
 pub const SYS_SLEEP: u64 = 106;
 pub const SYS_UPTIME: u64 = 107;
+pub const SYS_TASK_NAME: u64 = 108;
 pub const SYS_DEVICE_BAR: u64 = 110;
 pub const SYS_PCI_CONFIG_READ: u64 = 111;
 pub const SYS_DMA_INFO: u64 = 112;
+pub const SYS_READ_EVENTS: u64 = 113;
+pub const SYS_STATS: u64 = 114;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -114,7 +117,21 @@ pub fn recv(buf: &mut [u8]) -> Result<Message, u64> {
 
 /// `recv` with flags (`RECV_EXPECT_IRQ`).
 pub fn recv_flags(buf: &mut [u8], flags: u64) -> Result<Message, u64> {
-    let (sender, op, len) = syscall6(SYS_RECV, [buf.as_mut_ptr() as u64, buf.len() as u64, flags, 0, 0, 0]);
+    recv_raw(buf, flags, 0)
+}
+
+/// Kernel notification (sender 0) op: a `recv_timeout` expired.
+pub const NOTIFY_TIMER: u64 = 3;
+/// `recv` flag: give up after a number of ticks with `NOTIFY_TIMER`.
+pub const RECV_TIMEOUT: u64 = 2;
+
+/// Wait for a message for at most `ticks` (at least 1); then get sender 0, op `NOTIFY_TIMER`.
+pub fn recv_timeout(buf: &mut [u8], ticks: u64) -> Result<Message, u64> {
+    recv_raw(buf, RECV_TIMEOUT, ticks)
+}
+
+fn recv_raw(buf: &mut [u8], flags: u64, ticks: u64) -> Result<Message, u64> {
+    let (sender, op, len) = syscall6(SYS_RECV, [buf.as_mut_ptr() as u64, buf.len() as u64, flags, ticks, 0, 0]);
     if err::is_error(sender) { Err(sender) } else { Ok(Message { sender, op, len: len as usize }) }
 }
 
@@ -215,6 +232,81 @@ pub mod console {
 
     pub fn is_dead(e: u64) -> bool {
         e == err::DEAD
+    }
+}
+
+/// The manifest name of task `id` (any generation), written into `buf`.
+pub fn task_name(id: u64, buf: &mut [u8]) -> Result<&str, u64> {
+    let (len, _, _) = syscall6(SYS_TASK_NAME, [id, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]);
+    if err::is_error(len) {
+        return Err(len);
+    }
+    core::str::from_utf8(&buf[..len as usize]).map_err(|_| err::BAD_ARGUMENT)
+}
+
+/// The kernel event log (for the task with `events = true`).
+pub mod events {
+    use super::{SYS_READ_EVENTS, SYS_STATS, err, syscall6};
+
+    pub const TASK_START: u64 = 1;
+    pub const EXIT: u64 = 2;
+    pub const FAULT: u64 = 3;
+    pub const OVER_BUDGET: u64 = 4;
+    pub const RESTART: u64 = 5;
+    pub const IPC_REFUSED: u64 = 6;
+
+    /// See kernel/src/events.rs for what `a`, `b`, `c` hold for each kind.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Event {
+        pub seq: u64,
+        pub tick: u64,
+        pub kind: u64,
+        pub task: u64,
+        pub a: u64,
+        pub b: u64,
+        pub c: u64,
+    }
+
+    /// Events since the last read, oldest first: (how many were written to `out`, how many
+    /// were lost because the kernel's ring wrapped first).
+    pub fn read(out: &mut [Event]) -> Result<(usize, u64), u64> {
+        let bytes = core::mem::size_of_val(out) as u64;
+        let (count, dropped, _) = syscall6(SYS_READ_EVENTS, [out.as_mut_ptr() as u64, bytes, 0, 0, 0, 0]);
+        if err::is_error(count) { Err(count) } else { Ok((count as usize, dropped)) }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Stats {
+        pub uptime_ticks: u64,
+        pub frames_in_use: u64,
+        pub device_interrupts: u64,
+        pub events_logged: u64,
+        pub tasks: u64,
+        /// Per task slot: id, state (0 running/ready, 1 blocked, 2 exited, 3 faulted,
+        /// 4 over budget), CPU ticks.
+        pub task: [[u64; 3]; 8],
+    }
+
+    pub fn stats() -> Result<Stats, u64> {
+        let mut s = Stats::default();
+        let size = core::mem::size_of::<Stats>() as u64;
+        let (n, _, _) = syscall6(SYS_STATS, [&mut s as *mut Stats as u64, size, 0, 0, 0, 0]);
+        if err::is_error(n) { Err(n) } else { Ok(s) }
+    }
+}
+
+/// Client side of the telemetry task (`user/telemetry`).
+pub mod telemetry {
+    use super::send;
+
+    /// Forward a line of text to the host as a `log` event.
+    pub const OP_LOG: u64 = 1;
+
+    /// Send `text` to telemetry task `id`. Fails like `send`.
+    pub fn log(id: u64, text: &[u8]) -> Result<(), u64> {
+        send(id, OP_LOG, text, &mut []).map(|_| ())
     }
 }
 

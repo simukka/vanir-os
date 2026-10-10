@@ -12,6 +12,7 @@ mod serial;
 mod apic;
 mod cpu;
 mod elf;
+mod events;
 mod gdt;
 mod interrupts;
 mod irq;

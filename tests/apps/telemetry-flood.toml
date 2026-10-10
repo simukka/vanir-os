@@ -1,0 +1,17 @@
+[[task]]
+name = "supervisor"
+supervisor = true
+sends = ["telemetry"]
+
+[[task]]
+name = "crasher"
+
+[[task]]
+name = "virtio-console"
+devices = ["virtio-console"]
+dma_pages = 16
+
+[[task]]
+name = "telemetry"
+events = true
+sends = ["virtio-console"]
