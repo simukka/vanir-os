@@ -9,7 +9,7 @@ use core::arch::asm;
 use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
-use crate::memory::{AddressSpace, PAGE_SIZE};
+use crate::memory::{self, AddressSpace, PAGE_SIZE};
 use crate::{elf, gdt};
 
 /// A program the kernel runs at boot, declared at build time (see kernel/build.rs).
@@ -38,7 +38,8 @@ enum State {
 struct Process {
     pid: u64,
     task: &'static Task,
-    space: AddressSpace,
+    /// Freed (None) as soon as the process ends.
+    space: Option<AddressSpace>,
     /// Saved user registers while not running.
     context: TrapFrame,
     state: State,
@@ -48,6 +49,8 @@ struct Process {
 struct Table {
     procs: [Option<Process>; MAX_PROCESSES],
     current: usize,
+    /// Frames in use before any task was loaded; every task's memory is freed when it ends.
+    baseline_frames: u64,
 }
 
 impl Table {
@@ -56,12 +59,14 @@ impl Table {
     }
 }
 
-static TABLE: Mutex<Table> = Mutex::new(Table { procs: [const { None }; MAX_PROCESSES], current: 0 });
+static TABLE: Mutex<Table> =
+    Mutex::new(Table { procs: [const { None }; MAX_PROCESSES], current: 0, baseline_frames: 0 });
 
 /// Load every task, then enter the first one. Never returns.
 pub fn start() -> ! {
     assert!(!TASKS.is_empty() && TASKS.len() <= MAX_PROCESSES, "need 1..={MAX_PROCESSES} tasks");
     let mut table = TABLE.lock();
+    table.baseline_frames = memory::frames_in_use();
     for (i, task) in TASKS.iter().enumerate() {
         let pid = i as u64 + 1;
         let space = AddressSpace::new();
@@ -78,13 +83,14 @@ pub fn start() -> ! {
             entry
         );
         let context = initial_context(entry, USER_STACK_TOP);
+        let space = Some(space);
         table.procs[i] = Some(Process { pid, task, space, context, state: State::Ready, ticks: 0 });
     }
 
     table.current = 0;
     let first = table.current();
     first.state = State::Running;
-    first.space.activate();
+    first.space.as_ref().unwrap().activate();
     let (rip, rsp) = (first.context.rip, first.context.rsp);
     drop(table);
     println!("[kernel] entering ring 3");
@@ -102,6 +108,7 @@ pub fn tick(frame: &mut TrapFrame) {
     if budget != 0 && p.ticks >= budget {
         println!("[kernel] pid {} ({}) killed: CPU budget of {} ticks used up", p.pid, p.task.name, budget);
         p.state = State::OverBudget;
+        p.space = None;
         return switch_to_next(&mut table, frame);
     }
     preempt(&mut table, frame);
@@ -138,6 +145,7 @@ pub fn exit(frame: &mut TrapFrame, code: u64) {
         frame.cs & 3
     );
     p.state = State::Exited(code);
+    p.space = None;
     switch_to_next(&mut table, frame);
 }
 
@@ -147,6 +155,7 @@ pub fn kill(frame: &mut TrapFrame) {
     let p = table.current();
     println!("[kernel] pid {} ({}) killed by vector {}", p.pid, p.task.name, frame.vector);
     p.state = State::Faulted(frame.vector);
+    p.space = None;
     switch_to_next(&mut table, frame);
 }
 
@@ -159,7 +168,8 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
             p.state = State::Running;
             *frame = p.context;
             if i != table.current {
-                p.space.activate(); // reloading CR3 flushes the TLB, so skip it when staying put
+                // Reloading CR3 flushes the TLB, so skip it when staying put.
+                p.space.as_ref().unwrap().activate();
             }
             table.current = i;
             return;
@@ -191,6 +201,12 @@ fn finish(table: &Table) -> ! {
             State::Ready | State::Running => unreachable!(),
         };
         println!("[kernel]   pid {} ({}): {}, {} ticks", p.pid, p.task.name, outcome, p.ticks);
+    }
+    let in_use = memory::frames_in_use();
+    if in_use == table.baseline_frames {
+        println!("[kernel] frames in use: {} (all task memory freed)", in_use);
+    } else {
+        println!("[kernel] frames in use: {} (LEAK: {} before tasks)", in_use, table.baseline_frames);
     }
     crate::halt(status)
 }

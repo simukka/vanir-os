@@ -1,7 +1,7 @@
 //! Physical frames and user page mappings.
 //!
-//! Frames come from a bump allocator over Limine's usable regions and are never freed. Physical
-//! memory is reached through Limine's higher-half direct map (HHDM).
+//! Frames come from a free list of returned frames, or else a bump allocator over Limine's usable
+//! regions. Physical memory is reached through Limine's higher-half direct map (HHDM).
 //!
 //! Each process gets its own page-table tree (`AddressSpace`). The kernel half (top-level entries
 //! 256-511) is copied from the tables Limine built, so every address space shares the same kernel
@@ -33,9 +33,13 @@ struct FrameAllocator {
     regions: &'static [&'static Entry],
     region: usize,
     next: u64,
+    /// Head of the list of freed frames (0 = empty); each free frame's first word links the next.
+    free: u64,
+    in_use: u64,
 }
 
-static FRAMES: Mutex<FrameAllocator> = Mutex::new(FrameAllocator { regions: &[], region: 0, next: 0 });
+static FRAMES: Mutex<FrameAllocator> =
+    Mutex::new(FrameAllocator { regions: &[], region: 0, next: 0, free: 0, in_use: 0 });
 static mut HHDM_OFFSET: u64 = 0;
 /// Limine's top-level table: the source of the kernel half for every address space.
 static mut KERNEL_PML4: u64 = 0;
@@ -45,7 +49,7 @@ pub fn init(hhdm_offset: u64, memmap: &'static [&'static Entry]) {
         HHDM_OFFSET = hhdm_offset;
         KERNEL_PML4 = Cr3::read().0.start_address().as_u64();
     }
-    *FRAMES.lock() = FrameAllocator { regions: memmap, region: 0, next: 0 };
+    *FRAMES.lock() = FrameAllocator { regions: memmap, region: 0, next: 0, free: 0, in_use: 0 };
 }
 
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
@@ -55,6 +59,13 @@ pub fn phys_to_virt(phys: u64) -> *mut u8 {
 /// Allocate one zeroed 4 KiB frame and return its physical address.
 pub fn alloc_frame() -> u64 {
     let mut a = FRAMES.lock();
+    a.in_use += 1;
+    if a.free != 0 {
+        let frame = a.free;
+        a.free = unsafe { *(phys_to_virt(frame) as *const u64) };
+        unsafe { phys_to_virt(frame).write_bytes(0, PAGE_SIZE as usize) };
+        return frame;
+    }
     let frame = loop {
         let Some(entry) = a.regions.get(a.region) else { panic!("out of physical memory") };
         if entry.entry_type == EntryType::USABLE {
@@ -69,6 +80,18 @@ pub fn alloc_frame() -> u64 {
     };
     unsafe { phys_to_virt(frame).write_bytes(0, PAGE_SIZE as usize) };
     frame
+}
+
+/// Return a frame to the allocator. It must no longer be mapped anywhere.
+pub fn free_frame(frame: u64) {
+    let mut a = FRAMES.lock();
+    unsafe { *(phys_to_virt(frame) as *mut u64) = a.free };
+    a.free = frame;
+    a.in_use -= 1;
+}
+
+pub fn frames_in_use() -> u64 {
+    FRAMES.lock().in_use
 }
 
 fn table(phys: u64) -> &'static mut [u64; 512] {
@@ -108,6 +131,37 @@ impl AddressSpace {
         *leaf = frame | flags;
         frame
     }
+}
+
+impl Drop for AddressSpace {
+    /// Free every user page and user page table, then the top-level table. The kernel half's
+    /// tables are shared and are never freed.
+    fn drop(&mut self) {
+        if Cr3::read().0.start_address().as_u64() == self.pml4 {
+            // Never free the tables the CPU is using: fall back to the kernel-only tree.
+            let kernel = PhysFrame::from_start_address(PhysAddr::new(unsafe { KERNEL_PML4 })).unwrap();
+            unsafe { Cr3::write(kernel, Cr3Flags::empty()) };
+        }
+        free_tables(self.pml4, 4, 0..256);
+    }
+}
+
+/// Free the tree under the table at `phys` (a level-`level` table; 4 = PML4), limited to
+/// `entries` at the top level, then the table itself.
+fn free_tables(phys: u64, level: u32, entries: core::ops::Range<usize>) {
+    for &entry in &table(phys)[entries] {
+        if entry & PRESENT == 0 {
+            continue;
+        }
+        let child = entry & ADDR_MASK;
+        if level == 1 {
+            free_frame(child); // a user page
+        } else {
+            assert!(entry & HUGE == 0, "huge page in a user address space");
+            free_tables(child, level - 1, 0..512);
+        }
+    }
+    free_frame(phys);
 }
 
 /// Map one page of device registers into the kernel half: uncached, non-executable, kernel-only.
