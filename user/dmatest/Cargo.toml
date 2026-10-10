@@ -1,0 +1,12 @@
+[package]
+name = "dmatest"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dmatest"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }

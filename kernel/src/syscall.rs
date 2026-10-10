@@ -20,6 +20,7 @@ pub const SYS_SLEEP: u64 = 106;
 pub const SYS_UPTIME: u64 = 107;
 pub const SYS_DEVICE_BAR: u64 = 110;
 pub const SYS_PCI_CONFIG_READ: u64 = 111;
+pub const SYS_DMA_INFO: u64 = 112;
 
 const ERROR: u64 = u64::MAX;
 
@@ -39,6 +40,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_UPTIME => process::uptime(frame),
         SYS_DEVICE_BAR => process::device_bar(frame),
         SYS_PCI_CONFIG_READ => process::pci_config_read(frame),
+        SYS_DMA_INFO => process::dma_info(frame),
         SYS_RESTART => process::restart(frame),
         SYS_TASK_STATE => process::task_state(frame),
         _ => frame.rax = ERROR,

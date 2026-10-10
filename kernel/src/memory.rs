@@ -28,6 +28,9 @@ const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
 /// Software-defined PTE bit: device registers, not RAM. Never freed, never copied through.
 const DEVICE: u64 = 1 << 9;
+/// Software-defined PTE bit: RAM owned by a task slot for life (a DMA region). Not freed when
+/// the address space is.
+const PINNED: u64 = 1 << 10;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -84,6 +87,27 @@ pub fn alloc_frame() -> u64 {
     frame
 }
 
+/// Allocate `pages` physically contiguous, zeroed frames (for DMA) and return the first one's
+/// physical address. They come from the bump allocator and are never freed.
+pub fn alloc_contiguous(pages: u64) -> u64 {
+    let mut a = FRAMES.lock();
+    let len = pages * PAGE_SIZE;
+    let start = loop {
+        let Some(entry) = a.regions.get(a.region) else { panic!("no {pages} contiguous free pages") };
+        if entry.entry_type == EntryType::USABLE {
+            let next = a.next.max(entry.base.next_multiple_of(PAGE_SIZE));
+            if next + len <= entry.base + entry.length {
+                a.next = next + len;
+                break next;
+            }
+        }
+        a.region += 1;
+    };
+    a.in_use += pages;
+    unsafe { phys_to_virt(start).write_bytes(0, len as usize) };
+    start
+}
+
 /// Return a frame to the allocator. It must no longer be mapped anywhere.
 pub fn free_frame(frame: u64) {
     let mut a = FRAMES.lock();
@@ -128,6 +152,16 @@ impl AddressSpace {
         assert!(*leaf & PRESENT == 0, "user page {virt:#x} already mapped");
         let nx = if cpu::nx_enabled() { NO_EXECUTE } else { 0 };
         *leaf = phys | PRESENT | WRITABLE | USER | WRITE_THROUGH | CACHE_DISABLE | DEVICE | nx;
+    }
+
+    /// Map RAM the task slot owns for life (its DMA region) at `virt`: user read/write,
+    /// non-executable, and not freed with this address space.
+    pub fn map_user_pinned(&self, virt: u64, phys: u64) {
+        assert!(virt % PAGE_SIZE == 0 && virt < USER_END, "bad user address {virt:#x}");
+        let leaf = walk(self.pml4, virt, PRESENT | WRITABLE | USER);
+        assert!(*leaf & PRESENT == 0, "user page {virt:#x} already mapped");
+        let nx = if cpu::nx_enabled() { NO_EXECUTE } else { 0 };
+        *leaf = phys | PRESENT | WRITABLE | USER | PINNED | nx;
     }
 
     /// Map the 4 KiB page at `virt` to a fresh zeroed frame, user-accessible. Returns the frame.
@@ -247,8 +281,8 @@ fn free_tables(phys: u64, level: u32, entries: core::ops::Range<usize>) {
         }
         let child = entry & ADDR_MASK;
         if level == 1 {
-            if entry & DEVICE == 0 {
-                free_frame(child); // a user page (device registers aren't ours to free)
+            if entry & (DEVICE | PINNED) == 0 {
+                free_frame(child); // a user page (device registers and DMA regions are kept)
             }
         } else {
             assert!(entry & HUGE == 0, "huge page in a user address space");

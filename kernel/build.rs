@@ -30,11 +30,13 @@ fn main() {
     for (task, name) in tasks.iter().zip(&names) {
         let task = task.as_table().unwrap();
         for key in task.keys() {
-            let known = ["name", "program", "budget", "supervisor", "sends", "devices"];
+            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages"];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
         let program = task.get("program").and_then(Value::as_str).unwrap_or(name);
         let budget = task.get("budget").map_or(0, |v| v.as_integer().expect("budget: integer"));
+        let dma_pages = task.get("dma_pages").map_or(0, |v| v.as_integer().expect("dma_pages: integer"));
+        assert!((0..=256).contains(&dma_pages), "{app}: {name}: dma_pages must be 0..=256");
         let supervisor = task.get("supervisor").is_some_and(|v| v.as_bool().expect("supervisor: bool"));
         supervisors += supervisor as u32;
         let sends: Vec<usize> = match task.get("sends") {
@@ -72,7 +74,7 @@ fn main() {
         writeln!(
             out,
             "    Task {{ name: {name:?}, image: include_bytes!({path:?}), budget_ticks: {budget}, \
-             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?} }},"
+             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages} }},"
         )
         .unwrap();
     }

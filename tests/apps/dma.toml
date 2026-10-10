@@ -1,0 +1,7 @@
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "dmatest"
+dma_pages = 4

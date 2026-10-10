@@ -38,6 +38,8 @@ CASES=(
   "device-grant    | devprobe            |                     |               | 1 | re:pci 00:0[0-9a-f]\.0 1af4:1043 virtio-console[\s\S]*devprobe: device 1af4:1043[\s\S]*virtio common config in BAR 4 .*num_queues [0-9]+"
   "device-no-grant | devprobe-no-grant   |                     |               | 1 | devprobe: no device granted: BAD_ARGUMENT"
   "device-msix     | devprobe            | devprobe/poke-msix  |               | 5 | re:BAR 1 \(MSI-X\) visible to us: false[\s\S]*devprobe\) killed by vector 14"
+  "dma-region      | dma                 |                     |               | 1 | re:start 0: 16 KiB at 0x2000000000, physical (0x[0-9a-f]+), all zero: true[\s\S]*restarted task 2[\s\S]*start 1: 16 KiB at 0x2000000000, physical \1, all zero: true[\s\S]*region ok after restart"
+  "dma-none        | dma-none            |                     |               | 1 | dmatest: no DMA region: BAD_ARGUMENT"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }

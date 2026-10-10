@@ -24,6 +24,7 @@ pub const SYS_SLEEP: u64 = 106;
 pub const SYS_UPTIME: u64 = 107;
 pub const SYS_DEVICE_BAR: u64 = 110;
 pub const SYS_PCI_CONFIG_READ: u64 = 111;
+pub const SYS_DMA_INFO: u64 = 112;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -167,6 +168,13 @@ pub fn pci_config_read(device: u64, offset: u64) -> Result<u32, u64> {
     if err::is_error(value) { Err(value) } else { Ok(value as u32) }
 }
 
+/// This task's DMA region: (address, physical address for the device, length in bytes).
+/// Physically contiguous, owned by the task slot for life, zeroed on every (re)start.
+pub fn dma_info() -> Result<(u64, u64, u64), u64> {
+    let (addr, phys, len) = syscall6(SYS_DMA_INFO, [0; 6]);
+    if err::is_error(addr) { Err(addr) } else { Ok((addr, phys, len)) }
+}
+
 /// The id of the task called `name` in the app manifest.
 pub fn lookup(name: &str) -> Result<u64, u64> {
     let (id, _, _) = syscall6(SYS_LOOKUP, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]);
@@ -224,17 +232,47 @@ pub fn spin_cycles(cycles: u64) {
     }
 }
 
-pub struct Stdout;
+/// Collects formatted output and sends it in one `write`, so a line can't be split by a
+/// preemption between pieces and interleaved with another task's output. Output longer than
+/// the buffer goes out in buffer-sized writes.
+pub struct LineWriter {
+    buf: [u8; 256],
+    len: usize,
+}
 
-impl Write for Stdout {
+impl LineWriter {
+    pub const fn new() -> LineWriter {
+        LineWriter { buf: [0; 256], len: 0 }
+    }
+
+    pub fn flush(&mut self) {
+        if self.len != 0 {
+            write(&self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
+impl Write for LineWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if write(s.as_bytes()) == ERROR { Err(fmt::Error) } else { Ok(()) }
+        for &b in s.as_bytes() {
+            if self.len == self.buf.len() {
+                self.flush();
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
     }
 }
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => {{ let _ = core::fmt::Write::write_fmt(&mut $crate::Stdout, format_args!($($arg)*)); }};
+    ($($arg:tt)*) => {{
+        let mut out = $crate::LineWriter::new();
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!($($arg)*));
+        out.flush();
+    }};
 }
 
 #[macro_export]

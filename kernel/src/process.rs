@@ -33,6 +33,8 @@ pub struct Task {
     pub sends: &'static [usize],
     /// Kinds of PCI device granted (indices into `pci::KINDS`), one device each.
     pub devices: &'static [usize],
+    /// Size of the task's DMA region in pages (0 = none).
+    pub dma_pages: u64,
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
@@ -51,6 +53,17 @@ const MAX_TASK_DEVICES: usize = 4;
 const DEVICE_BASE: u64 = 0x10_0000_0000;
 const DEVICE_STRIDE: u64 = 0x1000_0000;
 const BAR_STRIDE: u64 = 0x200_0000;
+/// Where a task's DMA region appears.
+const DMA_BASE: u64 = 0x20_0000_0000;
+
+/// What a task slot is given at boot and keeps across restarts.
+#[derive(Clone, Copy)]
+struct Grants {
+    /// PCI devices (indices for `pci::get`).
+    devices: [Option<usize>; MAX_TASK_DEVICES],
+    /// Physically contiguous DMA region: (physical address, pages).
+    dma: Option<(u64, u64)>,
+}
 
 /// Kernel error codes returned by IPC syscalls. The top bit is set, so they never collide with a
 /// server's reply codes (which must have it clear).
@@ -125,8 +138,7 @@ struct Process {
     state: State,
     ticks: u64,
     death: Death,
-    /// PCI devices granted to this task (indices for `pci::get`), assigned once at boot.
-    devices: [Option<usize>; MAX_TASK_DEVICES],
+    grants: Grants,
 }
 
 impl Process {
@@ -198,15 +210,25 @@ static TABLE: Mutex<Table> =
 pub fn start() -> ! {
     assert!(!TASKS.is_empty() && TASKS.len() <= MAX_PROCESSES, "need 1..={MAX_PROCESSES} tasks");
     let mut table = TABLE.lock();
-    table.baseline_frames = memory::frames_in_use();
     table.supervisor = TASKS.iter().position(|t| t.supervisor);
+
+    // Grants first: DMA regions are permanent, so they belong in the baseline, not the leak check.
     let mut claimed = [false; pci::MAX_DEVICES];
+    let mut grants = [Grants { devices: [None; MAX_TASK_DEVICES], dma: None }; MAX_PROCESSES];
     for (slot, task) in TASKS.iter().enumerate() {
-        let devices = claim_devices(task, &mut claimed);
-        let (space, context) = load(task, &devices);
+        grants[slot].devices = claim_devices(task, &mut claimed);
+        if task.dma_pages != 0 {
+            grants[slot].dma = Some((memory::alloc_contiguous(task.dma_pages), task.dma_pages));
+        }
+    }
+    table.baseline_frames = memory::frames_in_use();
+
+    for (slot, task) in TASKS.iter().enumerate() {
+        let grants = grants[slot];
+        let (space, context) = load(task, &grants);
         let space = Some(space);
         let death = Death::default();
-        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0, death, devices };
+        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0, death, grants };
         println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), p.context.rip);
         table.procs[slot] = Some(p);
     }
@@ -235,15 +257,20 @@ fn claim_devices(task: &Task, claimed: &mut [bool; pci::MAX_DEVICES]) -> [Option
     devices
 }
 
-/// A fresh address space with `task` loaded, its stack and granted devices mapped, and its
-/// starting registers.
-fn load(task: &Task, devices: &[Option<usize>; MAX_TASK_DEVICES]) -> (AddressSpace, TrapFrame) {
+/// A fresh address space with `task` loaded, its stack, granted devices and DMA region mapped,
+/// and its starting registers.
+fn load(task: &Task, grants: &Grants) -> (AddressSpace, TrapFrame) {
     let space = AddressSpace::new();
     let entry = elf::load(task.image, &space).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
     for page in 1..=USER_STACK_PAGES {
         space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
     }
-    for (d, device) in devices.iter().enumerate() {
+    if let Some((phys, pages)) = grants.dma {
+        for page in 0..pages {
+            space.map_user_pinned(DMA_BASE + page * PAGE_SIZE, phys + page * PAGE_SIZE);
+        }
+    }
+    for (d, device) in grants.devices.iter().enumerate() {
         let Some(device) = device.and_then(pci::get) else { continue };
         for (b, bar) in device.bars.iter().enumerate() {
             if bar.size == 0 || bar.msix {
@@ -628,7 +655,11 @@ pub fn restart(frame: &mut TrapFrame) {
         frame.rax = err::BAD_ARGUMENT; // already restarted, or still alive
         return;
     }
-    let (space, context) = load(p.task, &p.devices);
+    if let Some((phys, pages)) = p.grants.dma {
+        // A fresh start sees a clean DMA region, as at boot.
+        unsafe { memory::phys_to_virt(phys).write_bytes(0, (pages * PAGE_SIZE) as usize) };
+    }
+    let (space, context) = load(p.task, &p.grants);
     p.space = Some(space);
     p.context = context;
     p.generation += 1;
@@ -666,7 +697,21 @@ pub fn task_state(frame: &mut TrapFrame) {
 /// The current task's granted device `index`, if it has one.
 fn my_device(table: &mut Table, index: u64) -> Option<&'static pci::Device> {
     let index = usize::try_from(index).ok().filter(|&i| i < MAX_TASK_DEVICES)?;
-    table.current().devices[index].and_then(pci::get)
+    table.current().grants.devices[index].and_then(pci::get)
+}
+
+/// `dma_info() -> (address, physical address, length)` of this task's DMA region. The physical
+/// address is what a device needs; the region is contiguous and stays the task slot's for life.
+pub fn dma_info(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    match table.current().grants.dma {
+        Some((phys, pages)) => {
+            frame.rax = DMA_BASE;
+            frame.rdx = phys;
+            frame.rsi = pages * PAGE_SIZE;
+        }
+        None => frame.rax = err::BAD_ARGUMENT,
+    }
 }
 
 /// `device_bar(device, bar) -> (address, size)` of a mapped BAR of a granted device.
