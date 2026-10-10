@@ -26,6 +26,8 @@ const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
 const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
+/// Software-defined PTE bit: device registers, not RAM. Never freed, never copied through.
+const DEVICE: u64 = 1 << 9;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -118,6 +120,16 @@ impl AddressSpace {
         unsafe { Cr3::write(frame, Cr3Flags::empty()) };
     }
 
+    /// Map device registers at `phys` into this task at `virt`: user-accessible, uncached,
+    /// non-executable, and marked so they are never freed or copied through.
+    pub fn map_user_device(&self, virt: u64, phys: u64) {
+        assert!(virt % PAGE_SIZE == 0 && virt < USER_END, "bad user address {virt:#x}");
+        let leaf = walk(self.pml4, virt, PRESENT | WRITABLE | USER);
+        assert!(*leaf & PRESENT == 0, "user page {virt:#x} already mapped");
+        let nx = if cpu::nx_enabled() { NO_EXECUTE } else { 0 };
+        *leaf = phys | PRESENT | WRITABLE | USER | WRITE_THROUGH | CACHE_DISABLE | DEVICE | nx;
+    }
+
     /// Map the 4 KiB page at `virt` to a fresh zeroed frame, user-accessible. Returns the frame.
     /// Non-executable pages get the NX bit (when the CPU supports it).
     pub fn map_user_page(&self, virt: u64, writable: bool, executable: bool) -> u64 {
@@ -146,6 +158,9 @@ impl AddressSpace {
             let needed = PRESENT | USER | if write { WRITABLE } else { 0 };
             if entry & needed != needed || (level != 0 && entry & HUGE != 0) {
                 return None;
+            }
+            if level == 0 && entry & DEVICE != 0 {
+                return None; // the direct map does not cover device registers
             }
             table_phys = entry & ADDR_MASK;
         }
@@ -232,7 +247,9 @@ fn free_tables(phys: u64, level: u32, entries: core::ops::Range<usize>) {
         }
         let child = entry & ADDR_MASK;
         if level == 1 {
-            free_frame(child); // a user page
+            if entry & DEVICE == 0 {
+                free_frame(child); // a user page (device registers aren't ours to free)
+            }
         } else {
             assert!(entry & HUGE == 0, "huge page in a user address space");
             free_tables(child, level - 1, 0..512);

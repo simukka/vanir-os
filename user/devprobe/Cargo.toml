@@ -1,0 +1,16 @@
+[package]
+name = "devprobe"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "devprobe"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# Read where the MSI-X table BAR would be mapped: it isn't, so this must fault.
+poke-msix = []

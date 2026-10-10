@@ -35,6 +35,9 @@ CASES=(
   "stale-id        | supervised-echo     | client/stale-id     |               | 1 | re:send to the old id: DEAD\n[\s\S]*send to the new id: ok"
   "sleep-idle      | two-sleepers        |                     |               | 1 | re:sleeper 1: woke after 1[0-3] ticks[\s\S]*sleeper 2: woke after 2[0-3] ticks[\s\S]*sleeper-a\): exited 0, [01] ticks\n[\s\S]*sleeper-b\): exited 0, [01] ticks"
   "sleep-busy      | sleep-while-busy    |                     |               | 5 | re:sleeper 2: woke after 2[0-3] ticks[\s\S]*sleeper\) exited with code 0[\s\S]*runaway\) killed: CPU budget"
+  "device-grant    | devprobe            |                     |               | 1 | re:pci 00:0[0-9a-f]\.0 1af4:1043 virtio-console[\s\S]*devprobe: device 1af4:1043[\s\S]*virtio common config in BAR 4 .*num_queues [0-9]+"
+  "device-no-grant | devprobe-no-grant   |                     |               | 1 | devprobe: no device granted: BAD_ARGUMENT"
+  "device-msix     | devprobe            | devprobe/poke-msix  |               | 5 | re:BAR 1 \(MSI-X\) visible to us: false[\s\S]*devprobe\) killed by vector 14"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }

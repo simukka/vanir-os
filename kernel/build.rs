@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use toml::{Table, Value};
 
+include!("src/pci_kinds.rs");
+
 fn main() {
     let dir = env!("CARGO_MANIFEST_DIR");
     println!("cargo:rustc-link-arg=-T{dir}/linker.ld");
@@ -28,7 +30,7 @@ fn main() {
     for (task, name) in tasks.iter().zip(&names) {
         let task = task.as_table().unwrap();
         for key in task.keys() {
-            let known = ["name", "program", "budget", "supervisor", "sends"];
+            let known = ["name", "program", "budget", "supervisor", "sends", "devices"];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
         let program = task.get("program").and_then(Value::as_str).unwrap_or(name);
@@ -48,13 +50,29 @@ fn main() {
                 .collect(),
         };
         assert!(names.iter().filter(|n| *n == name).count() == 1, "{app}: duplicate task name {name}");
+        // Each entry claims the next unclaimed device of that kind, in PCI discovery order.
+        let devices: Vec<usize> = match task.get("devices") {
+            None => vec![],
+            Some(v) => v
+                .as_array()
+                .expect("devices: array of device names")
+                .iter()
+                .map(|d| {
+                    let d = d.as_str().expect("devices: names");
+                    KINDS.iter().position(|(k, _, _)| *k == d).unwrap_or_else(|| {
+                        let known: Vec<_> = KINDS.iter().map(|(k, _, _)| *k).collect();
+                        panic!("{app}: {name}: unknown device {d} (known: {known:?})")
+                    })
+                })
+                .collect(),
+        };
 
         let path = format!("{dir}/../build/{program}.elf");
         println!("cargo:rerun-if-changed={path}");
         writeln!(
             out,
             "    Task {{ name: {name:?}, image: include_bytes!({path:?}), budget_ticks: {budget}, \
-             supervisor: {supervisor}, sends: &{sends:?} }},"
+             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?} }},"
         )
         .unwrap();
     }

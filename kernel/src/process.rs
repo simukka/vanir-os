@@ -19,7 +19,7 @@ use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
-use crate::{apic, elf, gdt};
+use crate::{apic, elf, gdt, pci};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
@@ -31,6 +31,8 @@ pub struct Task {
     pub supervisor: bool,
     /// Indices of the tasks this one may send IPC messages to.
     pub sends: &'static [usize],
+    /// Kinds of PCI device granted (indices into `pci::KINDS`), one device each.
+    pub devices: &'static [usize],
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
@@ -41,6 +43,14 @@ const USER_STACK_PAGES: u64 = 4;
 
 /// Largest message or reply, in bytes; bounds the time one syscall spends copying.
 pub const MAX_MESSAGE: u64 = 4096;
+
+/// Most devices one task may be granted.
+const MAX_TASK_DEVICES: usize = 4;
+/// Where granted devices' BARs appear in a task: device `d`'s BAR `b` is mapped at
+/// `DEVICE_BASE + d * DEVICE_STRIDE + b * BAR_STRIDE`.
+const DEVICE_BASE: u64 = 0x10_0000_0000;
+const DEVICE_STRIDE: u64 = 0x1000_0000;
+const BAR_STRIDE: u64 = 0x200_0000;
 
 /// Kernel error codes returned by IPC syscalls. The top bit is set, so they never collide with a
 /// server's reply codes (which must have it clear).
@@ -115,6 +125,8 @@ struct Process {
     state: State,
     ticks: u64,
     death: Death,
+    /// PCI devices granted to this task (indices for `pci::get`), assigned once at boot.
+    devices: [Option<usize>; MAX_TASK_DEVICES],
 }
 
 impl Process {
@@ -188,10 +200,13 @@ pub fn start() -> ! {
     let mut table = TABLE.lock();
     table.baseline_frames = memory::frames_in_use();
     table.supervisor = TASKS.iter().position(|t| t.supervisor);
+    let mut claimed = [false; pci::MAX_DEVICES];
     for (slot, task) in TASKS.iter().enumerate() {
-        let (space, context) = load(task);
+        let devices = claim_devices(task, &mut claimed);
+        let (space, context) = load(task, &devices);
         let space = Some(space);
-        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0, death: Death::default() };
+        let death = Death::default();
+        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0, death, devices };
         println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), p.context.rip);
         table.procs[slot] = Some(p);
     }
@@ -206,12 +221,40 @@ pub fn start() -> ! {
     enter_user(rip, rsp)
 }
 
-/// A fresh address space with `task` loaded and its stack mapped, and its starting registers.
-fn load(task: &Task) -> (AddressSpace, TrapFrame) {
+/// For each device kind the task asks for, take the next unclaimed device of that kind.
+fn claim_devices(task: &Task, claimed: &mut [bool; pci::MAX_DEVICES]) -> [Option<usize>; MAX_TASK_DEVICES] {
+    assert!(task.devices.len() <= MAX_TASK_DEVICES, "{}: too many devices", task.name);
+    let mut devices = [None; MAX_TASK_DEVICES];
+    for (i, &kind) in task.devices.iter().enumerate() {
+        devices[i] = pci::of_kind(kind).find(|&d| !claimed[d]);
+        match devices[i] {
+            Some(d) => claimed[d] = true,
+            None => println!("[kernel] {}: no {} device found", task.name, pci::KINDS[kind].0),
+        }
+    }
+    devices
+}
+
+/// A fresh address space with `task` loaded, its stack and granted devices mapped, and its
+/// starting registers.
+fn load(task: &Task, devices: &[Option<usize>; MAX_TASK_DEVICES]) -> (AddressSpace, TrapFrame) {
     let space = AddressSpace::new();
     let entry = elf::load(task.image, &space).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
     for page in 1..=USER_STACK_PAGES {
         space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
+    }
+    for (d, device) in devices.iter().enumerate() {
+        let Some(device) = device.and_then(pci::get) else { continue };
+        for (b, bar) in device.bars.iter().enumerate() {
+            if bar.size == 0 || bar.msix {
+                continue; // absent, or the MSI-X table: interrupt routing stays with the kernel
+            }
+            assert!(bar.size <= BAR_STRIDE, "{}: BAR {} too large to map", task.name, b);
+            let base = DEVICE_BASE + d as u64 * DEVICE_STRIDE + b as u64 * BAR_STRIDE;
+            for offset in (0..bar.size.max(PAGE_SIZE)).step_by(PAGE_SIZE as usize) {
+                space.map_user_device(base + offset, bar.phys + offset);
+            }
+        }
     }
     (space, initial_context(entry, USER_STACK_TOP))
 }
@@ -585,7 +628,7 @@ pub fn restart(frame: &mut TrapFrame) {
         frame.rax = err::BAD_ARGUMENT; // already restarted, or still alive
         return;
     }
-    let (space, context) = load(p.task);
+    let (space, context) = load(p.task, &p.devices);
     p.space = Some(space);
     p.context = context;
     p.generation += 1;
@@ -616,6 +659,39 @@ pub fn task_state(frame: &mut TrapFrame) {
         State::OverBudget => 4,
     };
     frame.rdx = p.id();
+}
+
+// ---- Devices -------------------------------------------------------------------------------
+
+/// The current task's granted device `index`, if it has one.
+fn my_device(table: &mut Table, index: u64) -> Option<&'static pci::Device> {
+    let index = usize::try_from(index).ok().filter(|&i| i < MAX_TASK_DEVICES)?;
+    table.current().devices[index].and_then(pci::get)
+}
+
+/// `device_bar(device, bar) -> (address, size)` of a mapped BAR of a granted device.
+pub fn device_bar(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let (index, b) = (frame.rdi, frame.rsi);
+    let bar = my_device(&mut table, index).and_then(|d| d.bars.get(b as usize)).filter(|bar| bar.size != 0 && !bar.msix);
+    match bar {
+        Some(bar) => {
+            frame.rax = DEVICE_BASE + index * DEVICE_STRIDE + b * BAR_STRIDE;
+            frame.rdx = bar.size;
+        }
+        None => frame.rax = err::BAD_ARGUMENT,
+    }
+}
+
+/// `pci_config_read(device, offset) -> u32` from a granted device's configuration space.
+/// Read-only: configuration (including interrupt routing) stays with the kernel.
+pub fn pci_config_read(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let offset = frame.rsi;
+    frame.rax = match my_device(&mut table, frame.rdi) {
+        Some(d) if offset < 256 && offset % 4 == 0 => d.read(offset as u8) as u64,
+        _ => err::BAD_ARGUMENT,
+    };
 }
 
 // ---- The end ---------------------------------------------------------------------------------

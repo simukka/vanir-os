@@ -15,6 +15,7 @@ mod elf;
 mod gdt;
 mod interrupts;
 mod memory;
+mod pci;
 mod process;
 mod syscall;
 mod usercopy;
@@ -60,6 +61,7 @@ extern "C" fn kmain() -> ! {
     let memmap = MEMMAP_REQUEST.get_response().expect("no memory map response");
     memory::init(hhdm.offset(), memmap.entries());
     apic::init();
+    pci::init();
 
     process::start()
 }

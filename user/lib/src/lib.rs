@@ -22,6 +22,8 @@ pub const SYS_TASK_STATE: u64 = 104;
 pub const SYS_LOOKUP: u64 = 105;
 pub const SYS_SLEEP: u64 = 106;
 pub const SYS_UPTIME: u64 = 107;
+pub const SYS_DEVICE_BAR: u64 = 110;
+pub const SYS_PCI_CONFIG_READ: u64 = 111;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -145,6 +147,24 @@ pub fn restart(id: u64) -> Result<u64, u64> {
 pub fn task_state(id: u64) -> Result<(u64, u64), u64> {
     let (state, current, _) = syscall6(SYS_TASK_STATE, [id, 0, 0, 0, 0, 0]);
     if err::is_error(state) { Err(state) } else { Ok((state, current)) }
+}
+
+/// Where the kernel maps granted devices' BARs (see `device_bar`).
+pub const DEVICE_BASE: u64 = 0x10_0000_0000;
+pub const DEVICE_STRIDE: u64 = 0x1000_0000;
+pub const BAR_STRIDE: u64 = 0x200_0000;
+
+/// Address and size of BAR `bar` of this task's granted device `device` (manifest order).
+/// Fails for missing devices, absent BARs, and the BAR holding the MSI-X table.
+pub fn device_bar(device: u64, bar: u64) -> Result<(u64, u64), u64> {
+    let (addr, size, _) = syscall6(SYS_DEVICE_BAR, [device, bar, 0, 0, 0, 0]);
+    if err::is_error(addr) { Err(addr) } else { Ok((addr, size)) }
+}
+
+/// Read a 32-bit word of a granted device's PCI configuration space.
+pub fn pci_config_read(device: u64, offset: u64) -> Result<u32, u64> {
+    let (value, _, _) = syscall6(SYS_PCI_CONFIG_READ, [device, offset, 0, 0, 0, 0]);
+    if err::is_error(value) { Err(value) } else { Ok(value as u32) }
 }
 
 /// The id of the task called `name` in the app manifest.

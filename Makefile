@@ -10,15 +10,18 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
 QEMU           := qemu-system-x86_64
 ACCEL          := tcg
 CPU_FLAGS      := $(if $(filter kvm,$(ACCEL)),-enable-kvm -cpu host,-cpu max)
+# The virtio console carries telemetry to the host (build/telemetry.log); COM1 stays the boot log.
 QEMU_FLAGS     := -M q35 $(CPU_FLAGS) -m 128M -cdrom $(ISO) -serial stdio -display none \
-                  -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04
+                  -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+                  -device virtio-serial-pci,id=vser,disable-legacy=on \
+                  -chardev file,id=tel,path=build/telemetry.log -device virtconsole,chardev=tel,bus=vser.0
 
 USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(USER_FEATURES)")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
