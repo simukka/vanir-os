@@ -11,7 +11,7 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -50,6 +50,12 @@ SB_UNSIGNED_LOADER :=
 # TPM=1 attaches a software TPM (swtpm, state in build/tpm): with BOOT=uefi-secure the firmware
 # measures the boot loader and Secure Boot state, and the kernel measures itself and every task.
 TPM            :=
+# DISK=1 attaches build/disk.img (64 MiB, kept across runs) as a virtio block device;
+# DISK_RESET=1 starts it from zeros.
+DISK           :=
+DISK_RESET     :=
+DISK_FLAGS     = $(if $(DISK),-drive file=build/disk.img$(,)if=none$(,)id=d0$(,)format=raw \
+                   -device virtio-blk-pci$(,)drive=d0$(,)disable-legacy=on)
 UEFI           := $(filter uefi-secure,$(BOOT))
 IMAGE          := $(if $(UEFI),esp,$(ISO))
 BOOT_FLAGS     := $(if $(UEFI),-M q35$(,)smm=on -global driver=cfi.pflash01$(,)property=secure$(,)value=on \
@@ -65,19 +71,24 @@ QEMU_FLAGS     := $(BOOT_FLAGS) $(CPU_FLAGS) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
                   -device virtio-serial-pci,id=vser,disable-legacy=on \
                   -chardev file,id=tel,path=$(CONSOLE_LOG) -device virtconsole,chardev=tel,bus=vser.0 \
-                  $(VSOCK_FLAGS)
+                  $(VSOCK_FLAGS) $(DISK_FLAGS)
 
 USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(USER_FEATURES)")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
 
-.PHONY: all iso esp image kernel user run run-debug test qemu-cmd clean distclean FORCE
+.PHONY: all iso esp image disk kernel user run run-debug test qemu-cmd clean distclean FORCE
 
 all: $(ISO)
 
 iso: $(ISO)
 
-# Whatever BOOT boots from.
-image: $(IMAGE)
+# Whatever BOOT boots from, and the disk if DISK is set.
+image: $(IMAGE) $(if $(DISK),disk)
+
+disk:
+	@mkdir -p build
+	$(if $(DISK_RESET),rm -f build/disk.img)
+	[ -f build/disk.img ] || truncate -s 64M build/disk.img
 
 $(SIGNING_KEY):
 	@mkdir -p $(dir $@)

@@ -206,6 +206,88 @@ pub fn dma_info() -> Result<(u64, u64, u64), u64> {
     if err::is_error(addr) { Err(addr) } else { Ok((addr, phys, len)) }
 }
 
+/// Block-device IPC interface, served by the virtio-blk driver and (per volume) by the storage
+/// task. Blocks are 4 KiB; the block number rides in `op` above the operation code, so a write
+/// message is exactly one block.
+pub mod block {
+    use super::{send, yield_now};
+
+    pub const BLOCK_SIZE: usize = 4096;
+
+    /// Reply: the block's 4096 bytes.
+    pub const OP_READ: u64 = 1;
+    /// Message: the block's 4096 bytes.
+    pub const OP_WRITE: u64 = 2;
+    /// Replied once everything written before it is on stable storage.
+    pub const OP_FLUSH: u64 = 3;
+    /// Reply: capacity in blocks (u64, little endian).
+    pub const OP_INFO: u64 = 4;
+
+    pub const CODE_OK: u64 = 0;
+    pub const CODE_BUSY: u64 = 1;
+    pub const CODE_BAD_OP: u64 = 2;
+    pub const CODE_OUT_OF_RANGE: u64 = 3;
+    pub const CODE_IO_ERROR: u64 = 4;
+    /// Storage task: no key yet (see F4); try again later.
+    pub const CODE_LOCKED: u64 = 5;
+    /// Storage task: the block failed its integrity check.
+    pub const CODE_INTEGRITY: u64 = 6;
+
+    pub fn op(code: u64, block: u64) -> u64 {
+        code | block << 8
+    }
+
+    /// Split an `op` into (operation code, block number).
+    pub fn split(op: u64) -> (u64, u64) {
+        (op & 0xff, op >> 8)
+    }
+
+    /// Send `msg` with `op` to `server`, retrying while it is busy. Returns the reply length;
+    /// fails with the server's code or a kernel error.
+    fn call(server: u64, op: u64, msg: &[u8], reply: &mut [u8]) -> Result<usize, u64> {
+        loop {
+            match send(server, op, msg, reply) {
+                Ok((CODE_OK, n)) => return Ok(n),
+                Ok((CODE_BUSY, _)) => yield_now(),
+                Ok((code, _)) => return Err(code),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn read(server: u64, block: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), u64> {
+        call(server, op(OP_READ, block), &[], buf).map(|_| ())
+    }
+
+    pub fn write(server: u64, block: u64, data: &[u8; BLOCK_SIZE]) -> Result<(), u64> {
+        call(server, op(OP_WRITE, block), data, &mut []).map(|_| ())
+    }
+
+    pub fn flush(server: u64) -> Result<(), u64> {
+        call(server, OP_FLUSH, &[], &mut []).map(|_| ())
+    }
+
+    /// Capacity in blocks.
+    pub fn capacity(server: u64) -> Result<u64, u64> {
+        let mut out = [0u8; 8];
+        call(server, OP_INFO, &[], &mut out)?;
+        Ok(u64::from_le_bytes(out))
+    }
+
+    pub fn code_name(code: u64) -> &'static str {
+        match code {
+            CODE_OK => "OK",
+            CODE_BUSY => "BUSY",
+            CODE_BAD_OP => "BAD_OP",
+            CODE_OUT_OF_RANGE => "OUT_OF_RANGE",
+            CODE_IO_ERROR => "IO_ERROR",
+            CODE_LOCKED => "LOCKED",
+            CODE_INTEGRITY => "INTEGRITY",
+            _ => super::err::name(code),
+        }
+    }
+}
+
 /// Client side of the console driver's IPC interface (`user/virtio-console`).
 pub mod console {
     use super::{err, send, yield_now};

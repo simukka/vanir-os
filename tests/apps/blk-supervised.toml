@@ -1,0 +1,13 @@
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "disk"
+program = "virtio-blk"
+devices = ["virtio-blk"]
+dma_pages = 16
+
+[[task]]
+name = "blktest"
+sends = ["disk"]

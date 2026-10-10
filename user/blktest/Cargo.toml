@@ -1,0 +1,16 @@
+[package]
+name = "blktest"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "blktest"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# Only check what an earlier boot wrote (persistence test).
+check-only = []

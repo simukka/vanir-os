@@ -1,0 +1,17 @@
+[package]
+name = "virtio-blk"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "virtio-blk"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+virtio = { path = "../virtio" }
+
+[features]
+# First start only: fault right after submitting the 10th write (a write is in flight).
+crash-after-10 = []
