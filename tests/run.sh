@@ -36,7 +36,7 @@ for case in "${CASES[@]}"; do
   if ! build_log=$(make -s iso TASKS="$tasks" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" 2>&1); then
     echo "FAIL $name: build failed"; echo "$build_log"; failed=1; continue
   fi
-  out=$(timeout 60 $(make -s qemu-cmd) 2>&1)
+  out=$(timeout 60 $(make -s qemu-cmd ACCEL="${ACCEL:-tcg}") 2>&1)
   status=$?
 
   if [[ "$want_text" == re:* ]]; then

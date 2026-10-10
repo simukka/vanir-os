@@ -4,6 +4,7 @@
 #   make run TASKS="spinner spinner"     choose the task table (name[:cpu budget in ticks] ...)
 #   make run-debug                    also log interrupts/CPU resets to qemu.log
 #   make test                         boot every scenario in tests/run.sh and check the results
+#   make test ACCEL=kvm               same, under KVM instead of QEMU's emulator
 
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
@@ -14,7 +15,9 @@ USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
 QEMU           := qemu-system-x86_64
-QEMU_FLAGS     := -M q35 -cpu max -m 128M -cdrom $(ISO) -serial stdio -display none \
+ACCEL          := tcg
+CPU_FLAGS      := $(if $(filter kvm,$(ACCEL)),-enable-kvm -cpu host,-cpu max)
+QEMU_FLAGS     := -M q35 $(CPU_FLAGS) -m 128M -cdrom $(ISO) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04
 
 USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(addprefix hello/,$(USER_FEATURES))")
@@ -61,7 +64,7 @@ run-debug: $(ISO)
 	$(QEMU) $(QEMU_FLAGS) -d int,cpu_reset -D qemu.log; s=$$?; [ $$s -eq 1 ] || exit $$s
 
 test:
-	tests/run.sh
+	ACCEL=$(ACCEL) tests/run.sh
 
 # Used by tests/run.sh so it boots with exactly the flags above.
 qemu-cmd:
