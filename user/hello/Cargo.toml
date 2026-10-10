@@ -1,0 +1,13 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hello"
+test = false
+bench = false
+
+[features]
+# Isolation test: read a kernel address from ring 3; must #PF.
+poke-kernel = []
