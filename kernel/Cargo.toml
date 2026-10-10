@@ -12,3 +12,7 @@ bench = false
 limine = "0.5"
 spin = "0.10"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+
+[features]
+# Test only: sys_write skips stac, so SMAP must fault the kernel on the user buffer.
+smap-selftest = []

@@ -9,6 +9,7 @@
 
 #[macro_use]
 mod serial;
+mod cpu;
 mod gdt;
 mod interrupts;
 mod memory;
@@ -47,6 +48,7 @@ extern "C" fn kmain() -> ! {
     println!("[kernel] vanir-os booting");
     assert!(BASE_REVISION.is_supported(), "Limine base revision 3 not supported");
 
+    cpu::enable_protections();
     mask_legacy_pic();
     gdt::init();
     interrupts::init();

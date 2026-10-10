@@ -23,7 +23,10 @@ pub fn dispatch(frame: &mut TrapFrame) {
 fn sys_write(ptr: u64, len: u64) -> u64 {
     match ptr.checked_add(len) {
         Some(end) if end <= USER_END => {
+            #[cfg(not(feature = "smap-selftest"))]
+            crate::cpu::stac();
             serial::write_bytes(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) });
+            crate::cpu::clac();
             len
         }
         _ => ERROR,

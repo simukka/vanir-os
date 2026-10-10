@@ -11,7 +11,7 @@ use x86_64::instructions::tables::lidt;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::DescriptorTablePointer;
 
-use crate::{gdt, syscall};
+use crate::{gdt, serial, syscall};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -254,6 +254,8 @@ const EXCEPTION_NAMES: [&str; 32] = [
 ];
 
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
+    crate::cpu::clac();
+
     if frame.vector == SYSCALL_VECTOR as u64 {
         syscall::dispatch(frame);
         return;
@@ -261,10 +263,15 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 
     let name = EXCEPTION_NAMES.get(frame.vector as usize).copied().unwrap_or("unknown");
     let ring = if frame.from_user() { "user" } else { "kernel" };
-    println!("\n[kernel] {} in {} mode", name, ring);
-    println!("  vector={} error={:#x} rip={:#x} rsp={:#x}", frame.vector, frame.error_code, frame.rip, frame.rsp);
+    // Unlocked: the fault may have hit while the serial lock was held.
+    let print = |args: core::fmt::Arguments| serial::print_unlocked(args);
+    print(format_args!("\n[kernel] {} in {} mode\n", name, ring));
+    print(format_args!(
+        "  vector={} error={:#x} rip={:#x} rsp={:#x}\n",
+        frame.vector, frame.error_code, frame.rip, frame.rsp
+    ));
     if frame.vector == 14 {
-        println!("  cr2={:#x}", Cr2::read_raw());
+        print(format_args!("  cr2={:#x}\n", Cr2::read_raw()));
     }
     // No scheduler: a faulting process (or kernel) ends the machine.
     crate::halt(if frame.from_user() { 2 } else { 3 });

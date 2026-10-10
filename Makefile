@@ -2,30 +2,34 @@
 #   make run                          normal boot
 #   make run USER_FEATURES=poke-kernel   isolation test: user reads kernel memory, must #PF
 #   make run-debug                    also log interrupts/CPU resets to qemu.log
-#   make test                         boot headless and check the exit status / output
+#   make test                         boot every scenario in tests/run.sh and check the results
 
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 USER_FEATURES  :=
+KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
 QEMU           := qemu-system-x86_64
-QEMU_FLAGS     := -M q35 -m 128M -cdrom $(ISO) -serial stdio -display none \
+QEMU_FLAGS     := -M q35 -cpu max -m 128M -cdrom $(ISO) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04
 
-CARGO_FEATURES := $(if $(USER_FEATURES),--features $(USER_FEATURES))
+USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features $(USER_FEATURES))
+KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
 
-.PHONY: all kernel user run run-debug test clean distclean FORCE
+.PHONY: all iso kernel user run run-debug test qemu-cmd clean distclean FORCE
 
 all: $(ISO)
 
+iso: $(ISO)
+
 user: FORCE
-	cargo build -p hello --$(PROFILE) $(CARGO_FEATURES)
+	cargo build -p hello --$(PROFILE) $(USER_CARGO_FEATURES)
 	@mkdir -p build
 	objcopy -O binary $(TARGET_DIR)/hello build/hello.bin
 
 kernel: user
-	cargo build -p vanir-kernel --$(PROFILE)
+	cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
 
 limine/limine:
 	git clone --depth=1 --branch=$(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git limine
@@ -53,11 +57,12 @@ run: $(ISO)
 run-debug: $(ISO)
 	$(QEMU) $(QEMU_FLAGS) -d int,cpu_reset -D qemu.log; s=$$?; [ $$s -eq 1 ] || exit $$s
 
-test: $(ISO)
-	@out=$$(timeout 20 $(QEMU) $(QEMU_FLAGS)); s=$$?; echo "$$out"; \
-	 echo "$$out" | grep -q 'hello from ring 3' && \
-	 echo "$$out" | grep -q 'exited with code 0 (called from CPL 3)' && [ $$s -eq 1 ] \
-	 && echo "PASS" || { echo "FAIL (qemu status $$s)"; exit 1; }
+test:
+	tests/run.sh
+
+# Used by tests/run.sh so it boots with exactly the flags above.
+qemu-cmd:
+	@echo $(QEMU) $(QEMU_FLAGS)
 
 clean:
 	cargo clean
