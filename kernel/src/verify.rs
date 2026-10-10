@@ -38,8 +38,13 @@ impl Rejection {
 }
 
 /// Check `image` against signature file `sig` for `program`. Returns the signed version and the
-/// image's SHA-256 (the value later measured into the TPM).
-pub fn check(program: &str, image: Option<&[u8]>, sig: Option<&[u8]>, min_version: u64) -> Result<(u64, [u8; 32]), Rejection> {
+/// signed statement (program, version, hash: what gets measured into the TPM).
+pub fn check(
+    program: &str,
+    image: Option<&[u8]>,
+    sig: Option<&'static [u8]>,
+    min_version: u64,
+) -> Result<(u64, &'static [u8]), Rejection> {
     let image = image.ok_or(Rejection::NoImage)?;
     let sig = sig.ok_or(Rejection::NoSignature)?;
     if sig.len() != SIG_FILE_LEN || &sig[..8] != MAGIC {
@@ -64,5 +69,5 @@ pub fn check(program: &str, image: Option<&[u8]>, sig: Option<&[u8]>, min_versio
     if version < min_version {
         return Err(Rejection::TooOld);
     }
-    Ok((version, hash))
+    Ok((version, signed))
 }

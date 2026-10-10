@@ -16,17 +16,21 @@ mod events;
 mod gdt;
 mod interrupts;
 mod irq;
+mod measure;
 mod memory;
 mod modules;
 mod pci;
 mod process;
 mod syscall;
+mod tpm;
 mod usercopy;
 mod verify;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{
+    ExecutableFileRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker,
+};
 use x86_64::instructions::{hlt, interrupts as cpu_interrupts, port::Port};
 
 // Base revision 3 is supported by Limine v8 and later.
@@ -45,6 +49,10 @@ static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static KERNEL_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -72,7 +80,8 @@ extern "C" fn kmain() -> ! {
     apic::init();
     pci::init();
 
-    process::start()
+    let kernel = KERNEL_FILE_REQUEST.get_response().expect("no kernel file response").file();
+    process::start(unsafe { core::slice::from_raw_parts(kernel.addr(), kernel.size() as usize) })
 }
 
 /// The boot banner on the serial console

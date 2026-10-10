@@ -57,6 +57,9 @@ CASES=(
   "sb-tampered-kernel | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm SB_TAMPER_KERNEL=1 TIMEOUT=25     | 124 | re:Blake2b hash for URI .boot\(\):/boot/vanir-kernel. does not match"
   "sb-edited-config   | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm SB_EDIT_CONFIG=1 TIMEOUT=25       | 124 | CHECKSUM MISMATCH FOR CONFIG FILE"
   "sb-unsigned-loader | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm SB_UNSIGNED_LOADER=1 TIMEOUT=25   | 124 | re:failed to load Boot[0-9]+ .UEFI QEMU HARDDISK[^\n]*Access Denied"
+  "measured-boot      | sig-pair                |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1                             | 1 | cmd:out=\$(cat); want=\$(tools/expected-pcrs.py --app tests/apps/sig-pair.toml); grep -q \"tpm: PCR12 = \$want\" <<<\"\$out\""
+  "measured-rejected  | sig-pair                |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TAMPER=hello                | 5 | cmd:out=\$(cat); want=\$(tools/expected-pcrs.py --app tests/apps/sig-pair.toml --rejected hello); grep -q \"tpm: PCR12 = \$want\" <<<\"\$out\""
+  "no-tpm             | hello                   |                                                           |               |                                                              | 1 | tpm: none found; the boot is not measured"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }

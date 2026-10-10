@@ -15,7 +15,7 @@ USER_PROGS     := hello spinner isolation runaway echo client deadlock superviso
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
-QEMU           := qemu-system-x86_64
+QEMU           = $(if $(TPM),tools/with-swtpm.sh )qemu-system-x86_64
 , := ,
 ACCEL          := tcg
 # Telemetry uplink: "console" (virtio console -> build/telemetry.log) or "vsock" (vhost-vsock:
@@ -47,6 +47,9 @@ SB_KEY         := build/secureboot.key
 SB_TAMPER_KERNEL   :=
 SB_EDIT_CONFIG     :=
 SB_UNSIGNED_LOADER :=
+# TPM=1 attaches a software TPM (swtpm, state in build/tpm): with BOOT=uefi-secure the firmware
+# measures the boot loader and Secure Boot state, and the kernel measures itself and every task.
+TPM            :=
 UEFI           := $(filter uefi-secure,$(BOOT))
 IMAGE          := $(if $(UEFI),esp,$(ISO))
 BOOT_FLAGS     := $(if $(UEFI),-M q35$(,)smm=on -global driver=cfi.pflash01$(,)property=secure$(,)value=on \

@@ -20,7 +20,7 @@ use spin::Mutex;
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
 use crate::verify::{self, Rejection};
-use crate::{apic, elf, events, gdt, irq, modules, pci};
+use crate::{apic, elf, events, gdt, irq, measure, modules, pci, tpm};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
@@ -240,8 +240,9 @@ static TABLE: Mutex<Table> =
     stalled_since: None,
 });
 
-/// Load every task, then enter the first one. Never returns.
-pub fn start() -> ! {
+/// Check every task's image, measure the boot, load the tasks, then enter the first one.
+/// `kernel_file` is the kernel's own image, for the measurement. Never returns.
+pub fn start(kernel_file: &[u8]) -> ! {
     assert!(!TASKS.is_empty() && TASKS.len() <= MAX_PROCESSES, "need 1..={MAX_PROCESSES} tasks");
     let mut table = TABLE.lock();
     table.supervisor = TASKS.iter().position(|t| t.supervisor);
@@ -265,11 +266,15 @@ pub fn start() -> ! {
             grants[slot].dma = Some((memory::alloc_contiguous(task.dma_pages), task.dma_pages));
         }
     }
+    // Mapping the TPM's registers allocates kernel page tables: do it before the baseline too.
+    tpm::init();
     table.baseline_frames = memory::frames_in_use();
 
+    let mut measured: [(&'static str, Option<&[u8]>); MAX_PROCESSES] = [("", None); MAX_PROCESSES];
     for (slot, task) in TASKS.iter().enumerate() {
         let grants = grants[slot];
         let checked = verify::check(task.program, modules::find(task.program), signature_of(task.program), task.min_version);
+        measured[slot] = (task.name, checked.ok().map(|(_, statement)| statement));
         let mut p = Process {
             slot,
             generation: 0,
@@ -283,7 +288,7 @@ pub fn start() -> ! {
             recv_deadline: None,
         };
         match checked {
-            Ok((version, _hash)) => {
+            Ok((version, _statement)) => {
                 let (space, context) = load(task, &grants);
                 p.space = Some(space);
                 p.context = context;
@@ -299,6 +304,8 @@ pub fn start() -> ! {
         }
         table.procs[slot] = Some(p);
     }
+
+    measure::boot(kernel_file, MANIFEST, &measured[..TASKS.len()]);
 
     let Some(first) = table.procs.iter().flatten().position(|p| p.state == State::Ready) else {
         finish(&table) // every image was rejected

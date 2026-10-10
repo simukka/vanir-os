@@ -90,6 +90,8 @@ fn main() {
     assert!(supervisors <= 1, "{app}: at most one supervisor");
     assert!(readers <= 1, "{app}: at most one task may read the event log");
     out.push_str("];\n");
+    // The manifest itself, measured into the TPM at boot.
+    out.push_str(&format!("pub static MANIFEST: &str = include_str!({app:?});\n"));
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/tasks.rs"), out).unwrap();
 }
