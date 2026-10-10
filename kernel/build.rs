@@ -34,11 +34,12 @@ fn main() {
         .collect();
     let mut supervisors = 0;
     let mut readers = 0;
+    let mut tpm_users = 0;
     let mut out = String::from("pub static TASKS: &[Task] = &[\n");
     for (task, name) in tasks.iter().zip(&names) {
         let task = task.as_table().unwrap();
         for key in task.keys() {
-            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events", "min_version"];
+            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events", "min_version", "tpm"];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
         let program = task.get("program").and_then(Value::as_str).unwrap_or(name);
@@ -49,6 +50,8 @@ fn main() {
         let supervisor = task.get("supervisor").is_some_and(|v| v.as_bool().expect("supervisor: bool"));
         supervisors += supervisor as u32;
         let events = task.get("events").is_some_and(|v| v.as_bool().expect("events: bool"));
+        let tpm = task.get("tpm").is_some_and(|v| v.as_bool().expect("tpm: bool"));
+        tpm_users += tpm as u32;
         readers += events as u32;
         let sends: Vec<usize> = match task.get("sends") {
             None => vec![],
@@ -83,12 +86,13 @@ fn main() {
         writeln!(
             out,
             "    Task {{ name: {name:?}, program: {program:?}, budget_ticks: {budget}, \
-             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events}, min_version: {min_version} }},"
+             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events}, min_version: {min_version}, tpm: {tpm} }},"
         )
         .unwrap();
     }
     assert!(supervisors <= 1, "{app}: at most one supervisor");
     assert!(readers <= 1, "{app}: at most one task may read the event log");
+    assert!(tpm_users <= 1, "{app}: at most one task may use the TPM");
     out.push_str("];\n");
     // The manifest itself, measured into the TPM at boot.
     out.push_str(&format!("pub static MANIFEST: &str = include_str!({app:?});\n"));

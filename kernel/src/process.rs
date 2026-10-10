@@ -41,6 +41,9 @@ pub struct Task {
     pub events: bool,
     /// Oldest signed version of the program that may run (rollback protection).
     pub min_version: u64,
+    /// Gets the TPM's registers mapped, and the measurement log (for attestation). The kernel
+    /// itself uses the TPM only before tasks start.
+    pub tpm: bool,
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
@@ -61,6 +64,8 @@ const DEVICE_STRIDE: u64 = 0x1000_0000;
 const BAR_STRIDE: u64 = 0x200_0000;
 /// Where a task's DMA region appears.
 const DMA_BASE: u64 = 0x20_0000_0000;
+/// Where the TPM's CRB page appears in the task granted `tpm = true`.
+const TPM_BASE: u64 = 0x30_0000_0000;
 
 /// What a task slot is given at boot and keeps across restarts.
 #[derive(Clone, Copy)]
@@ -355,6 +360,9 @@ fn load(task: &Task, grants: &Grants) -> (AddressSpace, TrapFrame) {
         for page in 0..pages {
             space.map_user_pinned(DMA_BASE + page * PAGE_SIZE, phys + page * PAGE_SIZE);
         }
+    }
+    if task.tpm && tpm::present() {
+        space.map_user_device(TPM_BASE, tpm::CRB_PHYS);
     }
     for (d, device) in grants.devices.iter().enumerate() {
         let Some(device) = device.and_then(pci::get) else { continue };
@@ -858,6 +866,41 @@ fn my_device(table: &mut Table, index: u64) -> Option<&'static pci::Device> {
 
 /// `dma_info() -> (address, physical address, length)` of this task's DMA region. The physical
 /// address is what a device needs; the region is contiguous and stays the task slot's for life.
+/// `measurements(buf, cap) -> (count, tpm address)`: the boot measurement log as 48-byte
+/// entries (16-byte zero-padded name, 32-byte SHA-256), and where the TPM is mapped. Only for the
+/// task with `tpm = true`; BAD_ARGUMENT if there is no TPM.
+pub fn measurements(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if !table.current().task.tpm {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    if !tpm::present() {
+        frame.rax = err::BAD_ARGUMENT;
+        return;
+    }
+    let mut out = [0u8; 48 * 16];
+    let mut count = 0;
+    for entry in measure::log().iter().flatten() {
+        let record = &mut out[48 * count..48 * (count + 1)];
+        let name = entry.what.as_bytes();
+        record[..name.len().min(16)].copy_from_slice(&name[..name.len().min(16)]);
+        record[16..].copy_from_slice(&entry.digest);
+        count += 1;
+    }
+    if frame.rsi < (48 * count) as u64 {
+        frame.rax = err::TOO_LONG;
+        return;
+    }
+    match memory::copy_to_user_space(table.current().space(), frame.rdi, &out[..48 * count]) {
+        Ok(()) => {
+            frame.rax = count as u64;
+            frame.rdx = TPM_BASE;
+        }
+        Err(_) => frame.rax = err::BAD_BUFFER,
+    }
+}
+
 pub fn dma_info(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     match table.current().grants.dma {

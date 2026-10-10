@@ -1,0 +1,15 @@
+# Remote attestation: control reads "attest <nonce>" from the host over vsock, asks attest for a
+# TPM quote, and sends it back.
+[[task]]
+name = "uplink"
+program = "virtio-vsock"
+devices = ["virtio-vsock"]
+dma_pages = 32
+
+[[task]]
+name = "attest"
+tpm = true
+
+[[task]]
+name = "control"
+sends = ["uplink", "attest"]

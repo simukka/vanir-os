@@ -16,13 +16,18 @@ pub const PCR: u32 = 12;
 const MAX_ENTRIES: usize = 16;
 
 /// The measurement log: what was extended into PCR 12, in order.
-#[allow(dead_code)] // read by the attestation task's syscall
+#[derive(Clone, Copy)]
 pub struct Entry {
     pub what: &'static str,
     pub digest: [u8; 32],
 }
 
 static LOG: Mutex<[Option<Entry>; MAX_ENTRIES]> = Mutex::new([const { None }; MAX_ENTRIES]);
+
+/// Copy of the measurement log.
+pub fn log() -> [Option<Entry>; MAX_ENTRIES] {
+    *LOG.lock()
+}
 
 struct Hex<'a>(&'a [u8]);
 

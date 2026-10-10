@@ -2,6 +2,8 @@
 //! with the same IPC interface as the console driver (`vanir_user::console`): `OP_WRITE`
 //! replied `CODE_OK` once the device has taken the bytes, `CODE_BUSY` when every slot is used.
 //!
+//! `OP_READ` returns bytes the host sent (one reader at a time; it waits until data arrives).
+//!
 //! The stream is opened at start and reopened after the host resets it. Data respects the
 //! host's advertised receive credit (`buf_alloc` minus what we sent beyond its `fwd_cnt`).
 
@@ -9,7 +11,7 @@
 #![no_main]
 
 use core::ptr::{read_volatile, write_volatile};
-use vanir_user::console::{CODE_BAD_OP, CODE_BUSY, CODE_OK, OP_WRITE};
+use vanir_user::console::{CODE_BAD_OP, CODE_BUSY, CODE_OK, OP_READ, OP_WRITE};
 use vanir_user::{NOTIFY_IRQ, NOTIFY_TIMER, RECV_EXPECT_IRQ, RECV_TIMEOUT, err, println};
 use virtio::{Buffer, Dma, Queue, Transport};
 
@@ -77,6 +79,11 @@ struct Driver {
     tx_cnt: u32,
     fwd_cnt: u32,
     connects: u32,
+    /// Bytes from the host not yet read, and the client waiting for them (with how many it
+    /// wants).
+    inbox: [u8; 4096],
+    inbox_len: usize,
+    reader: Option<(u64, usize)>,
 }
 
 fn put<T>(addr: u64, value: T) {
@@ -195,17 +202,44 @@ impl Driver {
                 // still waiting go out on the next one.
             }
             OP_RW => {
-                // We don't read host data, but must count it as consumed for the host's credit.
-                self.fwd_cnt = self.fwd_cnt.wrapping_add(get::<u32>(va + 24));
+                // Keep what fits for OP_READ (anything beyond 4 KiB unread is dropped), and count
+                // it all as consumed for the host's credit.
+                let len = get::<u32>(va + 24) as usize;
+                let room = self.inbox.len() - self.inbox_len;
+                let take = len.min(room).min(RX_SIZE as usize - HEADER as usize);
+                for i in 0..take {
+                    self.inbox[self.inbox_len + i] = get::<u8>(va + HEADER + i as u64);
+                }
+                self.inbox_len += take;
+                self.fwd_cnt = self.fwd_cnt.wrapping_add(len as u32);
                 self.send_control(OP_CREDIT_UPDATE);
+                self.serve_reader();
             }
             OP_CREDIT_REQUEST => self.send_control(OP_CREDIT_UPDATE),
             _ => {} // CREDIT_UPDATE: already recorded above
         }
     }
 
+    /// Give the waiting reader what has arrived, if anything has.
+    fn serve_reader(&mut self) {
+        let Some((client, want)) = self.reader else { return };
+        if self.inbox_len == 0 {
+            return;
+        }
+        let n = want.min(self.inbox_len);
+        let _ = vanir_user::reply(client, CODE_OK, &self.inbox[..n]);
+        self.inbox.copy_within(n..self.inbox_len, 0);
+        self.inbox_len -= n;
+        self.reader = None;
+    }
+
+    /// Whether an interrupt is coming that someone waits on: a transfer in flight, a connection
+    /// being made, or a reader waiting for the host.
     fn busy(&self) -> bool {
-        self.control_busy.is_some() || self.link == Link::Connecting || self.writes.iter().any(|w| w.is_some_and(|w| w.posted.is_some()))
+        self.control_busy.is_some()
+            || self.link == Link::Connecting
+            || self.reader.is_some()
+            || self.writes.iter().any(|w| w.is_some_and(|w| w.posted.is_some()))
     }
 }
 
@@ -241,6 +275,9 @@ fn main() -> u64 {
         tx_cnt: 0,
         fwd_cnt: 0,
         connects: 0,
+        inbox: [0; 4096],
+        inbox_len: 0,
+        reader: None,
     };
 
     let mut msg = [0u8; 4096];
@@ -263,6 +300,14 @@ fn main() -> u64 {
         match (sender, op) {
             (0, NOTIFY_IRQ) => d.on_interrupt(),
             (0, NOTIFY_TIMER) => {}
+            (_, OP_READ) if len == 4 && d.reader.is_none() => {
+                let want = u32::from_le_bytes(msg[..4].try_into().unwrap()) as usize;
+                d.reader = Some((sender, want));
+                d.serve_reader();
+            }
+            (_, OP_READ) => {
+                let _ = vanir_user::reply(sender, CODE_BUSY, &[]); // one reader at a time
+            }
             (_, OP_WRITE) => {
                 let Some(slot) = d.writes.iter().position(Option::is_none) else {
                     let _ = vanir_user::reply(sender, CODE_BUSY, &[]);

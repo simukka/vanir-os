@@ -28,6 +28,7 @@ pub const SYS_PCI_CONFIG_READ: u64 = 111;
 pub const SYS_DMA_INFO: u64 = 112;
 pub const SYS_READ_EVENTS: u64 = 113;
 pub const SYS_STATS: u64 = 114;
+pub const SYS_MEASUREMENTS: u64 = 115;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -215,6 +216,20 @@ pub mod console {
     /// Every transmit slot is in flight; try again.
     pub const CODE_BUSY: u64 = 1;
     pub const CODE_BAD_OP: u64 = 2;
+    /// Read bytes the host sent (drivers with a host-to-guest path, e.g. virtio-vsock). The
+    /// message is the most bytes wanted (u32, little endian); the reply carries what arrived,
+    /// waiting until something does.
+    pub const OP_READ: u64 = 3;
+
+    /// Wait for bytes from the host, into `buf`. Returns how many arrived.
+    pub fn read(driver: u64, buf: &mut [u8]) -> Result<usize, u64> {
+        let want = (buf.len() as u32).to_le_bytes();
+        match send(driver, OP_READ, &want, buf) {
+            Ok((CODE_OK, n)) => Ok(n),
+            Ok((code, _)) => Err(code),
+            Err(e) => Err(e),
+        }
+    }
 
     /// Send `bytes` (at most 4 KiB) to the host through the driver task `driver`, retrying while
     /// it is busy. Fails with the kernel error (e.g. `err::DEAD` if the driver died) or the
@@ -310,6 +325,19 @@ pub mod events {
         let (n, _, _) = syscall6(SYS_STATS, [&mut s as *mut Stats as u64, size, 0, 0, 0, 0]);
         if err::is_error(n) { Err(n) } else { Ok(s) }
     }
+}
+
+/// The boot measurement log and where the TPM is mapped (for the task with `tpm = true`):
+/// (count, TPM address). Entries are 48 bytes: 16-byte zero-padded name, 32-byte SHA-256.
+pub fn measurements(buf: &mut [u8]) -> Result<(usize, u64), u64> {
+    let (count, tpm, _) = syscall6(SYS_MEASUREMENTS, [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0]);
+    if err::is_error(count) { Err(count) } else { Ok((count as usize, tpm)) }
+}
+
+/// Client side of the attestation task (`user/attest`).
+pub mod attest {
+    /// Message: a nonce (up to 32 bytes). Reply: one JSON line with the quote.
+    pub const OP_QUOTE: u64 = 1;
 }
 
 /// Client side of the telemetry task (`user/telemetry`).

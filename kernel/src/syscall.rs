@@ -24,6 +24,7 @@ pub const SYS_PCI_CONFIG_READ: u64 = 111;
 pub const SYS_DMA_INFO: u64 = 112;
 pub const SYS_READ_EVENTS: u64 = 113;
 pub const SYS_STATS: u64 = 114;
+pub const SYS_MEASUREMENTS: u64 = 115;
 
 const ERROR: u64 = u64::MAX;
 
@@ -47,6 +48,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_TASK_NAME => process::task_name(frame),
         SYS_READ_EVENTS => process::read_events(frame),
         SYS_STATS => process::stats(frame),
+        SYS_MEASUREMENTS => process::measurements(frame),
         SYS_RESTART => process::restart(frame),
         SYS_TASK_STATE => process::task_state(frame),
         _ => frame.rax = ERROR,

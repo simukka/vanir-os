@@ -4,7 +4,7 @@
 
 use spin::Once;
 
-const MAX_MODULES: usize = 32;
+const MAX_MODULES: usize = 64;
 
 /// (module string = program name, contents).
 static MODULES: Once<[Option<(&'static [u8], &'static [u8])>; MAX_MODULES]> = Once::new();

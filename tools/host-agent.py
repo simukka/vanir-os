@@ -9,6 +9,8 @@ Sources:
   host-agent.py --socket build/tel.sock    a Unix socket (QEMU -chardev socket,...,server=on)
   host-agent.py --listen-vsock 5000        accept the guest's vsock connection (CID 2, port 5000)
   ... --save FILE                          also copy the raw stream to FILE as it arrives
+  ... --attest                             once connected, challenge the guest with a fresh
+                                           nonce ("attest <hex>"); the challenge is logged
 
 Checks (--check makes any failure the exit status):
   - every line is a JSON object with an "event"
@@ -20,6 +22,7 @@ Checks (--check makes any failure the exit status):
 """
 import argparse
 import json
+import secrets
 import socket
 import sys
 from collections import Counter
@@ -27,9 +30,9 @@ from collections import Counter
 MARKER = "--- build/telemetry.log ---\n"
 
 
-def stream_lines(sock, save):
+def stream_lines(sock, save, append=False):
     """Lines from a connected socket until the peer goes away, copied to `save` if given."""
-    out = open(save, "w", encoding="utf-8") if save else None
+    out = open(save, "a" if append else "w", encoding="utf-8") if save else None
     pending = b""
     while True:
         try:
@@ -59,7 +62,15 @@ def lines_from(args):
             open(args.save, "w").close()  # truncate, and tell anyone waiting that we listen
         conn, (cid, port) = listener.accept()
         print(f"host-agent: guest CID {cid} connected from port {port}", file=sys.stderr)
-        yield from stream_lines(conn, args.save)
+        if args.attest:
+            nonce = secrets.token_hex(32)
+            challenge = json.dumps({"event": "challenge", "nonce": nonce})
+            if args.save:
+                with open(args.save, "a", encoding="utf-8") as f:
+                    f.write(challenge + "\n")
+            yield challenge
+            conn.sendall(f"attest {nonce}\n".encode())
+        yield from stream_lines(conn, args.save, append=True)
         return
     if args.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -78,6 +89,7 @@ def main():
     p.add_argument("--socket")
     p.add_argument("--listen-vsock", type=int, metavar="PORT")
     p.add_argument("--save", metavar="FILE")
+    p.add_argument("--attest", action="store_true")
     p.add_argument("--check", action="store_true")
     p.add_argument("--quiet", action="store_true", help="only the summary, not each event")
     p.add_argument("--expect-heartbeats", type=int, default=0)

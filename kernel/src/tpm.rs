@@ -8,8 +8,8 @@ use spin::Once;
 use crate::memory;
 
 /// Where QEMU's tpm-crb puts the CRB registers (the ACPI TPM2 table would say so on real
-/// hardware).
-const CRB_PHYS: u64 = 0xfed4_0000;
+/// hardware). One page: registers, then the command/response buffer.
+pub const CRB_PHYS: u64 = 0xfed4_0000;
 /// Kernel address of the CRB page (next to the MSI-X table mappings).
 const CRB_VIRT: u64 = 0xffff_ffff_7080_0000;
 
@@ -160,6 +160,11 @@ pub fn read(pcr: u32) -> Result<[u8; 32], u32> {
         return Err(u32::MAX);
     }
     Ok(buf[at + 2..at + 34].try_into().unwrap())
+}
+
+/// Whether a TPM was found (after `init`).
+pub fn present() -> bool {
+    PRESENT.get().copied().unwrap_or(false)
 }
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {

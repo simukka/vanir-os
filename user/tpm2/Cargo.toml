@@ -1,0 +1,11 @@
+[package]
+name = "tpm2"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
