@@ -4,7 +4,7 @@ use core::arch::asm;
 
 use crate::{elf, gdt};
 use crate::interrupts::TrapFrame;
-use crate::memory::{self, PAGE_SIZE};
+use crate::memory::{AddressSpace, PAGE_SIZE};
 
 /// The user program's ELF, copied (and stripped) from user/hello by the Makefile.
 static HELLO: &[u8] = include_bytes!("../../build/hello.elf");
@@ -13,10 +13,12 @@ const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
 const USER_STACK_PAGES: u64 = 4;
 
 pub fn run_hello() -> ! {
-    let entry = elf::load(HELLO).unwrap_or_else(|e| panic!("cannot load user program: {e:?}"));
+    let space = AddressSpace::new();
+    let entry = elf::load(HELLO, &space).unwrap_or_else(|e| panic!("cannot load user program: {e:?}"));
     for i in 1..=USER_STACK_PAGES {
-        memory::map_user_page(USER_STACK_TOP - i * PAGE_SIZE, true, false);
+        space.map_user_page(USER_STACK_TOP - i * PAGE_SIZE, true, false);
     }
+    space.activate();
 
     println!(
         "[kernel] loaded {}-byte ELF, entry {:#x}, entering ring 3",

@@ -4,7 +4,7 @@
 use core::mem::size_of;
 use core::ptr;
 
-use crate::memory::{self, PAGE_SIZE};
+use crate::memory::{self, AddressSpace, PAGE_SIZE};
 use crate::usercopy::is_user_range;
 
 const PT_LOAD: u32 = 1;
@@ -62,11 +62,11 @@ fn read<T: Copy>(image: &[u8], offset: u64) -> Result<T, LoadError> {
     }
 }
 
-/// Map and copy every PT_LOAD segment of `image`; returns the entry point.
+/// Map and copy every PT_LOAD segment of `image` into `space`; returns the entry point.
 ///
 /// Overlapping segments trip an assertion in `map_user_page`; the image is built with the kernel,
 /// and verifying it before loading is a later step.
-pub fn load(image: &[u8]) -> Result<u64, LoadError> {
+pub fn load(image: &[u8], space: &AddressSpace) -> Result<u64, LoadError> {
     let header: Header = read(image, 0)?;
     let ident_ok = header.ident[..4] == *b"\x7fELF" && header.ident[4] == 2 && header.ident[5] == 1;
     if !ident_ok
@@ -100,7 +100,7 @@ pub fn load(image: &[u8]) -> Result<u64, LoadError> {
         let data = &image[ph.offset as usize..file_end as usize];
         for page in (0..ph.memsz).step_by(PAGE_SIZE as usize) {
             // Frames are zeroed, so the part past filesz (.bss) needs no work.
-            let frame = memory::map_user_page(ph.vaddr + page, writable, executable);
+            let frame = space.map_user_page(ph.vaddr + page, writable, executable);
             let chunk = data.get(page as usize..).unwrap_or(&[]);
             let chunk = &chunk[..chunk.len().min(PAGE_SIZE as usize)];
             unsafe { ptr::copy_nonoverlapping(chunk.as_ptr(), memory::phys_to_virt(frame), chunk.len()) };
