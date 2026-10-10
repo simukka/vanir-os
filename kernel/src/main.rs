@@ -17,6 +17,7 @@ mod gdt;
 mod interrupts;
 mod irq;
 mod memory;
+mod modules;
 mod pci;
 mod process;
 mod syscall;
@@ -24,7 +25,7 @@ mod usercopy;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker};
 use x86_64::instructions::{hlt, interrupts as cpu_interrupts, port::Port};
 
 // Base revision 3 is supported by Limine v8 and later.
@@ -39,6 +40,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -61,6 +66,7 @@ extern "C" fn kmain() -> ! {
 
     let hhdm = HHDM_REQUEST.get_response().expect("no HHDM response");
     let memmap = MEMMAP_REQUEST.get_response().expect("no memory map response");
+    modules::init(MODULE_REQUEST.get_response().map_or(&[], |r| r.modules()));
     memory::init(hhdm.offset(), memmap.entries());
     apic::init();
     pci::init();

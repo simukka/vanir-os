@@ -72,11 +72,9 @@ fn main() {
                 .collect(),
         };
 
-        let path = format!("{dir}/../build/{program}.elf");
-        println!("cargo:rerun-if-changed={path}");
         writeln!(
             out,
-            "    Task {{ name: {name:?}, image: include_bytes!({path:?}), budget_ticks: {budget}, \
+            "    Task {{ name: {name:?}, program: {program:?}, budget_ticks: {budget}, \
              supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events} }},"
         )
         .unwrap();

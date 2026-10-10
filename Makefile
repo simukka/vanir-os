@@ -52,11 +52,18 @@ limine/limine:
 	git clone --depth=1 --branch=$(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git limine
 	$(MAKE) -C limine
 
-$(ISO): kernel limine/limine limine.conf
+# limine.conf plus one boot module per user program: the kernel finds task images by name.
+build/limine.conf: limine.conf FORCE
+	@mkdir -p build
+	{ cat limine.conf; for p in $(USER_PROGS); do \
+	    printf '    module_path: boot():/boot/%s.elf\n    module_string: %s\n' $$p $$p; done; } > $@
+
+$(ISO): kernel limine/limine build/limine.conf
 	rm -rf build/iso_root
 	mkdir -p build/iso_root/boot/limine build/iso_root/EFI/BOOT
 	cp $(TARGET_DIR)/vanir-kernel build/iso_root/boot/vanir-kernel
-	cp limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin \
+	for p in $(USER_PROGS); do cp build/$$p.elf build/iso_root/boot/; done
+	cp build/limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin \
 	   build/iso_root/boot/limine/
 	cp limine/BOOTX64.EFI build/iso_root/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \

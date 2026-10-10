@@ -19,12 +19,13 @@ use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
-use crate::{apic, elf, events, gdt, irq, pci};
+use crate::{apic, elf, events, gdt, irq, modules, pci};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
     pub name: &'static str,
-    pub image: &'static [u8],
+    /// The program: the boot module (`build/<program>.elf`) holding its image.
+    pub program: &'static str,
     /// CPU budget in timer ticks; 0 = unlimited. A process that uses it up is killed.
     pub budget_ticks: u64,
     /// Told when other tasks die, and may restart them.
@@ -61,6 +62,8 @@ const DMA_BASE: u64 = 0x20_0000_0000;
 /// What a task slot is given at boot and keeps across restarts.
 #[derive(Clone, Copy)]
 struct Grants {
+    /// The program's ELF image (a boot module).
+    image: &'static [u8],
     /// PCI devices (indices for `pci::get`).
     devices: [Option<usize>; MAX_TASK_DEVICES],
     /// Physically contiguous DMA region: (physical address, pages).
@@ -240,9 +243,11 @@ pub fn start() -> ! {
 
     // Grants first: DMA regions are permanent, so they belong in the baseline, not the leak check.
     let mut claimed = [false; pci::MAX_DEVICES];
-    let mut grants = [Grants { devices: [None; MAX_TASK_DEVICES], dma: None }; MAX_PROCESSES];
+    let mut grants = [Grants { image: &[], devices: [None; MAX_TASK_DEVICES], dma: None }; MAX_PROCESSES];
     let mut vectors = irq::DEVICE_VECTORS;
     for (slot, task) in TASKS.iter().enumerate() {
+        grants[slot].image = modules::find(task.program)
+            .unwrap_or_else(|| panic!("{}: no boot module for program {}", task.name, task.program));
         grants[slot].devices = claim_devices(task, &mut claimed);
         for (bit, device) in grants[slot].devices.iter().enumerate() {
             let Some(device) = *device else { continue };
@@ -275,7 +280,7 @@ pub fn start() -> ! {
             recv_deadline: None,
         };
         events::log(events::TASK_START, p.id(), 0, 0, 0);
-        println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), p.context.rip);
+        println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), grants.image.len(), p.context.rip);
         table.procs[slot] = Some(p);
     }
 
@@ -307,7 +312,7 @@ fn claim_devices(task: &Task, claimed: &mut [bool; pci::MAX_DEVICES]) -> [Option
 /// and its starting registers.
 fn load(task: &Task, grants: &Grants) -> (AddressSpace, TrapFrame) {
     let space = AddressSpace::new();
-    let entry = elf::load(task.image, &space).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
+    let entry = elf::load(grants.image, &space).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
     for page in 1..=USER_STACK_PAGES {
         space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
     }
