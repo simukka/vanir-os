@@ -63,6 +63,11 @@ fn main() -> u64 {
                 task, d.code, d.rip, d.cr2, d.error_code
             ),
             3 if verbose => println!("supervisor: task {} used up its CPU budget", task),
+            4 => {
+                let why = vanir_user::events::rejection(d.code);
+                report(telemetry, format_args!("task {} image rejected ({}): not starting it", task, why));
+                continue;
+            }
             _ => {}
         }
         if *count >= MAX_RESTARTS {

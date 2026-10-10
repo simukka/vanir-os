@@ -22,6 +22,7 @@ mod pci;
 mod process;
 mod syscall;
 mod usercopy;
+mod verify;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

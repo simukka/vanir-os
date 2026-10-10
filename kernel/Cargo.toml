@@ -9,7 +9,9 @@ test = false
 bench = false
 
 [dependencies]
+ed25519-compact = { version = "2.6.0", default-features = false }
 limine = "0.5"
+sha2 = { version = "0.11.0", default-features = false }
 spin = "0.10"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
 

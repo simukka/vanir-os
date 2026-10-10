@@ -18,10 +18,12 @@ pub const OVER_BUDGET: u64 = 4;
 pub const RESTART: u64 = 5;
 /// An IPC send refused: a = target id, b = error code.
 pub const IPC_REFUSED: u64 = 6;
+/// A task image failed its signature check at boot: a = reason (verify::Rejection).
+pub const IMAGE_REJECTED: u64 = 7;
 
 /// One event, as the reader receives it. Fields `a`, `b`, `c` depend on `kind`:
-/// TASK_START none; EXIT a = code; FAULT a = vector, b = rip, c = cr2; OVER_BUDGET a = budget;
-/// RESTART a = previous id; IPC_REFUSED a = target, b = error.
+/// TASK_START a = signed version; EXIT a = code; FAULT a = vector, b = rip, c = cr2; OVER_BUDGET a = budget;
+/// RESTART a = previous id; IPC_REFUSED a = target, b = error; IMAGE_REJECTED a = reason.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Event {

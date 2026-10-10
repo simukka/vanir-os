@@ -130,6 +130,7 @@ fn event_line(out: &mut Out, e: &Event) {
             Name(e.a),
             err::name(e.b)
         ),
+        events::IMAGE_REJECTED => write!(out, "\"event\":\"image_rejected\",\"reason\":\"{}\"", events::rejection(e.a)),
         kind => write!(out, "\"event\":\"unknown\",\"kind\":{}", kind),
     };
     let _ = out.write_str("}");

@@ -3,3 +3,4 @@
 /limine
 *.iso
 qemu.log
+/keys

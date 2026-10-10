@@ -19,6 +19,7 @@ use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
+use crate::verify::{self, Rejection};
 use crate::{apic, elf, events, gdt, irq, modules, pci};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
@@ -38,6 +39,8 @@ pub struct Task {
     pub dma_pages: u64,
     /// May read the kernel event log and system statistics.
     pub events: bool,
+    /// Oldest signed version of the program that may run (rollback protection).
+    pub min_version: u64,
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
@@ -96,11 +99,13 @@ enum State {
     Exited(u64),
     Faulted(u64),
     OverBudget,
+    /// Its image failed signature checks at boot; it never runs and can't be restarted.
+    Rejected(Rejection),
 }
 
 impl State {
     fn is_dead(self) -> bool {
-        matches!(self, State::Exited(_) | State::Faulted(_) | State::OverBudget)
+        matches!(self, State::Exited(_) | State::Faulted(_) | State::OverBudget | State::Rejected(_))
     }
 }
 
@@ -264,27 +269,41 @@ pub fn start() -> ! {
 
     for (slot, task) in TASKS.iter().enumerate() {
         let grants = grants[slot];
-        let (space, context) = load(task, &grants);
-        let space = Some(space);
-        let death = Death::default();
-        let p = Process {
+        let checked = verify::check(task.program, modules::find(task.program), signature_of(task.program), task.min_version);
+        let mut p = Process {
             slot,
             generation: 0,
             task,
-            space,
-            context,
+            space: None,
+            context: TrapFrame::default(),
             state: State::Ready,
             ticks: 0,
-            death,
+            death: Death::default(),
             grants,
             recv_deadline: None,
         };
-        events::log(events::TASK_START, p.id(), 0, 0, 0);
-        println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), grants.image.len(), p.context.rip);
+        match checked {
+            Ok((version, _hash)) => {
+                let (space, context) = load(task, &grants);
+                p.space = Some(space);
+                p.context = context;
+                events::log(events::TASK_START, p.id(), version, 0, 0);
+                println!("[kernel] {}: {}-byte ELF, signed version {}, entry {:#x}", p.describe(), grants.image.len(), version, p.context.rip);
+            }
+            Err(why) => {
+                p.state = State::Rejected(why);
+                p.death.unreported = table.supervisor.is_some();
+                events::log(events::IMAGE_REJECTED, p.id(), why as u64, 0, 0);
+                println!("[kernel] {}: image REJECTED: {}", p.describe(), why.describe());
+            }
+        }
         table.procs[slot] = Some(p);
     }
 
-    table.current = 0;
+    let Some(first) = table.procs.iter().flatten().position(|p| p.state == State::Ready) else {
+        finish(&table) // every image was rejected
+    };
+    table.current = first;
     let first = table.current();
     first.state = State::Running;
     first.space().activate();
@@ -292,6 +311,15 @@ pub fn start() -> ! {
     drop(table);
     println!("[kernel] entering ring 3");
     enter_user(rip, rsp)
+}
+
+/// The signature file shipped with `program` (boot module `<program>.sig`).
+fn signature_of(program: &str) -> Option<&'static [u8]> {
+    let mut name = [0u8; 40];
+    let name = name.get_mut(..program.len() + 4)?;
+    name[..program.len()].copy_from_slice(program.as_bytes());
+    name[program.len()..].copy_from_slice(b".sig");
+    modules::find(core::str::from_utf8(name).ok()?)
 }
 
 /// For each device kind the task asks for, take the next unclaimed device of that kind.
@@ -484,6 +512,7 @@ fn report_death(table: &mut Table, sup: usize, buf: u64, cap: u64, regs: &mut Tr
         State::Exited(code) => (1, code),
         State::Faulted(vector) => (2, vector),
         State::OverBudget => (3, 0),
+        State::Rejected(why) => (4, why as u64),
         _ => unreachable!("only dead processes have deaths to report"),
     };
     let record = DeathRecord {
@@ -763,7 +792,7 @@ pub fn restart(frame: &mut TrapFrame) {
     };
     let p = table.get(slot);
     let old_id = p.id();
-    if p.id() != id || !p.state.is_dead() {
+    if p.id() != id || !p.state.is_dead() || matches!(p.state, State::Rejected(_)) {
         frame.rax = err::BAD_ARGUMENT; // already restarted, or still alive
         return;
     }
@@ -808,6 +837,7 @@ fn state_code(state: State) -> u64 {
         State::Exited(_) => 2,
         State::Faulted(_) => 3,
         State::OverBudget => 4,
+        State::Rejected(_) => 5,
     }
 }
 
@@ -968,6 +998,10 @@ fn finish(table: &Table) -> ! {
             State::OverBudget => {
                 status = status.max(2);
                 "over CPU budget"
+            }
+            State::Rejected(_) => {
+                status = status.max(2);
+                "image rejected"
             }
             State::RecvBlocked => "waiting for messages",
             State::SendBlocked(_) | State::ReplyBlocked(_) => {

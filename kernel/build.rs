@@ -9,6 +9,13 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{dir}/linker.ld");
     println!("cargo:rerun-if-changed={dir}/linker.ld");
 
+    // The key task images must be signed with (tools/sign-image.py; the Makefile makes a dev key).
+    println!("cargo:rerun-if-env-changed=VANIR_SIGNING_PUB");
+    let public_key = std::env::var("VANIR_SIGNING_PUB").unwrap_or_else(|_| format!("{dir}/../keys/dev-signing.pub"));
+    assert!(std::fs::metadata(&public_key).is_ok_and(|m| m.len() == 32), "{public_key}: need a 32-byte Ed25519 public key (make keys)");
+    println!("cargo:rerun-if-changed={public_key}");
+    println!("cargo:rustc-env=VANIR_SIGNING_PUB={public_key}");
+
     // The task table comes from an app manifest (VANIR_APP, default apps/default.toml), the
     // build-time list of every process the image runs. See apps/README.md for the format.
     println!("cargo:rerun-if-env-changed=VANIR_APP");
@@ -31,11 +38,12 @@ fn main() {
     for (task, name) in tasks.iter().zip(&names) {
         let task = task.as_table().unwrap();
         for key in task.keys() {
-            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events"];
+            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events", "min_version"];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
         let program = task.get("program").and_then(Value::as_str).unwrap_or(name);
         let budget = task.get("budget").map_or(0, |v| v.as_integer().expect("budget: integer"));
+        let min_version = task.get("min_version").map_or(0, |v| v.as_integer().expect("min_version: integer"));
         let dma_pages = task.get("dma_pages").map_or(0, |v| v.as_integer().expect("dma_pages: integer"));
         assert!((0..=256).contains(&dma_pages), "{app}: {name}: dma_pages must be 0..=256");
         let supervisor = task.get("supervisor").is_some_and(|v| v.as_bool().expect("supervisor: bool"));
@@ -75,7 +83,7 @@ fn main() {
         writeln!(
             out,
             "    Task {{ name: {name:?}, program: {program:?}, budget_ticks: {budget}, \
-             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events} }},"
+             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events}, min_version: {min_version} }},"
         )
         .unwrap();
     }

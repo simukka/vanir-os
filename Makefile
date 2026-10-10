@@ -20,6 +20,16 @@ ACCEL          := tcg
 # Telemetry uplink: "console" (virtio console -> build/telemetry.log) or "vsock" (vhost-vsock:
 # needs /dev/vhost-vsock, i.e. the kvm group; tools/host-agent.py --listen-vsock receives it).
 TRANSPORT      := console
+# Task images are signed with this key (made on first build; keep it out of git) and version.
+SIGNING_KEY    := keys/dev-signing.key
+SIGNING_PUB    := $(SIGNING_KEY:.key=.pub)
+# The public key compiled into the kernel: images must be signed with its private half.
+TRUSTED_PUB    := $(SIGNING_PUB)
+SIGN_VERSION   := 1
+# Tests of the signature checks: changed after signing, shipped unsigned, signatures swapped (a:b).
+TAMPER         :=
+UNSIGNED       :=
+SWAP_SIGS      :=
 CPU_FLAGS      := $(if $(filter kvm,$(ACCEL)),-enable-kvm -cpu host,-cpu max)
 # The virtio console carries telemetry to the host (build/telemetry.log, or build/console.log when
 # vsock does); COM1 stays the boot log.
@@ -40,13 +50,19 @@ all: $(ISO)
 
 iso: $(ISO)
 
-user: FORCE
+$(SIGNING_KEY):
+	@mkdir -p $(dir $@)
+	tools/sign-image.py gen-key $(SIGNING_KEY) $(SIGNING_PUB)
+
+user: $(SIGNING_KEY) FORCE
 	cargo build $(addprefix -p ,$(USER_PROGS)) --$(PROFILE) $(USER_CARGO_FEATURES)
 	@mkdir -p build
 	for p in $(USER_PROGS); do objcopy --strip-all $(TARGET_DIR)/$$p build/$$p.elf; done
+	tools/sign-image.py sign-all $(SIGNING_KEY) build $(USER_PROGS) --version $(SIGN_VERSION)
 
 kernel: user
-	VANIR_APP="$(abspath $(APP))" cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
+	VANIR_APP="$(abspath $(APP))" VANIR_SIGNING_PUB="$(abspath $(TRUSTED_PUB))" \
+	    cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
 
 limine/limine:
 	git clone --depth=1 --branch=$(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git limine
@@ -56,13 +72,20 @@ limine/limine:
 build/limine.conf: limine.conf FORCE
 	@mkdir -p build
 	{ cat limine.conf; for p in $(USER_PROGS); do \
-	    printf '    module_path: boot():/boot/%s.elf\n    module_string: %s\n' $$p $$p; done; } > $@
+	    printf '    module_path: boot():/boot/%s.elf\n    module_string: %s\n' $$p $$p; \
+	    case " $(UNSIGNED) " in *" $$p "*) ;; \
+	    *) printf '    module_path: boot():/boot/%s.sig\n    module_string: %s.sig\n' $$p $$p;; esac; \
+	done; } > $@
 
 $(ISO): kernel limine/limine build/limine.conf
 	rm -rf build/iso_root
 	mkdir -p build/iso_root/boot/limine build/iso_root/EFI/BOOT
 	cp $(TARGET_DIR)/vanir-kernel build/iso_root/boot/vanir-kernel
-	for p in $(USER_PROGS); do cp build/$$p.elf build/iso_root/boot/; done
+	for p in $(USER_PROGS); do cp build/$$p.elf build/$$p.sig build/iso_root/boot/; done
+	for p in $(TAMPER); do printf X >> build/iso_root/boot/$$p.elf; done
+	for pair in $(SWAP_SIGS); do a=$${pair%%:*}; b=$${pair##*:}; \
+	    mv build/iso_root/boot/$$a.sig build/t.sig; mv build/iso_root/boot/$$b.sig build/iso_root/boot/$$a.sig; \
+	    mv build/t.sig build/iso_root/boot/$$b.sig; done
 	cp build/limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin \
 	   build/iso_root/boot/limine/
 	cp limine/BOOTX64.EFI build/iso_root/EFI/BOOT/

@@ -1,0 +1,6 @@
+[[task]]
+name = "hello"
+min_version = 2
+
+[[task]]
+name = "spinner"

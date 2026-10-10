@@ -150,7 +150,7 @@ pub const NOTIFY_DEATH: u64 = 1;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeathRecord {
     pub id: u64,
-    /// 1 exited, 2 faulted, 3 over CPU budget.
+    /// 1 exited, 2 faulted, 3 over CPU budget, 4 image rejected at boot (`code` = reason).
     pub kind: u64,
     /// Exit code, or the fault's vector.
     pub code: u64,
@@ -254,6 +254,21 @@ pub mod events {
     pub const OVER_BUDGET: u64 = 4;
     pub const RESTART: u64 = 5;
     pub const IPC_REFUSED: u64 = 6;
+    pub const IMAGE_REJECTED: u64 = 7;
+
+    /// Why the kernel refused a task image (`IMAGE_REJECTED`'s `a`, a death record's `code`).
+    pub fn rejection(reason: u64) -> &'static str {
+        match reason {
+            1 => "no image",
+            2 => "no signature",
+            3 => "malformed signature file",
+            4 => "signature does not verify",
+            5 => "signed for another program",
+            6 => "image does not match its signature",
+            7 => "version older than the manifest allows",
+            _ => "unknown",
+        }
+    }
 
     /// See kernel/src/events.rs for what `a`, `b`, `c` hold for each kind.
     #[repr(C)]
