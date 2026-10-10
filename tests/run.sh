@@ -53,6 +53,10 @@ CASES=(
   "sig-rogue-key      | sig-pair                |                                                           |               | SIGNING_KEY=build/rogue.key TRUSTED_PUB=keys/dev-signing.pub | 5 | re:hello\): image REJECTED: signature does not verify[\s\S]*spinner\): image REJECTED: signature does not verify"
   "sig-rollback       | sig-rollback            |                                                           |               |                                                              | 5 | re:pid 1 \(hello\): image REJECTED: version older than the manifest allows[\s\S]*spinner\) exited with code 0"
   "sig-supervised     | sig-supervised          |                                                           |               | TAMPER=hello                                                 | 5 | re:task 2 image rejected \(image does not match its signature\): not starting it[\s\S]*spinner\) exited with code 0"
+  "sb-boot            | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm                                   | 1 | re:limine: Loading executable .boot\(\):/boot/vanir-kernel.[\s\S]*signed version 1[\s\S]*hello\) exited with code 0"
+  "sb-tampered-kernel | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm SB_TAMPER_KERNEL=1 TIMEOUT=25     | 124 | re:Blake2b hash for URI .boot\(\):/boot/vanir-kernel. does not match"
+  "sb-edited-config   | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm SB_EDIT_CONFIG=1 TIMEOUT=25       | 124 | CHECKSUM MISMATCH FOR CONFIG FILE"
+  "sb-unsigned-loader | hello                   |                                                           |               | BOOT=uefi-secure ACCEL=kvm SB_UNSIGNED_LOADER=1 TIMEOUT=25   | 124 | re:failed to load Boot[0-9]+ .UEFI QEMU HARDDISK[^\n]*Access Denied"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
@@ -64,6 +68,8 @@ for case in "${CASES[@]}"; do
   want_status=$(trim "$want_status"); want_text=$(trim "$want_text")
 
   vars=(ACCEL="${ACCEL:-tcg}" $env)
+  limit=60
+  for v in $env; do [[ "$v" == TIMEOUT=* ]] && limit=${v#TIMEOUT=}; done
   wrap=()
   if [[ " $env " == *" TRANSPORT=vsock "* ]]; then
     # vhost-vsock needs /dev/vhost-vsock (the kvm group): use `sg kvm` if this login predates it.
@@ -72,7 +78,7 @@ for case in "${CASES[@]}"; do
     else echo "SKIP $name: no access to /dev/vhost-vsock (join the kvm group)"; continue
     fi
   fi
-  if ! build_log=$(make -s iso APP="tests/apps/$app.toml" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" "${vars[@]}" 2>&1); then
+  if ! build_log=$(make -s image APP="tests/apps/$app.toml" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" "${vars[@]}" 2>&1); then
     echo "FAIL $name: build failed"; echo "$build_log"; failed=1; continue
   fi
   qemu=$(make -s qemu-cmd "${vars[@]}")
@@ -81,13 +87,16 @@ for case in "${CASES[@]}"; do
     tools/host-agent.py --listen-vsock 5000 --save build/telemetry.log --quiet >/dev/null 2>&1 &
     agent=$!
     for _ in $(seq 50); do [ -e build/telemetry.log ] && break; sleep 0.1; done
-    out=$(timeout 60 "${wrap[@]}" "$qemu" 2>&1)
+    out=$(timeout "$limit" "${wrap[@]}" "$qemu" 2>&1)
     status=$?
     sleep 0.5; kill $agent 2>/dev/null; wait $agent 2>/dev/null
   else
-    out=$(timeout 60 $qemu 2>&1)
+    out=$(timeout "$limit" $qemu 2>&1)
     status=$?
   fi
+  # Firmware consoles (OVMF under BOOT=uefi-secure) position every character with escape codes;
+  # match against plain text.
+  out=$(sed 's/\x1b\[[0-9;:?=]*[A-Za-z]//g; s/\x1b[()][0-9A-Za-z]//g; s/\r//g' <<<"$out")
   # What reached the host over the virtio console, for the checks below.
   out+=$'\n--- build/telemetry.log ---\n'"$(cat build/telemetry.log 2>/dev/null)"
 

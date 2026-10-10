@@ -5,6 +5,7 @@
 #   make run-debug                    also log interrupts/CPU resets to qemu.log
 #   make test                         boot every scenario in tests/run.sh and check the results
 #   make test ACCEL=kvm               same, under KVM instead of QEMU's emulator
+#   make run BOOT=uefi-secure ACCEL=kvm   boot through UEFI Secure Boot (see "Boot chain" in README)
 
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
@@ -30,12 +31,34 @@ SIGN_VERSION   := 1
 TAMPER         :=
 UNSIGNED       :=
 SWAP_SIGS      :=
+# Boot path: "bios" boots the Limine ISO (fast; nothing vouches for the bootloader) and
+# "uefi-secure" boots OVMF with Secure Boot on and Debian's snakeoil test keys enrolled:
+# firmware checks the signed Limine, Limine checks its enrolled config, the config pins the
+# kernel's hash, and the kernel checks each task's signature.
+BOOT           := bios
+OVMF_CODE      := /usr/share/OVMF/OVMF_CODE_4M.snakeoil.fd
+OVMF_VARS      := /usr/share/OVMF/OVMF_VARS_4M.snakeoil.fd
+SB_CERT        := /usr/share/ovmf/PkKek-1-snakeoil.pem
+SB_KEY_SOURCE  := /usr/share/ovmf/PkKek-1-snakeoil.key
+SB_KEY_PASS    := snakeoil
+SB_KEY         := build/secureboot.key
+# Tests of the boot chain: kernel changed after hashing, config edited after enrolling, Limine
+# left unsigned.
+SB_TAMPER_KERNEL   :=
+SB_EDIT_CONFIG     :=
+SB_UNSIGNED_LOADER :=
+UEFI           := $(filter uefi-secure,$(BOOT))
+IMAGE          := $(if $(UEFI),esp,$(ISO))
+BOOT_FLAGS     := $(if $(UEFI),-M q35$(,)smm=on -global driver=cfi.pflash01$(,)property=secure$(,)value=on \
+                    -drive if=pflash$(,)format=raw$(,)unit=0$(,)file=$(OVMF_CODE)$(,)readonly=on \
+                    -drive if=pflash$(,)format=raw$(,)unit=1$(,)file=build/OVMF_VARS.fd \
+                    -drive format=raw$(,)file=fat:rw:build/esp -nic none -m 256M,-M q35 -cdrom $(ISO) -m 128M)
 CPU_FLAGS      := $(if $(filter kvm,$(ACCEL)),-enable-kvm -cpu host,-cpu max)
 # The virtio console carries telemetry to the host (build/telemetry.log, or build/console.log when
 # vsock does); COM1 stays the boot log.
 CONSOLE_LOG    := $(if $(filter vsock,$(TRANSPORT)),build/console.log,build/telemetry.log)
 VSOCK_FLAGS    := $(if $(filter vsock,$(TRANSPORT)),-device vhost-vsock-pci$(,)guest-cid=3)
-QEMU_FLAGS     := -M q35 $(CPU_FLAGS) -m 128M -cdrom $(ISO) -serial stdio -display none \
+QEMU_FLAGS     := $(BOOT_FLAGS) $(CPU_FLAGS) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
                   -device virtio-serial-pci,id=vser,disable-legacy=on \
                   -chardev file,id=tel,path=$(CONSOLE_LOG) -device virtconsole,chardev=tel,bus=vser.0 \
@@ -44,11 +67,14 @@ QEMU_FLAGS     := -M q35 $(CPU_FLAGS) -m 128M -cdrom $(ISO) -serial stdio -displ
 USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(USER_FEATURES)")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
 
-.PHONY: all iso kernel user run run-debug test qemu-cmd clean distclean FORCE
+.PHONY: all iso esp image kernel user run run-debug test qemu-cmd clean distclean FORCE
 
 all: $(ISO)
 
 iso: $(ISO)
+
+# Whatever BOOT boots from.
+image: $(IMAGE)
 
 $(SIGNING_KEY):
 	@mkdir -p $(dir $@)
@@ -77,15 +103,21 @@ build/limine.conf: limine.conf FORCE
 	    *) printf '    module_path: boot():/boot/%s.sig\n    module_string: %s.sig\n' $$p $$p;; esac; \
 	done; } > $@
 
+# Kernel, task images and signatures into $(1)/boot, then the signature-test switches.
+define stage_boot_files
+	mkdir -p $(1)/boot/limine
+	cp $(TARGET_DIR)/vanir-kernel $(1)/boot/vanir-kernel
+	for p in $(USER_PROGS); do cp build/$$p.elf build/$$p.sig $(1)/boot/; done
+	for p in $(TAMPER); do printf X >> $(1)/boot/$$p.elf; done
+	for pair in $(SWAP_SIGS); do a=$${pair%%:*}; b=$${pair##*:}; \
+	    mv $(1)/boot/$$a.sig build/t.sig; mv $(1)/boot/$$b.sig $(1)/boot/$$a.sig; \
+	    mv build/t.sig $(1)/boot/$$b.sig; done
+endef
+
 $(ISO): kernel limine/limine build/limine.conf
 	rm -rf build/iso_root
-	mkdir -p build/iso_root/boot/limine build/iso_root/EFI/BOOT
-	cp $(TARGET_DIR)/vanir-kernel build/iso_root/boot/vanir-kernel
-	for p in $(USER_PROGS); do cp build/$$p.elf build/$$p.sig build/iso_root/boot/; done
-	for p in $(TAMPER); do printf X >> build/iso_root/boot/$$p.elf; done
-	for pair in $(SWAP_SIGS); do a=$${pair%%:*}; b=$${pair##*:}; \
-	    mv build/iso_root/boot/$$a.sig build/t.sig; mv build/iso_root/boot/$$b.sig build/iso_root/boot/$$a.sig; \
-	    mv build/t.sig build/iso_root/boot/$$b.sig; done
+	mkdir -p build/iso_root/EFI/BOOT
+	$(call stage_boot_files,build/iso_root)
 	cp build/limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin \
 	   build/iso_root/boot/limine/
 	cp limine/BOOTX64.EFI build/iso_root/EFI/BOOT/
@@ -96,12 +128,35 @@ $(ISO): kernel limine/limine build/limine.conf
 	   build/iso_root -o $@ 2>/dev/null
 	./limine/limine bios-install $@ 2>/dev/null
 
+$(SB_KEY): $(SB_KEY_SOURCE)
+	@mkdir -p build
+	openssl pkey -in $< -passin pass:$(SB_KEY_PASS) -out $@
+	chmod 600 $@
+
+# EFI system partition for BOOT=uefi-secure (QEMU serves the directory as a FAT disk).
+esp: kernel limine/limine build/limine.conf $(SB_KEY)
+	rm -rf build/esp
+	mkdir -p build/esp/EFI/BOOT
+	$(call stage_boot_files,build/esp)
+	# The config pins the kernel by BLAKE2b hash and sends Limine's messages to the serial port.
+	{ printf 'serial: yes\n'; sed "s|^\(    path: boot():/boot/vanir-kernel\)$$|\1#$$(b2sum build/esp/boot/vanir-kernel | cut -d' ' -f1)|" \
+	    build/limine.conf; } > build/esp/boot/limine/limine.conf
+	# Limine refuses any config but this one; firmware refuses any Limine but this signed one.
+	cp limine/BOOTX64.EFI build/esp/EFI/BOOT/BOOTX64.EFI
+	./limine/limine enroll-config build/esp/EFI/BOOT/BOOTX64.EFI \
+	    $$(b2sum build/esp/boot/limine/limine.conf | cut -d' ' -f1) >/dev/null
+	$(if $(SB_UNSIGNED_LOADER),,sbsign --key $(SB_KEY) --cert $(SB_CERT) \
+	    --output build/esp/EFI/BOOT/BOOTX64.EFI build/esp/EFI/BOOT/BOOTX64.EFI 2>/dev/null)
+	$(if $(SB_TAMPER_KERNEL),printf X >> build/esp/boot/vanir-kernel)
+	$(if $(SB_EDIT_CONFIG),sed -i 's/timeout: 0/timeout: 1/' build/esp/boot/limine/limine.conf)
+	cp $(OVMF_VARS) build/OVMF_VARS.fd
+
 # isa-debug-exit makes QEMU exit with (code << 1) | 1: 1 = clean exit(0), 3 = user exit(!=0),
 # 5 = user fault, 7 = kernel fault/panic. Map 1 back to success for the shell.
-run: $(ISO)
+run: image
 	$(QEMU) $(QEMU_FLAGS); s=$$?; [ $$s -eq 1 ] || exit $$s
 
-run-debug: $(ISO)
+run-debug: image
 	$(QEMU) $(QEMU_FLAGS) -d int,cpu_reset -D qemu.log; s=$$?; [ $$s -eq 1 ] || exit $$s
 
 test:
