@@ -4,3 +4,4 @@
 *.iso
 qemu.log
 /keys
+__pycache__/
