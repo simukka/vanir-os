@@ -3,7 +3,7 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 const SYS_WRITE: u64 = 1;
@@ -26,9 +26,44 @@ fn exit(code: u64) -> ! {
     unreachable!()
 }
 
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-extern "C" fn _start() -> ! {
+/// Registers as the kernel handed them over: rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15.
+static mut ENTRY_REGS: [u64; 15] = [0; 15];
+
+// Entry point: record every register before any compiled code can change one, then call main.
+global_asm!(
+    r#"
+.section .text.entry
+.global _start
+_start:
+    mov [rip + {regs} + 0x00], rax
+    mov [rip + {regs} + 0x08], rbx
+    mov [rip + {regs} + 0x10], rcx
+    mov [rip + {regs} + 0x18], rdx
+    mov [rip + {regs} + 0x20], rsi
+    mov [rip + {regs} + 0x28], rdi
+    mov [rip + {regs} + 0x30], rbp
+    mov [rip + {regs} + 0x38], r8
+    mov [rip + {regs} + 0x40], r9
+    mov [rip + {regs} + 0x48], r10
+    mov [rip + {regs} + 0x50], r11
+    mov [rip + {regs} + 0x58], r12
+    mov [rip + {regs} + 0x60], r13
+    mov [rip + {regs} + 0x68], r14
+    mov [rip + {regs} + 0x70], r15
+    call {main}
+    ud2
+"#,
+    regs = sym ENTRY_REGS,
+    main = sym main,
+);
+
+extern "C" fn main() -> ! {
+    // The kernel must not leak register contents into ring 3.
+    if unsafe { (*(&raw const ENTRY_REGS)).iter().any(|&r| r != 0) } {
+        write(b"kernel leaked non-zero registers into ring 3\n");
+        exit(3);
+    }
+
     write(b"hello from ring 3\n");
 
     #[cfg(feature = "bad-pointer")]
