@@ -57,7 +57,7 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     serial::init();
-    println!("[kernel] vanir-os booting");
+    print_banner();
     assert!(BASE_REVISION.is_supported(), "Limine base revision 3 not supported");
 
     cpu::enable_protections();
@@ -73,6 +73,33 @@ extern "C" fn kmain() -> ! {
     pci::init();
 
     process::start()
+}
+
+/// The boot banner on the serial console
+fn print_banner() {
+    const GREEN: &[u8] = b"\x1b[38;2;0;216;146m";
+    const MUTED: &[u8] = b"\x1b[38;2;100;110;115m";
+    const TEXT: &[u8] = b"\x1b[38;2;222;222;222m";
+    const RESET: &[u8] = b"\x1b[0m";
+
+    serial::write_bytes(RESET);
+    serial::write_bytes(b"\n");
+    serial::write_bytes(GREEN);
+    serial::write_bytes(
+br"\\\          ///    V A N I R
+ \\\        ///     OPERATING SYSTEM
+  \\\      ///
+   \\\    ///
+    \\\  ///
+     \\\///
+");
+    serial::write_bytes(MUTED);
+    serial::write_bytes(b"----------------------------------------------------\n");
+    serial::write_bytes(GREEN);
+    serial::write_bytes(b"[vanir] ");
+    serial::write_bytes(TEXT);
+    serial::write_bytes(b"booting\n");
+    serial::write_bytes(RESET);
 }
 
 /// Stop the machine. Under QEMU with `isa-debug-exit`, `code` becomes the exit status
