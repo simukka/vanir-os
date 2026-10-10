@@ -16,8 +16,7 @@ use crate::{elf, gdt};
 pub struct Task {
     pub name: &'static str,
     pub image: &'static [u8],
-    /// CPU budget in timer ticks; 0 = unlimited.
-    #[allow(dead_code)] // enforced once the timer exists
+    /// CPU budget in timer ticks; 0 = unlimited. A process that uses it up is killed.
     pub budget_ticks: u64,
 }
 
@@ -33,6 +32,7 @@ enum State {
     Running,
     Exited(u64),
     Faulted(u64),
+    OverBudget,
 }
 
 struct Process {
@@ -91,11 +91,19 @@ pub fn start() -> ! {
     enter_user(rip, rsp)
 }
 
-/// Timer interrupt: charge the tick to the running process, then preempt it.
+/// Timer interrupt: charge the tick to the running process, then preempt it, or kill it if it
+/// has used up its CPU budget.
 pub fn tick(frame: &mut TrapFrame) {
     debug_assert!(frame.from_user(), "timer tick in kernel mode");
     let mut table = TABLE.lock();
-    table.current().ticks += 1;
+    let p = table.current();
+    p.ticks += 1;
+    let budget = p.task.budget_ticks;
+    if budget != 0 && p.ticks >= budget {
+        println!("[kernel] pid {} ({}) killed: CPU budget of {} ticks used up", p.pid, p.task.name, budget);
+        p.state = State::OverBudget;
+        return switch_to_next(&mut table, frame);
+    }
     preempt(&mut table, frame);
 }
 
@@ -160,7 +168,8 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
     finish(table)
 }
 
-/// Every process has ended. Exit status: 0 all exited 0, 1 some exited non-zero, 2 some faulted.
+/// Every process has ended. Exit status: 0 all exited 0, 1 some exited non-zero, 2 some were
+/// killed (fault or CPU budget).
 fn finish(table: &Table) -> ! {
     let mut status = 0;
     println!("[kernel] all processes finished:");
@@ -174,6 +183,10 @@ fn finish(table: &Table) -> ! {
             State::Faulted(_) => {
                 status = 2;
                 "faulted"
+            }
+            State::OverBudget => {
+                status = 2;
+                "over CPU budget"
             }
             State::Ready | State::Running => unreachable!(),
         };

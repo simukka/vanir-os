@@ -21,6 +21,7 @@ CASES=(
   "timer-ticks    | spinner       |              |               | 1 | re:pid 1 \(spinner\): exited 0, [1-9][0-9]* ticks"
   "preemption     | spinner spinner |            |               | 1 | re:spinner B 0\n[\s\S]*spinner A 9\n"
   "address-spaces | isolation isolation |        |               | 1 | re:isolation pid 1: ok[\s\S]*isolation pid 2: ok|isolation pid 2: ok[\s\S]*isolation pid 1: ok"
+  "cpu-budget     | runaway:20 spinner |         |               | 5 | re:spinner\) exited with code 0[\s\S]*runaway\) killed: CPU budget of 20 ticks used up"
   "fault-isolated | hello spinner | poke-kernel  |               | 5 | re:hello\) killed by vector 14[\s\S]*spinner B 9\n[\s\S]*spinner\) exited with code 0"
 )
 
