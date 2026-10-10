@@ -15,7 +15,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
     assert!(frame.from_user(), "syscall from kernel mode");
     match frame.rax {
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi),
-        SYS_GETPID => frame.rax = process::current_pid(),
+        SYS_GETPID => frame.rax = process::current_id(),
         // These switch processes: `frame` then holds the next process's registers.
         SYS_SCHED_YIELD => process::yield_now(frame),
         SYS_EXIT => process::exit(frame, frame.rdi),

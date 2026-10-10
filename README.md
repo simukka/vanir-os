@@ -6,9 +6,9 @@ per process, a 100 Hz local APIC timer with round-robin preemption, and `int 0x8
 
 ## Processes
 
-- **Static task table.** The processes are fixed at build time (no `fork`/`exec`):
-  `make TASKS="spinner spinner runaway:20"` embeds those programs, and `name:N` gives a task a CPU
-  budget of N timer ticks.
+- **Static task table.** The processes are fixed at build time (no `fork`/`exec`) by an app
+  manifest: `make run APP=tests/apps/two-spinners.toml`. Each task can have a CPU budget in timer
+  ticks. See [apps/README.md](apps/README.md) for the format.
 - **One kernel stack.** A trap saves the user's registers on it; a context switch stores that
   frame in the current process, copies the next process's saved frame over it, switches `CR3`,
   and returns through the normal `iretq`. Kernel code never blocks mid-syscall.
@@ -19,7 +19,7 @@ per process, a 100 Hz local APIC timer with round-robin preemption, and `int 0x8
 |---|---|---|
 | `write(ptr, len)` | 1 | to the serial port; bad pointers return an error |
 | `sched_yield()` | 24 | give up the rest of the time slice |
-| `getpid()` | 39 | pids start at 1, in task-table order |
+| `getpid()` | 39 | task id: 1, 2, ... in manifest order (restart generation in bits 16+) |
 | `exit(code)` | 60 | |
 
 ## Protections
@@ -69,7 +69,7 @@ make                                  # build build/vanir-os.iso
 make run                              # boot in QEMU, serial output on the terminal
 make test                             # boot every scenario in tests/run.sh; prints PASS/FAIL each
 make test ACCEL=kvm                   # same, under KVM (needs access to /dev/kvm)
-make run TASKS="spinner spinner"      # choose the task table
+make run APP=tests/apps/budget.toml   # choose the app manifest
 make run USER_FEATURES=poke-kernel    # turn on one of hello's attack tests (see tests/run.sh)
 make run-debug                        # also log interrupts and CPU resets to qemu.log
 make clean                            # remove build outputs (make distclean also removes limine/)
@@ -87,7 +87,7 @@ QEMU exits with status `(code << 1) | 1` via the `isa-debug-exit` device:
 ## Layout
 
 ```
-kernel/build.rs           generates the task table from TASKS
+kernel/build.rs           generates the task table from the app manifest
 kernel/src/main.rs        Limine requests, kernel entry, halt/panic
 kernel/src/cpu.rs         enables SMEP, SMAP, NX, CR0.WP
 kernel/src/apic.rs        local APIC timer (calibrated against the PIT), PIC remap

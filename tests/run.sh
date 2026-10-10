@@ -10,7 +10,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-# name | tasks | user (hello) features | kernel features | expected status | expected text
+# name | app (tests/apps/<app>.toml) | user (hello) features | kernel features | expected status | expected text
 CASES=(
   "normal         | hello         |              |               | 1 | exited with code 0 (called from CPL 3)"
   "bad-pointer    | hello         | bad-pointer  |               | 1 | bad pointers rejected"
@@ -19,22 +19,22 @@ CASES=(
   "write-code     | hello         | write-code   |               | 5 | error=0x7"
   "smap           | hello         |              | smap-selftest | 7 | #PF page fault in kernel mode"
   "timer-ticks    | spinner       |              |               | 1 | re:pid 1 \(spinner\): exited 0, [1-9][0-9]* ticks"
-  "preemption     | spinner spinner |            |               | 1 | re:spinner B 0\n[\s\S]*spinner A 9\n"
-  "address-spaces | isolation isolation |        |               | 1 | re:isolation pid 1: ok[\s\S]*isolation pid 2: ok|isolation pid 2: ok[\s\S]*isolation pid 1: ok"
-  "cpu-budget     | runaway:20 spinner |         |               | 5 | re:spinner\) exited with code 0[\s\S]*runaway\) killed: CPU budget of 20 ticks used up"
-  "no-leak        | hello spinner isolation | |               | 1 | all task memory freed"
-  "fault-isolated | hello spinner | poke-kernel  |               | 5 | re:hello\) killed by vector 14[\s\S]*spinner B 9\n[\s\S]*spinner\) exited with code 0"
+  "preemption     | two-spinners    |            |               | 1 | re:spinner B 0\n[\s\S]*spinner A 9\n"
+  "address-spaces | two-isolation       |        |               | 1 | re:isolation pid 1: ok[\s\S]*isolation pid 2: ok|isolation pid 2: ok[\s\S]*isolation pid 1: ok"
+  "cpu-budget     | budget             |         |               | 5 | re:spinner\) exited with code 0[\s\S]*runaway\) killed: CPU budget of 20 ticks used up"
+  "no-leak        | mixed                   | |               | 1 | all task memory freed"
+  "fault-isolated | hello-spinner | poke-kernel  |               | 5 | re:hello\) killed by vector 14[\s\S]*spinner B 9\n[\s\S]*spinner\) exited with code 0"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
 
 failed=0
 for case in "${CASES[@]}"; do
-  IFS='|' read -r name tasks user kernel want_status want_text <<<"$case"
-  name=$(trim "$name"); tasks=$(trim "$tasks"); user=$(trim "$user"); kernel=$(trim "$kernel")
+  IFS='|' read -r name app user kernel want_status want_text <<<"$case"
+  name=$(trim "$name"); app=$(trim "$app"); user=$(trim "$user"); kernel=$(trim "$kernel")
   want_status=$(trim "$want_status"); want_text=$(trim "$want_text")
 
-  if ! build_log=$(make -s iso TASKS="$tasks" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" 2>&1); then
+  if ! build_log=$(make -s iso APP="tests/apps/$app.toml" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" 2>&1); then
     echo "FAIL $name: build failed"; echo "$build_log"; failed=1; continue
   fi
   out=$(timeout 60 $(make -s qemu-cmd ACCEL="${ACCEL:-tcg}") 2>&1)

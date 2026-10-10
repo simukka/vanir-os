@@ -6,14 +6,14 @@
 #![no_main]
 
 use core::ptr::{read_volatile, write_volatile};
-use vanir_user::{getpid, println, spin_cycles, yield_now};
+use vanir_user::{getpid, println, spin_cycles, task_index, yield_now};
 
 vanir_user::entry!(main);
 
 static mut VALUE: u64 = 0;
 
 fn main() -> u64 {
-    let pid = getpid();
+    let pid = task_index(getpid());
     let mine = pid * 0x1111_1111_1111;
     unsafe { write_volatile(&raw mut VALUE, mine) };
     yield_now(); // let the other copies write their values now

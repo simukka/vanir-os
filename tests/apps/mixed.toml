@@ -1,0 +1,8 @@
+[[task]]
+name = "hello"
+
+[[task]]
+name = "spinner"
+
+[[task]]
+name = "isolation"

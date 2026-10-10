@@ -16,3 +16,7 @@ x86_64 = { version = "0.15", default-features = false, features = ["instructions
 [features]
 # Test only: sys_write skips stac, so SMAP must fault the kernel on the user buffer.
 smap-selftest = []
+
+[build-dependencies]
+# Pinned: toml 1.1.8 depends on a toml_writer release the crates.io index does not offer.
+toml = { version = "=1.1.7", default-features = false, features = ["std", "parse", "serde"] }

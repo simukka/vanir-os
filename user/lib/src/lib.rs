@@ -30,8 +30,15 @@ pub fn write(bytes: &[u8]) -> u64 {
     syscall2(SYS_WRITE, bytes.as_ptr() as u64, bytes.len() as u64)
 }
 
+/// This task's id: its 1-based position in the app manifest in the low 16 bits, and how many
+/// times it has been restarted above that.
 pub fn getpid() -> u64 {
     syscall2(SYS_GETPID, 0, 0)
+}
+
+/// The 1-based task number from an id, without the restart generation.
+pub fn task_index(id: u64) -> u64 {
+    id & 0xffff
 }
 
 pub fn yield_now() {

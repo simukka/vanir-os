@@ -1,0 +1,7 @@
+[[task]]
+name = "spinner-a"
+program = "spinner"
+
+[[task]]
+name = "spinner-b"
+program = "spinner"

@@ -1,0 +1,7 @@
+[[task]]
+name = "isolation-a"
+program = "isolation"
+
+[[task]]
+name = "isolation-b"
+program = "isolation"

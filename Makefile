@@ -1,7 +1,7 @@
 # Build the user program, embed it in the kernel, wrap the kernel in a Limine ISO, run in QEMU.
 #   make run                          normal boot
 #   make run USER_FEATURES=poke-kernel   isolation test: user reads kernel memory, must #PF
-#   make run TASKS="spinner spinner"     choose the task table (name[:cpu budget in ticks] ...)
+#   make run APP=tests/apps/two-spinners.toml   choose the app manifest (see apps/README.md)
 #   make run-debug                    also log interrupts/CPU resets to qemu.log
 #   make test                         boot every scenario in tests/run.sh and check the results
 #   make test ACCEL=kvm               same, under KVM instead of QEMU's emulator
@@ -9,7 +9,7 @@
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
-TASKS          := hello
+APP            := apps/default.toml
 USER_PROGS     := hello spinner isolation runaway
 USER_FEATURES  :=
 KERNEL_FEATURES:=
@@ -35,7 +35,7 @@ user: FORCE
 	for p in $(USER_PROGS); do objcopy --strip-all $(TARGET_DIR)/$$p build/$$p.elf; done
 
 kernel: user
-	VANIR_TASKS="$(TASKS)" cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
+	VANIR_APP="$(abspath $(APP))" cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
 
 limine/limine:
 	git clone --depth=1 --branch=$(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git limine

@@ -6,18 +6,25 @@
 //! process. The kernel never blocks in the middle of a syscall, so nothing else needs saving.
 
 use core::arch::asm;
+use core::fmt;
 use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
 use crate::{elf, gdt};
 
-/// A program the kernel runs at boot, declared at build time (see kernel/build.rs).
+/// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
     pub name: &'static str,
     pub image: &'static [u8],
     /// CPU budget in timer ticks; 0 = unlimited. A process that uses it up is killed.
     pub budget_ticks: u64,
+    /// Told when other tasks die, and may restart them.
+    #[allow(dead_code)] // used by the supervisor syscalls
+    pub supervisor: bool,
+    /// Indices of the tasks this one may send IPC messages to.
+    #[allow(dead_code)] // used by IPC
+    pub sends: &'static [usize],
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
@@ -36,7 +43,10 @@ enum State {
 }
 
 struct Process {
-    pid: u64,
+    /// Index in the task table and the process table.
+    slot: usize,
+    /// Bumped on every restart, so an id held from before a restart no longer matches.
+    generation: u64,
     task: &'static Task,
     /// Freed (None) as soon as the process ends.
     space: Option<AddressSpace>,
@@ -53,6 +63,32 @@ struct Table {
     baseline_frames: u64,
 }
 
+impl Process {
+    /// Task id as user code sees it: `slot + 1` in the low 16 bits (0 means "the kernel"), the
+    /// generation above.
+    fn id(&self) -> u64 {
+        (self.slot as u64 + 1) | self.generation << 16
+    }
+
+    /// "pid 2 (echo)", or "pid 2.1 (echo)" after its first restart.
+    fn describe(&self) -> Describe<'_> {
+        Describe(self)
+    }
+}
+
+struct Describe<'a>(&'a Process);
+
+impl fmt::Display for Describe<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let p = self.0;
+        write!(f, "pid {}", p.slot + 1)?;
+        if p.generation != 0 {
+            write!(f, ".{}", p.generation)?;
+        }
+        write!(f, " ({})", p.task.name)
+    }
+}
+
 impl Table {
     fn current(&mut self) -> &mut Process {
         self.procs[self.current].as_mut().expect("no current process")
@@ -67,24 +103,18 @@ pub fn start() -> ! {
     assert!(!TASKS.is_empty() && TASKS.len() <= MAX_PROCESSES, "need 1..={MAX_PROCESSES} tasks");
     let mut table = TABLE.lock();
     table.baseline_frames = memory::frames_in_use();
-    for (i, task) in TASKS.iter().enumerate() {
-        let pid = i as u64 + 1;
+    for (slot, task) in TASKS.iter().enumerate() {
         let space = AddressSpace::new();
         let entry = elf::load(task.image, &space)
             .unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
         for page in 1..=USER_STACK_PAGES {
             space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
         }
-        println!(
-            "[kernel] pid {} ({}): {}-byte ELF, entry {:#x}",
-            pid,
-            task.name,
-            task.image.len(),
-            entry
-        );
         let context = initial_context(entry, USER_STACK_TOP);
         let space = Some(space);
-        table.procs[i] = Some(Process { pid, task, space, context, state: State::Ready, ticks: 0 });
+        let p = Process { slot, generation: 0, task, space, context, state: State::Ready, ticks: 0 };
+        println!("[kernel] {}: {}-byte ELF, entry {:#x}", p.describe(), task.image.len(), entry);
+        table.procs[slot] = Some(p);
     }
 
     table.current = 0;
@@ -106,7 +136,7 @@ pub fn tick(frame: &mut TrapFrame) {
     p.ticks += 1;
     let budget = p.task.budget_ticks;
     if budget != 0 && p.ticks >= budget {
-        println!("[kernel] pid {} ({}) killed: CPU budget of {} ticks used up", p.pid, p.task.name, budget);
+        println!("[kernel] {} killed: CPU budget of {} ticks used up", p.describe(), budget);
         p.state = State::OverBudget;
         p.space = None;
         return switch_to_next(&mut table, frame);
@@ -129,21 +159,15 @@ fn preempt(table: &mut Table, frame: &mut TrapFrame) {
     switch_to_next(table, frame);
 }
 
-pub fn current_pid() -> u64 {
-    TABLE.lock().current().pid
+pub fn current_id() -> u64 {
+    TABLE.lock().current().id()
 }
 
 /// `exit(code)`: end the current process and resume the next one in `frame`.
 pub fn exit(frame: &mut TrapFrame, code: u64) {
     let mut table = TABLE.lock();
     let p = table.current();
-    println!(
-        "[kernel] pid {} ({}) exited with code {} (called from CPL {})",
-        p.pid,
-        p.task.name,
-        code,
-        frame.cs & 3
-    );
+    println!("[kernel] {} exited with code {} (called from CPL {})", p.describe(), code, frame.cs & 3);
     p.state = State::Exited(code);
     p.space = None;
     switch_to_next(&mut table, frame);
@@ -153,7 +177,7 @@ pub fn exit(frame: &mut TrapFrame, code: u64) {
 pub fn kill(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     let p = table.current();
-    println!("[kernel] pid {} ({}) killed by vector {}", p.pid, p.task.name, frame.vector);
+    println!("[kernel] {} killed by vector {}", p.describe(), frame.vector);
     p.state = State::Faulted(frame.vector);
     p.space = None;
     switch_to_next(&mut table, frame);
@@ -200,7 +224,7 @@ fn finish(table: &Table) -> ! {
             }
             State::Ready | State::Running => unreachable!(),
         };
-        println!("[kernel]   pid {} ({}): {}, {} ticks", p.pid, p.task.name, outcome, p.ticks);
+        println!("[kernel]   {}: {}, {} ticks", p.describe(), outcome, p.ticks);
     }
     let in_use = memory::frames_in_use();
     if in_use == table.baseline_frames {
