@@ -31,6 +31,16 @@ fn exit(code: u64) -> ! {
 extern "C" fn _start() -> ! {
     write(b"hello from ring 3\n");
 
+    #[cfg(feature = "bad-pointer")]
+    {
+        let unmapped = unsafe { core::slice::from_raw_parts(0x1000_0000 as *const u8, 16) };
+        // Starts in the top stack page and runs off the end of the mapped stack.
+        let straddling = unsafe { core::slice::from_raw_parts(0x7fff_ffff_eff0 as *const u8, 32) };
+        let rejected = write(unmapped) == u64::MAX && write(straddling) == u64::MAX;
+        write(if rejected { b"bad pointers rejected\n" } else { b"bad pointer ACCEPTED\n" });
+        exit(if rejected { 0 } else { 1 });
+    }
+
     #[cfg(feature = "poke-kernel")]
     {
         write(b"reading kernel memory at 0xffffffff80000000...\n");

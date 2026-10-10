@@ -11,3 +11,5 @@ bench = false
 [features]
 # Isolation test: read a kernel address from ring 3; must #PF.
 poke-kernel = []
+# write() from unmapped and partly-mapped buffers; the kernel must return an error.
+bad-pointer = []

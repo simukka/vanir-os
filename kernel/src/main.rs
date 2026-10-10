@@ -15,6 +15,7 @@ mod interrupts;
 mod memory;
 mod process;
 mod syscall;
+mod usercopy;
 
 use core::panic::PanicInfo;
 use limine::BaseRevision;

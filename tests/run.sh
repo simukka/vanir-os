@@ -10,7 +10,8 @@ cd "$(dirname "$0")/.."
 # name | user features | kernel features | expected status | expected serial text
 CASES=(
   "normal       |              |               | 1 | process exited with code 0 (called from CPL 3)"
-  "poke-kernel  | poke-kernel  |               | 5 | cr2=0xffffffff80000000"
+  "bad-pointer  | bad-pointer  |               | 1 | bad pointers rejected"
+  "poke-kernel  | poke-kernel  |               | 5 | process killed by vector 14"
   "smap         |              | smap-selftest | 7 | #PF page fault in kernel mode"
 )
 

@@ -3,6 +3,7 @@
 use core::arch::asm;
 
 use crate::gdt;
+use crate::interrupts::TrapFrame;
 use crate::memory::{self, PAGE_SIZE};
 
 /// Flat binary produced from user/hello by the Makefile (objcopy -O binary).
@@ -29,6 +30,13 @@ pub fn run_hello() -> ! {
         USER_CODE_BASE
     );
     enter_user(USER_CODE_BASE, USER_STACK_TOP)
+}
+
+/// A fault in user mode ends the process, not the kernel. With one process there is nothing left
+/// to run, so this stops the machine; once there is a scheduler it will run the next process.
+pub fn kill(frame: &TrapFrame) -> ! {
+    println!("[kernel] process killed by vector {}", frame.vector);
+    crate::halt(2)
 }
 
 /// Build the frame `iretq` expects and "return" into ring 3. The RPL bits in the selectors

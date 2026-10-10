@@ -11,7 +11,7 @@ use x86_64::instructions::tables::lidt;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::DescriptorTablePointer;
 
-use crate::{gdt, serial, syscall};
+use crate::{gdt, process, serial, syscall, usercopy};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -261,6 +261,10 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    if frame.vector == 14 && !frame.from_user() && usercopy::fixup(frame) {
+        return;
+    }
+
     let name = EXCEPTION_NAMES.get(frame.vector as usize).copied().unwrap_or("unknown");
     let ring = if frame.from_user() { "user" } else { "kernel" };
     // Unlocked: the fault may have hit while the serial lock was held.
@@ -273,6 +277,8 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     if frame.vector == 14 {
         print(format_args!("  cr2={:#x}\n", Cr2::read_raw()));
     }
-    // No scheduler: a faulting process (or kernel) ends the machine.
-    crate::halt(if frame.from_user() { 2 } else { 3 });
+    if frame.from_user() {
+        process::kill(frame);
+    }
+    crate::halt(3);
 }
