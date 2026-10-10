@@ -4,7 +4,8 @@ A minimal x86-64 kernel in Rust, booted by [Limine](https://github.com/limine-bo
 isolated ring-3 processes. It provides serial output, GDT/TSS, IDT, an ELF loader, a page-table tree
 per process, a 100 Hz local APIC timer with round-robin preemption, synchronous IPC between
 processes, a supervisor task that restarts failed ones, unprivileged device-driver tasks (virtio
-console and vsock), and telemetry streamed to a host agent.
+console and vsock), telemetry streamed to a host agent, signed task images, a Secure Boot chain,
+measured boot and TPM remote attestation.
 
 ## Processes
 
@@ -102,6 +103,55 @@ make run TRANSPORT=vsock ACCEL=kvm APP=tests/apps/telemetry-vsock.toml   # then 
 
 vsock needs `/dev/vhost-vsock` (the `kvm` group) and KVM.
 
+## Boot chain and attestation
+
+With `BOOT=uefi-secure` every link checks the next before running it:
+
+| Link | Checks | How | Refuses (test) |
+|---|---|---|---|
+| UEFI firmware (OVMF, Secure Boot on) | the boot loader | `BOOTX64.EFI` signed with `sbsign` | `sb-unsigned-loader` |
+| Limine | its config | config hash embedded with `limine enroll-config` | `sb-edited-config` |
+| Limine | the kernel | BLAKE2b hash pinned in `limine.conf` | `sb-tampered-kernel` |
+| Kernel | every task image | Ed25519 signature (`tools/sign-image.py`), key compiled in | `sig-*` |
+
+Task images ship as boot modules beside the kernel, each with a `.sig`: program name, version and
+SHA-256 of the ELF, signed. The kernel refuses an image that is unsigned, changed, signed for
+another program, signed by another key, or older than the manifest's `min_version`. A refused task
+never runs; the supervisor and telemetry are told why. Images can be updated without rebuilding
+the kernel, as long as they are signed.
+
+**Measured boot** (`TPM=1`, a software TPM): the firmware measures the boot loader and the Secure
+Boot state into PCRs 0-7. Before any task runs, the kernel extends **PCR 12** with SHA-256 of the
+kernel file, of the app manifest, and of each task's signed statement (zeros for a refused image).
+`tools/expected-pcrs.py` computes PCR 12 from the build output alone.
+
+**Attestation**: the `attest` task (manifest `tpm = true`) holds an attestation key in the TPM.
+When the host sends `attest <nonce>` over the vsock uplink, `control` asks `attest`, which returns
+a TPM quote of PCRs 0, 4, 7 and 12 over that nonce. `tools/verify-quote.py` checks it is genuine
+TPM output, over this nonce, correctly signed, consistent with the reported PCRs and the kernel's
+measurement log, and equal to an approved reference:
+
+```sh
+make image BOOT=uefi-secure APP=tests/apps/attest.toml USER_FEATURES=control/one-shot
+tools/host-agent.py --listen-vsock 5000 --save build/telemetry.log --attest &
+make run BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock APP=tests/apps/attest.toml USER_FEATURES=control/one-shot
+tools/verify-quote.py --record build/attest-reference.json \
+    --expected-pcr12 $(tools/expected-pcrs.py --app tests/apps/attest.toml)      # known-good boot
+tools/verify-quote.py --reference build/attest-reference.json                     # later boots
+```
+
+**What this does not prove yet:**
+
+- **Development keys.** Secure Boot uses Debian's snakeoil keys, whose private key is public, and
+  the image key is a local dev key in `keys/`. Production needs your own keys, kept offline.
+- **Trust on first use.** The attestation key is not yet tied to the TPM's endorsement
+  certificate (TPM2 credential activation), so the verifier trusts the key recorded with the
+  reference.
+- **Recorded firmware values.** PCRs 0, 4 and 7 are compared with a recorded known-good boot,
+  not computed independently; only PCR 12 is.
+- **No IOMMU.** A signed but malicious driver can still use its device's DMA to subvert the system
+  after measurement. Signing narrows who can run such code; it does not make drivers safe.
+
 ## Syscalls
 
 Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
@@ -126,6 +176,7 @@ Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
 | `dma_info()` | 112 | → `(address, physical address, length)` of the DMA region |
 | `read_events(buf, cap)` | 113 | event reader only → `(count, dropped)` |
 | `stats(buf, cap)` | 114 | event reader only: uptime, memory, interrupts, per-task state |
+| `measurements(buf, cap)` | 115 | TPM task only → `(count, TPM address)`; the boot measurement log |
 
 `recv` flags (in `rdx`): `RECV_EXPECT_IRQ` (1), `RECV_TIMEOUT` (2, ticks in `r10`; then sender 0,
 `NOTIFY_TIMER`). Kernel notifications come as sender 0 with op `NOTIFY_DEATH` (1, supervisor),
@@ -151,6 +202,9 @@ Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
 | Restart generations in task ids | clients silently reaching a restarted server | `stale-id` |
 | Device grants; MSI-X table not mapped | drivers touching other devices or redirecting interrupts | `device-no-grant`, `device-msix` |
 | Per-slot DMA regions, zeroed on restart | a dead driver's device scribbling on reused memory | `dma-region` |
+| Signed task images, `min_version` | unsigned, modified, swapped or rolled-back programs | `sig-*` |
+| Secure Boot chain | a modified boot loader, config or kernel | `sb-*` |
+| Measured boot + TPM quotes | a host trusting a VM that booted something else | `measured-*`, `attest-*` |
 | Frames freed on death | memory exhaustion from restart loops | `restart-no-leak` |
 
 ## System dependencies
@@ -165,11 +219,16 @@ Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
 | `objcopy` (GNU binutils) | stripping the user ELF before it is embedded | `binutils` |
 | `xorriso` | creating the bootable ISO | `xorriso` |
 | `qemu-system-x86_64` | running the kernel (`-cpu max` for SMEP/SMAP, or KVM with `ACCEL=kvm`) | `qemu-system-x86` |
+| Python 3.11+ with `cryptography` | signing images, verifying quotes, test tools | `python3-cryptography` |
+| OVMF | UEFI firmware for `BOOT=uefi-secure` | `ovmf` |
+| `sbsign`, `openssl`, `b2sum` | signing the boot loader, pinning hashes | `sbsigntool`, `openssl`, `coreutils` |
+| `swtpm` | software TPM for `TPM=1` | `swtpm`, `swtpm-tools` |
 
 Install on Debian/Ubuntu:
 
 ```sh
 sudo apt install make git gcc binutils xorriso qemu-system-x86
+sudo apt install python3-cryptography ovmf sbsigntool swtpm swtpm-tools   # boot chain, TPM
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if Rust isn't installed
 rustup target add x86_64-unknown-none
 ```
@@ -218,6 +277,10 @@ kernel/src/process.rs     task and process tables, scheduler, budgets, IPC, supe
 kernel/src/pci.rs         PCI discovery, BAR sizing, MSI-X setup (device kinds in pci_kinds.rs)
 kernel/src/irq.rs         device interrupts to task notifications
 kernel/src/events.rs      kernel event log
+kernel/src/modules.rs     task images and signatures as Limine boot modules
+kernel/src/verify.rs      Ed25519 task image signatures
+kernel/src/tpm.rs         TPM 2.0 (CRB): PCR extend/read, kernel use at boot only
+kernel/src/measure.rs     measured boot into PCR 12
 kernel/src/syscall.rs     int 0x80 dispatch
 user/lib/                 shared user runtime: _start, syscall wrappers, println!
 user/hello/               greeting plus the attack tests (features)
@@ -237,10 +300,18 @@ user/virtio-console/      console driver (OP_WRITE); crash-after-50 test feature
 user/virtio-vsock/        vsock driver: one stream to host CID 2 port 5000
 user/chatter/             writes 200 numbered lines through the console driver
 user/telemetry/           event log + heartbeats -> JSON lines -> uplink
+user/tpm2/                TPM 2.0 client: attestation key, quote, PCR read
+user/attest/              answers quote requests with a JSON quote
+user/control/             reads host commands from the uplink (attest <nonce>)
 apps/                     app manifests (the default image, and the format)
 tests/apps/               the manifests the tests boot
 tools/host-agent.py       receives and checks telemetry (file, stdin, Unix socket, vsock)
 tools/check_lines.py      checks numbered lines arrived in order
+tools/sign-image.py       makes the image-signing key; signs task images
+tools/expected-pcrs.py    computes PCR 12 from the build output
+tools/verify-quote.py     verifies a TPM quote against a recorded reference
+tools/with-swtpm.sh       runs QEMU with a software TPM
+keys/                     image-signing key (generated, not in git)
 user/linker.ld            user programs are ELF, linked at 0x400000
 tests/run.sh              boots each scenario and checks QEMU status and output
 ```

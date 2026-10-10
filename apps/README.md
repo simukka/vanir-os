@@ -13,11 +13,13 @@ sends = ["echo"]       # optional: tasks this one may send IPC messages to
 devices = ["virtio-console"]  # optional: PCI devices to drive (see kernel/src/pci_kinds.rs)
 dma_pages = 16         # optional: physically contiguous DMA region, in 4 KiB pages (max 256)
 events = true          # optional: may read the kernel event log and stats (at most one task)
+min_version = 2        # optional: refuse images of this program signed with an older version
+tpm = true             # optional: gets the TPM mapped, for attestation (at most one task)
 ```
 
 Tasks get ids 1, 2, ... in manifest order (programs can also find one with `lookup(name)`). The
 build fails on unknown keys, duplicate names, unknown `sends` targets or device names, or more than
-one supervisor or event reader. Each `devices` entry claims the next unclaimed device of that kind
+one supervisor, event reader or TPM task. Each `devices` entry claims the next unclaimed device of that kind
 at boot; a missing device is logged and the task runs without it.
 
 Telemetry sends through the task named `uplink` if there is one (e.g. `program = "virtio-vsock"`),
