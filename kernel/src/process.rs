@@ -19,7 +19,7 @@ use spin::Mutex;
 
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
-use crate::{apic, elf, gdt, pci};
+use crate::{apic, elf, gdt, irq, pci};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
 pub struct Task {
@@ -39,7 +39,7 @@ pub struct Task {
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
 
-const MAX_PROCESSES: usize = 8;
+pub const MAX_PROCESSES: usize = 8;
 const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
 const USER_STACK_PAGES: u64 = 4;
 
@@ -124,6 +124,15 @@ struct DeathRecord {
 }
 
 pub const NOTIFY_DEATH: u64 = 1;
+/// `recv` from sender 0 with this op: device interrupts; the length register holds the bits.
+pub const NOTIFY_IRQ: u64 = 2;
+/// `recv` flag (in rdx): this task has device work in flight and an interrupt will come, so the
+/// kernel should idle for it rather than conclude that nothing can ever run again.
+pub const RECV_EXPECT_IRQ: u64 = 1;
+
+/// Give up idling if no process has become ready for this many ticks (5 s) while tasks wait on
+/// interrupts: something is stuck, and a test should not hang forever.
+const STALL_TICKS: u64 = 500;
 
 struct Process {
     /// Index in the task table and the process table.
@@ -177,6 +186,8 @@ struct Table {
     /// Frames in use before any task was loaded; every task's memory is freed when it ends.
     baseline_frames: u64,
     supervisor: Option<usize>,
+    /// When the scheduler last started idling with no sleepers (only waiting on interrupts).
+    stalled_since: Option<u64>,
 }
 
 impl Table {
@@ -204,7 +215,13 @@ impl Table {
 }
 
 static TABLE: Mutex<Table> =
-    Mutex::new(Table { procs: [const { None }; MAX_PROCESSES], current: 0, baseline_frames: 0, supervisor: None });
+    Mutex::new(Table {
+    procs: [const { None }; MAX_PROCESSES],
+    current: 0,
+    baseline_frames: 0,
+    supervisor: None,
+    stalled_since: None,
+});
 
 /// Load every task, then enter the first one. Never returns.
 pub fn start() -> ! {
@@ -215,8 +232,16 @@ pub fn start() -> ! {
     // Grants first: DMA regions are permanent, so they belong in the baseline, not the leak check.
     let mut claimed = [false; pci::MAX_DEVICES];
     let mut grants = [Grants { devices: [None; MAX_TASK_DEVICES], dma: None }; MAX_PROCESSES];
+    let mut vectors = irq::DEVICE_VECTORS;
     for (slot, task) in TASKS.iter().enumerate() {
         grants[slot].devices = claim_devices(task, &mut claimed);
+        for (bit, device) in grants[slot].devices.iter().enumerate() {
+            let Some(device) = *device else { continue };
+            let vector = vectors.next().expect("out of device interrupt vectors");
+            if pci::enable_msix(device, vector) {
+                irq::route(vector, slot, bit);
+            }
+        }
         if task.dma_pages != 0 {
             grants[slot].dma = Some((memory::alloc_contiguous(task.dma_pages), task.dma_pages));
         }
@@ -312,6 +337,30 @@ pub fn sleep(frame: &mut TrapFrame) {
 /// `uptime() -> ticks` since boot.
 pub fn uptime(frame: &mut TrapFrame) {
     frame.rax = apic::now();
+}
+
+/// A device interrupt arrived while user code ran: wake its task if it waits in `recv`, and if
+/// one woke, let the scheduler run (drivers are latency-sensitive; clients wait on them).
+pub fn irq_arrived(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if wake_irq_waiters(&mut table) {
+        block(&mut table, frame, State::Ready);
+    }
+}
+
+/// Deliver pending interrupt bits to tasks waiting in `recv`. Returns whether any woke.
+fn wake_irq_waiters(table: &mut Table) -> bool {
+    let mut woke = false;
+    for p in table.procs.iter_mut().flatten() {
+        if p.state == State::RecvBlocked && irq::pending(p.slot) {
+            p.context.rax = 0;
+            p.context.rdx = NOTIFY_IRQ;
+            p.context.rsi = irq::take(p.slot);
+            p.state = State::Ready;
+            woke = true;
+        }
+    }
+    woke
 }
 
 /// Make every sleeper whose time has come ready.
@@ -443,6 +492,7 @@ fn block(table: &mut Table, frame: &mut TrapFrame, state: State) {
 fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
     loop {
         wake_sleepers(table);
+        wake_irq_waiters(table);
         for step in 1..=MAX_PROCESSES {
             let i = (table.current + step) % MAX_PROCESSES;
             if let Some(p) = table.procs[i].as_mut().filter(|p| p.state == State::Ready) {
@@ -453,11 +503,23 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
                     p.space().activate();
                 }
                 table.current = i;
+                table.stalled_since = None;
                 return;
             }
         }
-        if !table.procs.iter().flatten().any(|p| matches!(p.state, State::Sleeping(_))) {
+        let procs = || table.procs.iter().flatten();
+        let sleeping = procs().any(|p| matches!(p.state, State::Sleeping(_)));
+        // A blocked recv's flags are still in its saved registers.
+        let awaiting_device = procs().any(|p| p.state == State::RecvBlocked && p.context.rdx & RECV_EXPECT_IRQ != 0);
+        if !sleeping && !awaiting_device {
             finish(table)
+        }
+        if !sleeping {
+            let since = *table.stalled_since.get_or_insert(apic::now());
+            if apic::now() - since >= STALL_TICKS {
+                println!("[kernel] no process has run for {} ticks while waiting on devices", STALL_TICKS);
+                finish(table)
+            }
         }
         idle();
     }
@@ -536,8 +598,9 @@ fn deliver(table: &mut Table, from: usize, to: usize, buf: u64) {
     }
 }
 
-/// `recv(buf, cap) -> (sender, op, len)` in rax, rdx, rsi. Takes the next waiting sender,
-/// round-robin from after the last one served, or waits for one.
+/// `recv(buf, cap, flags) -> (sender, op, len)` in rax, rdx, rsi. Takes the next waiting
+/// sender, round-robin from after the last one served, or waits for one. Kernel notifications
+/// (deaths for the supervisor, then device interrupts) come first. Flags: `RECV_EXPECT_IRQ`.
 pub fn recv(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     let me = table.current;
@@ -551,8 +614,15 @@ pub fn recv(frame: &mut TrapFrame) {
         return;
     }
 
-    // The supervisor hears about deaths before ordinary messages.
+    // The supervisor hears about deaths, and drivers about interrupts, before ordinary messages.
     if table.supervisor == Some(me) && report_death(&mut table, me, buf, cap, frame) {
+        return;
+    }
+    let bits = irq::take(me);
+    if bits != 0 {
+        frame.rax = 0;
+        frame.rdx = NOTIFY_IRQ;
+        frame.rsi = bits;
         return;
     }
 
@@ -659,6 +729,7 @@ pub fn restart(frame: &mut TrapFrame) {
         // A fresh start sees a clean DMA region, as at boot.
         unsafe { memory::phys_to_virt(phys).write_bytes(0, (pages * PAGE_SIZE) as usize) };
     }
+    irq::take(slot); // interrupts meant for the previous incarnation
     let (space, context) = load(p.task, &p.grants);
     p.space = Some(space);
     p.context = context;

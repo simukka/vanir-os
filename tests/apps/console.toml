@@ -1,0 +1,4 @@
+[[task]]
+name = "virtio-console"
+devices = ["virtio-console"]
+dma_pages = 4

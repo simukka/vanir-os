@@ -8,6 +8,12 @@
 use spin::Once;
 use x86_64::instructions::port::Port;
 
+use crate::{apic, memory};
+
+/// Kernel addresses where devices' MSI-X tables are mapped (16 pages per device).
+const MSIX_VIRT: u64 = 0xffff_ffff_7000_0000;
+const MSIX_STRIDE: u64 = 0x1_0000;
+
 pub const MAX_DEVICES: usize = 32;
 
 include!("pci_kinds.rs");
@@ -171,6 +177,41 @@ fn probe(bus: u8, dev: u8, func: u8, id: u32) -> Device {
     // Memory decoding and bus mastering on; legacy INTx off (interrupts will use MSI-X).
     d.write(0x04, (command | 0b110 | 1 << 10) & 0xffff);
     d
+}
+
+/// Point every MSI-X table entry of device `index` at `vector` on this CPU and enable MSI-X.
+/// The table lives in a BAR that is never mapped into the driver task, so only the kernel
+/// decides where a device's interrupts go. Returns false if the device has no MSI-X.
+pub fn enable_msix(index: usize, vector: u64) -> bool {
+    let Some(d) = get(index) else { return false };
+    let Some(cap) = d.msix_cap else { return false };
+    let control = d.read(cap) >> 16;
+    let entries = (control & 0x7ff) as u64 + 1;
+    let table = d.read(cap + 4);
+    let bar = d.bars[(table & 0b111) as usize];
+    let offset = (table & !0b111) as u64;
+
+    let base = MSIX_VIRT + index as u64 * MSIX_STRIDE;
+    let first_page = (bar.phys + offset) & !0xfff;
+    let last_page = (bar.phys + offset + entries * 16 - 1) & !0xfff;
+    assert!(last_page - first_page < MSIX_STRIDE, "MSI-X table too large");
+    for page in (first_page..=last_page).step_by(0x1000) {
+        memory::map_kernel_mmio(base + (page - first_page), page);
+    }
+    let table = (base + ((bar.phys + offset) & 0xfff)) as *mut u32;
+    for e in 0..entries as usize {
+        unsafe {
+            let entry = table.add(e * 4);
+            entry.write_volatile(0xfee0_0000 | apic::id() << 12); // message address: this CPU
+            entry.add(1).write_volatile(0);
+            entry.add(2).write_volatile(vector as u32); // message data: fixed delivery, vector
+            entry.add(3).write_volatile(0); // unmasked
+        }
+    }
+    // Enable MSI-X, clear the function mask.
+    let control = (control | 1 << 15) & !(1 << 14);
+    d.write(cap, (d.read(cap) & 0xffff) | control << 16);
+    true
 }
 
 pub fn get(index: usize) -> Option<&'static Device> {

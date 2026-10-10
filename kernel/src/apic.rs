@@ -19,6 +19,7 @@ pub const TICK_HZ: u32 = 100;
 const LAPIC_VIRT: u64 = 0xffff_ffff_7fff_f000;
 const IA32_APIC_BASE: u32 = 0x1b;
 
+const ID: u64 = 0x20;
 const TPR: u64 = 0x80;
 const EOI: u64 = 0xb0;
 const SVR: u64 = 0xf0;
@@ -68,6 +69,11 @@ pub fn tick() {
 /// Timer ticks since boot (10 ms each).
 pub fn now() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// This CPU's local APIC id: where MSI messages must be addressed.
+pub fn id() -> u32 {
+    read(ID) >> 24
 }
 
 /// Acknowledge the current interrupt. Not sent for spurious interrupts.

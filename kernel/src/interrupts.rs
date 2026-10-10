@@ -11,7 +11,7 @@ use x86_64::instructions::tables::lidt;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::DescriptorTablePointer;
 
-use crate::{apic, gdt, process, serial, syscall, usercopy};
+use crate::{apic, gdt, irq, process, serial, syscall, usercopy};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -138,6 +138,9 @@ TRAP_NOERR 31
 .irp n, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,64,128,255
 TRAP_NOERR \n
 .endr
+.irp n, 80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+TRAP_NOERR \n
+.endr
 
 .section .rodata
 .balign 8
@@ -154,6 +157,11 @@ trap_stub_pic_table:
 .global trap_stub_syscall
 trap_stub_syscall:
     .quad trap_stub_128
+.global trap_stub_device_table
+trap_stub_device_table:
+.irp n, 80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+    .quad trap_stub_\n
+.endr
 .global trap_stub_timer
 trap_stub_timer:
     .quad trap_stub_64
@@ -168,6 +176,7 @@ unsafe extern "C" {
     static trap_stub_table: [u64; 32];
     static trap_stub_pic_table: [u64; 16];
     static trap_stub_syscall: u64;
+    static trap_stub_device_table: [u64; 16];
     static trap_stub_timer: u64;
     static trap_stub_spurious: u64;
 }
@@ -227,6 +236,9 @@ pub fn init() {
             idt[apic::PIC_VECTORS.start as usize + i] = Gate::new(stub, 0, 0);
         }
         idt[apic::TIMER_VECTOR as usize] = Gate::new(unsafe { trap_stub_timer }, 0, 0);
+        for (i, &stub) in unsafe { &trap_stub_device_table }.iter().enumerate() {
+            idt[irq::DEVICE_VECTORS.start as usize + i] = Gate::new(stub, 0, 0);
+        }
         idt[apic::SPURIOUS_VECTOR as usize] = Gate::new(unsafe { trap_stub_spurious }, 0, 0);
         idt
     });
@@ -285,6 +297,15 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
             // In kernel mode this can only be the idle loop, which checks the clock itself.
             if frame.from_user() {
                 process::tick(frame);
+            }
+            return;
+        }
+        v if irq::DEVICE_VECTORS.contains(&v) => {
+            apic::eoi();
+            irq::raise(v);
+            // In kernel mode this can only be the idle loop, which delivers it itself.
+            if frame.from_user() {
+                process::irq_arrived(frame);
             }
             return;
         }

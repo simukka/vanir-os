@@ -283,6 +283,21 @@ name = "vanir-user"
 version = "0.1.0"
 
 [[package]]
+name = "virtio"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
+name = "virtio-console"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+ "virtio",
+]
+
+[[package]]
 name = "volatile"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

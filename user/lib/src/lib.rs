@@ -99,9 +99,22 @@ pub struct Message {
     pub len: usize,
 }
 
+/// Kernel notification (sender 0) op: device interrupts; `Message::len` holds the pending bits
+/// (one per granted device, in manifest order).
+pub const NOTIFY_IRQ: u64 = 2;
+
+/// `recv` flag: device work is in flight, so an interrupt will come. Without it, the kernel
+/// may end the run when nothing else can happen.
+pub const RECV_EXPECT_IRQ: u64 = 1;
+
 /// Wait for a message, written to the start of `buf`.
 pub fn recv(buf: &mut [u8]) -> Result<Message, u64> {
-    let (sender, op, len) = syscall6(SYS_RECV, [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0]);
+    recv_flags(buf, 0)
+}
+
+/// `recv` with flags (`RECV_EXPECT_IRQ`).
+pub fn recv_flags(buf: &mut [u8], flags: u64) -> Result<Message, u64> {
+    let (sender, op, len) = syscall6(SYS_RECV, [buf.as_mut_ptr() as u64, buf.len() as u64, flags, 0, 0, 0]);
     if err::is_error(sender) { Err(sender) } else { Ok(Message { sender, op, len: len as usize }) }
 }
 

@@ -14,6 +14,7 @@ mod cpu;
 mod elf;
 mod gdt;
 mod interrupts;
+mod irq;
 mod memory;
 mod pci;
 mod process;

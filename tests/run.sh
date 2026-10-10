@@ -40,6 +40,7 @@ CASES=(
   "device-msix     | devprobe            | devprobe/poke-msix  |               | 5 | re:BAR 1 \(MSI-X\) visible to us: false[\s\S]*devprobe\) killed by vector 14"
   "dma-region      | dma                 |                     |               | 1 | re:start 0: 16 KiB at 0x2000000000, physical (0x[0-9a-f]+), all zero: true[\s\S]*restarted task 2[\s\S]*start 1: 16 KiB at 0x2000000000, physical \1, all zero: true[\s\S]*region ok after restart"
   "dma-none        | dma-none            |                     |               | 1 | dmatest: no DMA region: BAD_ARGUMENT"
+  "device-irq      | console             |                     |               | 1 | re:transmit true done, signalled by interrupt \(bits 0x1\)[\s\S]*--- build/telemetry.log ---\nhello host, from the virtio-console driver"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
@@ -55,6 +56,8 @@ for case in "${CASES[@]}"; do
   fi
   out=$(timeout 60 $(make -s qemu-cmd ACCEL="${ACCEL:-tcg}") 2>&1)
   status=$?
+  # What reached the host over the virtio console, for the checks below.
+  out+=$'\n--- build/telemetry.log ---\n'"$(cat build/telemetry.log 2>/dev/null)"
 
   if [[ "$want_text" == re:* ]]; then
     grep -Pzq -- "${want_text#re:}" <<<"$out"; text_ok=$?
