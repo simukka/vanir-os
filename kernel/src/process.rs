@@ -2,34 +2,28 @@
 
 use core::arch::asm;
 
-use crate::gdt;
+use crate::{elf, gdt};
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, PAGE_SIZE};
 
-/// Flat binary produced from user/hello by the Makefile (objcopy -O binary).
-static HELLO: &[u8] = include_bytes!("../../build/hello.bin");
+/// The user program's ELF, copied (and stripped) from user/hello by the Makefile.
+static HELLO: &[u8] = include_bytes!("../../build/hello.elf");
 
-/// Must match the address in user/hello/linker.ld.
-const USER_CODE_BASE: u64 = 0x40_0000;
 const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
 const USER_STACK_PAGES: u64 = 4;
 
 pub fn run_hello() -> ! {
-    // Code and data share one flat image, so its pages are writable.
-    for (i, chunk) in HELLO.chunks(PAGE_SIZE as usize).enumerate() {
-        let frame = memory::map_user_page(USER_CODE_BASE + i as u64 * PAGE_SIZE, true);
-        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), memory::phys_to_virt(frame), chunk.len()) };
-    }
+    let entry = elf::load(HELLO).unwrap_or_else(|e| panic!("cannot load user program: {e:?}"));
     for i in 1..=USER_STACK_PAGES {
-        memory::map_user_page(USER_STACK_TOP - i * PAGE_SIZE, true);
+        memory::map_user_page(USER_STACK_TOP - i * PAGE_SIZE, true, false);
     }
 
     println!(
-        "[kernel] loaded {} bytes at {:#x}, entering ring 3",
+        "[kernel] loaded {}-byte ELF, entry {:#x}, entering ring 3",
         HELLO.len(),
-        USER_CODE_BASE
+        entry
     );
-    enter_user(USER_CODE_BASE, USER_STACK_TOP)
+    enter_user(entry, USER_STACK_TOP)
 }
 
 /// A fault in user mode ends the process, not the kernel. With one process there is nothing left

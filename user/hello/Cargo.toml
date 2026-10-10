@@ -13,3 +13,7 @@ bench = false
 poke-kernel = []
 # write() from unmapped and partly-mapped buffers; the kernel must return an error.
 bad-pointer = []
+# NX test: jump to code written on the stack; must #PF on instruction fetch.
+exec-stack = []
+# W^X test: write to our own code; must #PF.
+write-code = []

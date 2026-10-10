@@ -8,6 +8,8 @@ use limine::memory_map::{Entry, EntryType};
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
 
+use crate::cpu;
+
 pub const PAGE_SIZE: u64 = 4096;
 
 /// First non-canonical address; everything below is the user half.
@@ -17,6 +19,7 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
+const NO_EXECUTE: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 struct FrameAllocator {
@@ -61,13 +64,14 @@ fn table(phys: u64) -> &'static mut [u64; 512] {
 }
 
 /// Map the 4 KiB page at `virt` to a fresh zeroed frame, user-accessible. Returns the frame.
-pub fn map_user_page(virt: u64, writable: bool) -> u64 {
+/// Non-executable pages get the NX bit (when the CPU supports it).
+pub fn map_user_page(virt: u64, writable: bool, executable: bool) -> u64 {
     assert!(virt % PAGE_SIZE == 0 && virt < USER_END, "bad user address {virt:#x}");
 
     let (pml4, _) = Cr3::read();
     let mut table_phys = pml4.start_address().as_u64();
     // Walk PML4 -> PDPT -> PD, creating tables as needed. USER must be set at every level
-    // for ring 3 to reach the final page; the leaf entry decides writability too.
+    // for ring 3 to reach the final page; the leaf entry decides writability and NX.
     for level in (1..=3).rev() {
         let index = ((virt >> (12 + 9 * level)) & 0x1ff) as usize;
         let entry = &mut table(table_phys)[index];
@@ -83,6 +87,7 @@ pub fn map_user_page(virt: u64, writable: bool) -> u64 {
     let leaf = &mut table(table_phys)[index];
     assert!(*leaf & PRESENT == 0, "user page {virt:#x} already mapped");
     let frame = alloc_frame();
-    *leaf = frame | PRESENT | USER | if writable { WRITABLE } else { 0 };
+    let nx = if !executable && cpu::nx_enabled() { NO_EXECUTE } else { 0 };
+    *leaf = frame | PRESENT | USER | nx | if writable { WRITABLE } else { 0 };
     frame
 }

@@ -12,6 +12,8 @@ CASES=(
   "normal       |              |               | 1 | process exited with code 0 (called from CPL 3)"
   "bad-pointer  | bad-pointer  |               | 1 | bad pointers rejected"
   "poke-kernel  | poke-kernel  |               | 5 | process killed by vector 14"
+  "exec-stack   | exec-stack   |               | 5 | error=0x15"
+  "write-code   | write-code   |               | 5 | error=0x7"
   "smap         |              | smap-selftest | 7 | #PF page fault in kernel mode"
 )
 

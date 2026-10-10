@@ -76,6 +76,24 @@ extern "C" fn main() -> ! {
         exit(if rejected { 0 } else { 1 });
     }
 
+    #[cfg(feature = "exec-stack")]
+    {
+        let code = core::hint::black_box([0xc3u8]); // `ret`
+        let f: extern "C" fn() = unsafe { core::mem::transmute(code.as_ptr()) };
+        write(b"calling code on the stack...\n");
+        f();
+        write(b"NX BROKEN: executed code on the stack\n");
+        exit(1);
+    }
+
+    #[cfg(feature = "write-code")]
+    {
+        write(b"writing to our own code...\n");
+        unsafe { core::ptr::write_volatile(main as *const () as *mut u8, 0xc3) };
+        write(b"W^X BROKEN: code page was writable\n");
+        exit(1);
+    }
+
     #[cfg(feature = "poke-kernel")]
     {
         write(b"reading kernel memory at 0xffffffff80000000...\n");

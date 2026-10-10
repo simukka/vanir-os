@@ -26,7 +26,7 @@ iso: $(ISO)
 user: FORCE
 	cargo build -p hello --$(PROFILE) $(USER_CARGO_FEATURES)
 	@mkdir -p build
-	objcopy -O binary $(TARGET_DIR)/hello build/hello.bin
+	objcopy --strip-all $(TARGET_DIR)/hello build/hello.elf
 
 kernel: user
 	cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)

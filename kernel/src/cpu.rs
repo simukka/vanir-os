@@ -45,7 +45,6 @@ pub fn enable_protections() {
     );
 }
 
-#[allow(dead_code)] // used by the ELF loader
 pub fn nx_enabled() -> bool {
     NX.load(Ordering::Relaxed)
 }

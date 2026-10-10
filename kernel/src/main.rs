@@ -10,6 +10,7 @@
 #[macro_use]
 mod serial;
 mod cpu;
+mod elf;
 mod gdt;
 mod interrupts;
 mod memory;
