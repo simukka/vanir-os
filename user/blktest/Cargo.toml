@@ -14,3 +14,5 @@ vanir-user = { path = "../lib" }
 [features]
 # Only check what an earlier boot wrote (persistence test).
 check-only = []
+# Try the block driver directly (only the storage task may): must get NOT_ALLOWED.
+poke-driver = []

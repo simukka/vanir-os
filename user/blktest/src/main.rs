@@ -7,15 +7,17 @@
 #![no_main]
 
 use vanir_user::block::{self, BLOCK_SIZE, CODE_OUT_OF_RANGE, code_name};
-use vanir_user::{err, lookup, println, sleep};
+use vanir_user::{err, getpid, lookup, println, sleep, task_name};
 
 vanir_user::entry!(main);
 
 const BLOCKS: u64 = 32;
 
-fn pattern(block: u64, out: &mut [u8; BLOCK_SIZE]) {
+/// The contents block `block` should have, different for every block and every task name, so
+/// two tasks whose volumes overlapped would see each other's data.
+fn pattern(seed: u64, block: u64, out: &mut [u8; BLOCK_SIZE]) {
     for (i, chunk) in out.chunks_mut(8).enumerate() {
-        chunk.copy_from_slice(&(block * 0x0101_0101 ^ i as u64 ^ 0x5eed_0000_0000).to_le_bytes());
+        chunk.copy_from_slice(&(seed ^ block * 0x0101_0101 ^ i as u64 ^ 0x5eed_0000_0000).to_le_bytes());
     }
 }
 
@@ -38,6 +40,21 @@ fn with_disk<T>(disk: &mut u64, mut f: impl FnMut(u64) -> Result<T, u64>) -> Res
 }
 
 fn main() -> u64 {
+    let mut name = [0u8; 64];
+    let name = task_name(getpid(), &mut name).unwrap_or("?");
+    // FNV-1a of the task name: this task's data differs from every other task's.
+    let seed = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+
+    #[cfg(feature = "poke-driver")]
+    {
+        // Only the storage task may talk to the block driver.
+        let driver = lookup("blockdev").expect("no blockdev task");
+        let result = block::capacity(driver);
+        println!("blktest: talking to the block driver directly: {}", code_name(result.err().unwrap_or(0)));
+        return if result == Err(err::NOT_ALLOWED) { 0 } else { 1 };
+    }
+
+    #[allow(unreachable_code)]
     let mut disk = lookup("disk").expect("no disk task");
     let capacity = match with_disk(&mut disk, block::capacity) {
         Ok(c) => c,
@@ -52,7 +69,7 @@ fn main() -> u64 {
     #[cfg(not(feature = "check-only"))]
     {
         for b in 0..BLOCKS {
-            pattern(b, &mut want);
+            pattern(seed, b, &mut want);
             if let Err(e) = with_disk(&mut disk, |d| block::write(d, b, &want)) {
                 println!("blktest: write {} failed: {}", b, code_name(e));
                 return 1;
@@ -62,12 +79,14 @@ fn main() -> u64 {
             println!("blktest: flush failed: {}", code_name(e));
             return 1;
         }
-        println!("blktest: wrote {} blocks", BLOCKS);
+        println!("blktest: {} wrote {} blocks", name, BLOCKS);
+        // Give other clients time to write theirs before checking ours.
+        sleep(20);
     }
 
     let mut got = [0u8; BLOCK_SIZE];
     for b in 0..BLOCKS {
-        pattern(b, &mut want);
+        pattern(seed, b, &mut want);
         if let Err(e) = with_disk(&mut disk, |d| block::read(d, b, &mut got)) {
             println!("blktest: read {} failed: {}", b, code_name(e));
             return 1;
@@ -77,7 +96,7 @@ fn main() -> u64 {
             return 1;
         }
     }
-    println!("blktest: read back {} blocks, all correct", BLOCKS);
+    println!("blktest: {} read back {} blocks, all correct", name, BLOCKS);
 
     match with_disk(&mut disk, |d| block::read(d, capacity, &mut got)) {
         Err(CODE_OUT_OF_RANGE) => println!("blktest: block {} (past the end) refused", capacity),

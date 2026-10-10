@@ -310,6 +310,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
 name = "supervisor"
 version = "0.1.0"
 dependencies = [

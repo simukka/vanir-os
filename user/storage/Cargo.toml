@@ -1,0 +1,12 @@
+[package]
+name = "storage"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "storage"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }

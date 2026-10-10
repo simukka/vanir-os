@@ -50,7 +50,8 @@ include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
 
 pub const MAX_PROCESSES: usize = 8;
 const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
-const USER_STACK_PAGES: u64 = 4;
+/// 64 KiB: drivers and servers keep several 4 KiB block or message buffers on their stacks.
+const USER_STACK_PAGES: u64 = 16;
 
 /// Largest message or reply, in bytes; bounds the time one syscall spends copying.
 pub const MAX_MESSAGE: u64 = 4096;

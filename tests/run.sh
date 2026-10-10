@@ -69,6 +69,9 @@ CASES=(
   "blk-persist          | blk                     | blktest/check-only                                        |               | DISK=1                                                                   | 1 | read back 32 blocks, all correct"
   "blk-persist-negative | blk                     | blktest/check-only                                        |               | DISK=1 DISK_RESET=1                                                      | 3 | block 0 has the wrong contents"
   "blk-restart          | blk-supervised          | virtio-blk/crash-after-10                                 |               | DISK=1 DISK_RESET=1                                                      | 1 | re:crashing with a write in flight[\s\S]*read back 32 blocks, all correct"
+  "storage-isolation    | storage                 |                                                           |               | DISK=1 DISK_RESET=1                                                      | 1 | re:(?=[\s\S]*client-a read back 32 blocks, all correct)(?=[\s\S]*client-b read back 32 blocks, all correct)[\s\S]*new volume for client-a[\s\S]*new volume for client-b"
+  "storage-persist      | storage                 | blktest/check-only                                        |               | DISK=1                                                                   | 1 | re:(?=[\s\S]*client-a read back 32 blocks, all correct)(?=[\s\S]*client-b read back 32 blocks, all correct)[\s\S]*2 volume\(s\) on the disk"
+  "storage-no-driver    | storage-poke            | blktest/poke-driver                                       |               | DISK=1                                                                   | 1 | talking to the block driver directly: NOT_ALLOWED"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
