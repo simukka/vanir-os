@@ -1,0 +1,13 @@
+# Clients first: they send before echo has reached recv, so their messages wait in the queue.
+[[task]]
+name = "client-a"
+program = "client"
+sends = ["echo"]
+
+[[task]]
+name = "client-b"
+program = "client"
+sends = ["echo"]
+
+[[task]]
+name = "echo"

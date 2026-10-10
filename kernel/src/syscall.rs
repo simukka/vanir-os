@@ -1,4 +1,6 @@
-//! `int 0x80` system calls. ABI: rax = number, rdi/rsi = args, result in rax (u64::MAX = error).
+//! `int 0x80` system calls. ABI: rax = number; arguments in rdi, rsi, rdx, r10, r8, r9; results
+//! in rax (then rdx, rsi). Simple calls return u64::MAX on error; IPC calls return the
+//! `process::err` codes, which have the top bit set.
 
 use crate::interrupts::TrapFrame;
 use crate::{process, serial};
@@ -8,6 +10,10 @@ pub const SYS_WRITE: u64 = 1;
 pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_SEND: u64 = 100;
+pub const SYS_RECV: u64 = 101;
+pub const SYS_REPLY: u64 = 102;
+pub const SYS_LOOKUP: u64 = 105;
 
 const ERROR: u64 = u64::MAX;
 
@@ -16,9 +22,13 @@ pub fn dispatch(frame: &mut TrapFrame) {
     match frame.rax {
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi),
         SYS_GETPID => frame.rax = process::current_id(),
-        // These switch processes: `frame` then holds the next process's registers.
+        // These may switch processes: `frame` then holds the next process's registers.
         SYS_SCHED_YIELD => process::yield_now(frame),
         SYS_EXIT => process::exit(frame, frame.rdi),
+        SYS_SEND => process::send(frame),
+        SYS_RECV => process::recv(frame),
+        SYS_REPLY => process::reply(frame),
+        SYS_LOOKUP => process::lookup(frame),
         _ => frame.rax = ERROR,
     }
 }

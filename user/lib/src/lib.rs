@@ -14,9 +14,39 @@ pub const SYS_WRITE: u64 = 1;
 pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_SEND: u64 = 100;
+pub const SYS_RECV: u64 = 101;
+pub const SYS_REPLY: u64 = 102;
+pub const SYS_LOOKUP: u64 = 105;
 
-/// Returned by the kernel when a syscall fails.
+/// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
+
+/// Errors from the IPC syscalls. The top bit is set; reply codes from servers never have it.
+pub mod err {
+    pub const DEAD: u64 = 1 << 63;
+    pub const NOT_ALLOWED: u64 = DEAD | 1;
+    pub const BAD_TARGET: u64 = DEAD | 2;
+    pub const BAD_BUFFER: u64 = DEAD | 3;
+    pub const TOO_LONG: u64 = DEAD | 4;
+    pub const BAD_ARGUMENT: u64 = DEAD | 5;
+
+    pub fn is_error(code: u64) -> bool {
+        code & DEAD != 0
+    }
+
+    pub fn name(code: u64) -> &'static str {
+        match code {
+            DEAD => "DEAD",
+            NOT_ALLOWED => "NOT_ALLOWED",
+            BAD_TARGET => "BAD_TARGET",
+            BAD_BUFFER => "BAD_BUFFER",
+            TOO_LONG => "TOO_LONG",
+            BAD_ARGUMENT => "BAD_ARGUMENT",
+            _ => "OK",
+        }
+    }
+}
 
 pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {
     let ret;
@@ -24,6 +54,60 @@ pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {
         asm!("int 0x80", inlateout("rax") number => ret, in("rdi") arg0, in("rsi") arg1, options(nostack));
     }
     ret
+}
+
+/// Raw six-argument syscall; returns (rax, rdx, rsi).
+pub fn syscall6(number: u64, args: [u64; 6]) -> (u64, u64, u64) {
+    let (rax, rdx, rsi);
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") number => rax,
+            in("rdi") args[0],
+            inlateout("rsi") args[1] => rsi,
+            inlateout("rdx") args[2] => rdx,
+            in("r10") args[3],
+            in("r8") args[4],
+            in("r9") args[5],
+            options(nostack),
+        );
+    }
+    (rax, rdx, rsi)
+}
+
+/// Send `msg` with operation `op` to task `target` and wait for the reply, which is written to
+/// the start of `reply`. Returns the server's reply code and the reply length, or a kernel error.
+pub fn send(target: u64, op: u64, msg: &[u8], reply: &mut [u8]) -> Result<(u64, usize), u64> {
+    let (code, len, _) = syscall6(
+        SYS_SEND,
+        [target, op, msg.as_ptr() as u64, msg.len() as u64, reply.as_mut_ptr() as u64, reply.len() as u64],
+    );
+    if err::is_error(code) { Err(code) } else { Ok((code, len as usize)) }
+}
+
+pub struct Message {
+    /// Sender's task id; 0 for a notification from the kernel.
+    pub sender: u64,
+    pub op: u64,
+    pub len: usize,
+}
+
+/// Wait for a message, written to the start of `buf`.
+pub fn recv(buf: &mut [u8]) -> Result<Message, u64> {
+    let (sender, op, len) = syscall6(SYS_RECV, [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0]);
+    if err::is_error(sender) { Err(sender) } else { Ok(Message { sender, op, len: len as usize }) }
+}
+
+/// Answer the message from `sender` with `code` (top bit clear) and `data`.
+pub fn reply(sender: u64, code: u64, data: &[u8]) -> Result<(), u64> {
+    let (status, _, _) = syscall6(SYS_REPLY, [sender, code, data.as_ptr() as u64, data.len() as u64, 0, 0]);
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
+/// The id of the task called `name` in the app manifest.
+pub fn lookup(name: &str) -> Result<u64, u64> {
+    let (id, _, _) = syscall6(SYS_LOOKUP, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]);
+    if err::is_error(id) { Err(id) } else { Ok(id) }
 }
 
 pub fn write(bytes: &[u8]) -> u64 {

@@ -1,0 +1,6 @@
+[[task]]
+name = "echo"
+
+[[task]]
+name = "client"
+sends = ["echo"]

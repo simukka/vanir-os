@@ -1,0 +1,9 @@
+[[task]]
+name = "deadlock-a"
+program = "deadlock"
+sends = ["deadlock-b"]
+
+[[task]]
+name = "deadlock-b"
+program = "deadlock"
+sends = ["deadlock-a"]

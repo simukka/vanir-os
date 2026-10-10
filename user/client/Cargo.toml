@@ -1,0 +1,20 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "client"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# send from an unmapped buffer: BAD_BUFFER, and the server keeps serving
+bad-buffer = []
+# send to a task outside the `sends` list: NOT_ALLOWED
+not-allowed = []
+# ask echo to fault while we wait for the reply: DEAD
+crash-server = []

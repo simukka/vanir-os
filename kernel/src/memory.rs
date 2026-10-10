@@ -133,6 +133,65 @@ impl AddressSpace {
     }
 }
 
+impl AddressSpace {
+    /// Physical address behind user address `virt`, if it is mapped user-accessible (and
+    /// writable, when `write`). Walks this tree, so it works whichever tree is in CR3.
+    fn translate(&self, virt: u64, write: bool) -> Option<u64> {
+        if virt >= USER_END {
+            return None;
+        }
+        let mut table_phys = self.pml4;
+        for level in (0..=3).rev() {
+            let entry = table(table_phys)[((virt >> (12 + 9 * level)) & 0x1ff) as usize];
+            let needed = PRESENT | USER | if write { WRITABLE } else { 0 };
+            if entry & needed != needed || (level != 0 && entry & HUGE != 0) {
+                return None;
+            }
+            table_phys = entry & ADDR_MASK;
+        }
+        Some(table_phys + (virt & (PAGE_SIZE - 1)))
+    }
+
+    /// True if every byte of `[virt, virt + len)` is mapped user-accessible (and writable).
+    pub fn check_range(&self, virt: u64, len: u64, write: bool) -> bool {
+        let Some(end) = virt.checked_add(len) else { return false };
+        if len == 0 {
+            return true;
+        }
+        let mut page = virt & !(PAGE_SIZE - 1);
+        while page < end {
+            if self.translate(page.max(virt), write).is_none() {
+                return false;
+            }
+            page += PAGE_SIZE;
+        }
+        true
+    }
+}
+
+/// Copy `len` bytes from user address `src` in `from` to user address `dst` in `to`, through the
+/// direct map. Both ranges are checked (readable, writable) before any byte moves, so it either
+/// copies everything or nothing. No user page is touched through its user mapping, so the copy
+/// can neither fault nor trip SMAP, and the two address spaces need not be the one in CR3.
+pub fn copy_between(from: &AddressSpace, src: u64, to: &AddressSpace, dst: u64, len: u64) -> Result<(), BadAddress> {
+    if !from.check_range(src, len, false) || !to.check_range(dst, len, true) {
+        return Err(BadAddress);
+    }
+    let mut done = 0;
+    while done < len {
+        let (s, d) = (src + done, dst + done);
+        let chunk = (len - done).min(PAGE_SIZE - (s & (PAGE_SIZE - 1))).min(PAGE_SIZE - (d & (PAGE_SIZE - 1)));
+        let s_phys = from.translate(s, false).unwrap();
+        let d_phys = to.translate(d, true).unwrap();
+        unsafe { core::ptr::copy(phys_to_virt(s_phys), phys_to_virt(d_phys), chunk as usize) };
+        done += chunk;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct BadAddress;
+
 impl Drop for AddressSpace {
     /// Free every user page and user page table, then the top-level table. The kernel half's
     /// tables are shared and are never freed.
