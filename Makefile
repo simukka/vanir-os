@@ -11,7 +11,7 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -54,6 +54,8 @@ TPM            :=
 # DISK_RESET=1 starts it from zeros.
 DISK           :=
 DISK_RESET     :=
+# DISK_CORRUPT=volume:block flips a byte of that data block before booting (integrity tests).
+DISK_CORRUPT   :=
 DISK_FLAGS     = $(if $(DISK),-drive file=build/disk.img$(,)if=none$(,)id=d0$(,)format=raw \
                    -device virtio-blk-pci$(,)drive=d0$(,)disable-legacy=on)
 UEFI           := $(filter uefi-secure,$(BOOT))
@@ -89,6 +91,7 @@ disk:
 	@mkdir -p build
 	$(if $(DISK_RESET),rm -f build/disk.img)
 	[ -f build/disk.img ] || truncate -s 64M build/disk.img
+	$(if $(DISK_CORRUPT),tools/corrupt-disk.py build/disk.img $(DISK_CORRUPT))
 
 $(SIGNING_KEY):
 	@mkdir -p $(dir $@)

@@ -232,6 +232,16 @@ pub mod block {
     pub const CODE_LOCKED: u64 = 5;
     /// Storage task: the block failed its integrity check.
     pub const CODE_INTEGRITY: u64 = 6;
+    /// Storage task: refused (e.g. OP_UNLOCK from a task that may not unlock).
+    pub const CODE_NOT_ALLOWED: u64 = 7;
+
+    /// Storage task: message is the 32-byte master key. Only the tasks named "keys" or
+    /// "attest" may send it; until then every other request gets CODE_LOCKED.
+    pub const OP_UNLOCK: u64 = 5;
+
+    pub fn unlock(storage: u64, master_key: &[u8; 32]) -> Result<(), u64> {
+        call(storage, OP_UNLOCK, master_key, &mut []).map(|_| ())
+    }
 
     pub fn op(code: u64, block: u64) -> u64 {
         code | block << 8
@@ -283,6 +293,7 @@ pub mod block {
             CODE_IO_ERROR => "IO_ERROR",
             CODE_LOCKED => "LOCKED",
             CODE_INTEGRITY => "INTEGRITY",
+            CODE_NOT_ALLOWED => "NOT_ALLOWED",
             _ => super::err::name(code),
         }
     }

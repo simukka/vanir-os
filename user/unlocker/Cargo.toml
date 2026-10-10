@@ -1,0 +1,16 @@
+[package]
+name = "unlocker"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "unlocker"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# Hand over a different key (wrong-key test).
+wrong-key = []

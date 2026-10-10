@@ -1,0 +1,21 @@
+# Two clients, each with its own volume, behind the storage task ("disk"), and nothing to unlock it.
+[[task]]
+name = "blockdev"
+program = "virtio-blk"
+devices = ["virtio-blk"]
+dma_pages = 16
+
+[[task]]
+name = "disk"
+program = "storage"
+sends = ["blockdev"]
+
+[[task]]
+name = "client-a"
+program = "blktest"
+sends = ["disk"]
+
+[[task]]
+name = "client-b"
+program = "blktest"
+sends = ["disk"]

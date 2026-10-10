@@ -13,3 +13,8 @@ sends = ["blockdev"]
 name = "client-a"
 program = "blktest"
 sends = ["disk"]
+
+[[task]]
+name = "keys"
+program = "unlocker"
+sends = ["disk"]

@@ -4,4 +4,10 @@ target = "x86_64-unknown-none"
 [target.x86_64-unknown-none]
 # Fixed-address, non-PIE images. code-model=kernel lets the kernel live in the
 # top 2 GiB; it also fits the user program at 0x400000 (sign-extended 32-bit).
-rustflags = ["-C", "relocation-model=static", "-C", "code-model=kernel"]
+#
+# The target has no SIMD (soft float), so the crypto crates use their portable backends: their
+# runtime-detected AVX2/SSE paths make rustc crash (SIGILL) when built for it.
+rustflags = [
+    "-C", "relocation-model=static", "-C", "code-model=kernel",
+    "--cfg", 'poly1305_backend="soft"', "--cfg", 'chacha20_backend="soft"',
+]

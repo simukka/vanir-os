@@ -4,22 +4,43 @@
 //! the `vanir_user::block` interface with block numbers relative to their volume, and can't
 //! address anything outside it.
 //!
-//! On disk (4 KiB blocks): block 0 superblock, block 1 the volume table, data from block 2.
+//! Every block is encrypted at rest with XChaCha20-Poly1305 under its volume's key,
+//! HKDF-SHA256(master key, volume name). The nonce is the block number and a per-block write
+//! counter (so it never repeats), and the block's volume name, number and counter are bound in
+//! as associated data, so ciphertext changed, moved between blocks or volumes, or paired with
+//! the wrong counter fails to decrypt (CODE_INTEGRITY). Counters and tags live in each volume's
+//! metadata blocks. Until it gets the master key (OP_UNLOCK), the task answers CODE_LOCKED.
+//!
+//! On disk (4 KiB blocks): block 0 superblock, block 1 the volume table (both in plain text),
+//! then volumes: `META_BLOCKS` metadata blocks followed by `DATA_BLOCKS` data blocks each.
 
 #![no_std]
 #![no_main]
 
-use vanir_user::block::{self, BLOCK_SIZE, CODE_BAD_OP, CODE_IO_ERROR, CODE_OK, CODE_OUT_OF_RANGE, OP_FLUSH, OP_INFO, OP_READ, OP_WRITE, split};
+use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use vanir_user::block::{
+    self, BLOCK_SIZE, CODE_BAD_OP, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE, OP_FLUSH,
+    OP_INFO, OP_READ, OP_UNLOCK, OP_WRITE, split,
+};
 use vanir_user::{err, lookup, println, recv, reply, sleep, task_name};
 
 vanir_user::entry!(main);
 
-const MAGIC: &[u8; 8] = b"VNRSTOR1";
+const MAGIC: &[u8; 8] = b"VNRSTOR2";
 const SUPERBLOCK: u64 = 0;
 const TABLE: u64 = 1;
 const FIRST_DATA: u64 = 2;
-/// Every volume's size: 1 MiB.
-const VOLUME_BLOCKS: u64 = 256;
+/// Every volume's data: 1 MiB.
+const DATA_BLOCKS: u64 = 256;
+/// Per data block: write counter (8 bytes) and tag (16 bytes).
+const META_ENTRY: usize = 24;
+const META_PER_BLOCK: u64 = (BLOCK_SIZE / META_ENTRY) as u64;
+const META_BLOCKS: u64 = DATA_BLOCKS.div_ceil(META_PER_BLOCK);
+const VOLUME_BLOCKS: u64 = META_BLOCKS + DATA_BLOCKS;
+/// Tasks that may hand over the master key.
+const UNLOCKERS: [&[u8]; 2] = [b"keys", b"attest"];
 const MAX_VOLUMES: usize = BLOCK_SIZE / ENTRY;
 /// Volume table entry: name (32 bytes, zero padded), start block, size in blocks.
 const ENTRY: usize = 64;
@@ -33,6 +54,7 @@ struct Volume {
 
 struct Storage {
     driver: u64,
+    master: Option<[u8; 32]>,
     capacity: u64,
     next_free: u64,
     volumes: [Option<Volume>; MAX_VOLUMES],
@@ -125,9 +147,14 @@ impl Storage {
         if self.next_free + VOLUME_BLOCKS > self.capacity {
             return Err(CODE_OUT_OF_RANGE);
         }
-        let v = Volume { name: key, start: self.next_free, blocks: VOLUME_BLOCKS };
+        let v = Volume { name: key, start: self.next_free, blocks: DATA_BLOCKS };
         self.volumes[slot] = Some(v);
         self.next_free += VOLUME_BLOCKS;
+        // Fresh metadata: every block unwritten (counter 0).
+        let zero = [0u8; BLOCK_SIZE];
+        for m in 0..META_BLOCKS {
+            self.write(v.start + m, &zero)?;
+        }
         self.save()?;
         println!(
             "storage: new volume for {}: blocks {}..{}",
@@ -139,9 +166,64 @@ impl Storage {
     }
 }
 
+impl Storage {
+    fn cipher(&self, v: &Volume) -> XChaCha20Poly1305 {
+        let mut key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(b"vanir-storage-v1"), self.master.as_ref().unwrap())
+            .expand(&v.name, &mut key)
+            .expect("32 bytes is a valid HKDF output length");
+        XChaCha20Poly1305::new(&key.into())
+    }
+
+    /// Where data block `b` of `v` keeps its counter and tag: (metadata block, byte offset).
+    fn meta(v: &Volume, b: u64) -> (u64, usize) {
+        (v.start + b / META_PER_BLOCK, (b % META_PER_BLOCK) as usize * META_ENTRY)
+    }
+
+    /// Nonce and associated data for data block `b` of `v` at write `counter`.
+    fn binding(v: &Volume, b: u64, counter: u64) -> (XNonce, [u8; 48]) {
+        let mut nonce = [0u8; 24];
+        nonce[..8].copy_from_slice(&b.to_le_bytes());
+        nonce[8..16].copy_from_slice(&counter.to_le_bytes());
+        let mut aad = [0u8; 48];
+        aad[..32].copy_from_slice(&v.name);
+        aad[32..40].copy_from_slice(&b.to_le_bytes());
+        aad[40..48].copy_from_slice(&counter.to_le_bytes());
+        (nonce.into(), aad)
+    }
+
+    fn read_data(&mut self, v: &Volume, b: u64, out: &mut [u8; BLOCK_SIZE]) -> Result<(), u64> {
+        let (mb, at) = Self::meta(v, b);
+        let mut meta = [0u8; BLOCK_SIZE];
+        self.read(mb, &mut meta)?;
+        let counter = u64::from_le_bytes(meta[at..at + 8].try_into().unwrap());
+        if counter == 0 {
+            *out = [0; BLOCK_SIZE]; // never written
+            return Ok(());
+        }
+        let tag = Tag::try_from(&meta[at + 8..at + 24]).unwrap();
+        self.read(v.start + META_BLOCKS + b, out)?;
+        let (nonce, aad) = Self::binding(v, b, counter);
+        self.cipher(v).decrypt_inout_detached(&nonce, &aad, out.as_mut_slice().into(), &tag).map_err(|_| CODE_INTEGRITY)
+    }
+
+    fn write_data(&mut self, v: &Volume, b: u64, data: &mut [u8; BLOCK_SIZE]) -> Result<(), u64> {
+        let (mb, at) = Self::meta(v, b);
+        let mut meta = [0u8; BLOCK_SIZE];
+        self.read(mb, &mut meta)?;
+        let counter = u64::from_le_bytes(meta[at..at + 8].try_into().unwrap()) + 1;
+        let (nonce, aad) = Self::binding(v, b, counter);
+        let tag = self.cipher(v).encrypt_inout_detached(&nonce, &aad, data.as_mut_slice().into()).map_err(|_| CODE_IO_ERROR)?;
+        self.write(v.start + META_BLOCKS + b, data)?;
+        meta[at..at + 8].copy_from_slice(&counter.to_le_bytes());
+        meta[at + 8..at + 24].copy_from_slice(&tag);
+        self.write(mb, &meta)
+    }
+}
+
 fn main() -> u64 {
     let driver = lookup("blockdev").expect("no blockdev task");
-    let mut s = Storage { driver, capacity: 0, next_free: FIRST_DATA, volumes: [None; MAX_VOLUMES] };
+    let mut s = Storage { driver, master: None, capacity: 0, next_free: FIRST_DATA, volumes: [None; MAX_VOLUMES] };
     s.capacity = match on_driver(&mut s.driver, block::capacity) {
         Ok(c) => c,
         Err(e) => {
@@ -171,6 +253,24 @@ fn main() -> u64 {
         let mut name_copy = [0u8; 64];
         name_copy[..name.len()].copy_from_slice(name);
         let name = &name_copy[..name.len()];
+        let (op, b) = split(m.op);
+        if op == OP_UNLOCK {
+            let code = if !UNLOCKERS.contains(&name) {
+                CODE_NOT_ALLOWED
+            } else if m.len != 32 {
+                CODE_BAD_OP
+            } else {
+                s.master = Some(msg[..32].try_into().unwrap());
+                println!("storage: unlocked by {}", core::str::from_utf8(name).unwrap_or("?"));
+                CODE_OK
+            };
+            let _ = reply(m.sender, code, &[]);
+            continue;
+        }
+        if s.master.is_none() {
+            let _ = reply(m.sender, CODE_LOCKED, &[]);
+            continue;
+        }
         let v = match s.volume(name) {
             Ok(v) => v,
             Err(code) => {
@@ -178,7 +278,6 @@ fn main() -> u64 {
                 continue;
             }
         };
-        let (op, b) = split(m.op);
         let result = match op {
             OP_INFO => {
                 let _ = reply(m.sender, CODE_OK, &v.blocks.to_le_bytes());
@@ -186,14 +285,14 @@ fn main() -> u64 {
             }
             OP_FLUSH => s.flush(),
             OP_READ | OP_WRITE if b >= v.blocks => Err(CODE_OUT_OF_RANGE),
-            OP_READ => match s.read(v.start + b, &mut msg) {
+            OP_READ => match s.read_data(&v, b, &mut msg) {
                 Ok(()) => {
                     let _ = reply(m.sender, CODE_OK, &msg);
                     continue;
                 }
                 Err(e) => Err(e),
             },
-            OP_WRITE if m.len == BLOCK_SIZE => s.write(v.start + b, &msg),
+            OP_WRITE if m.len == BLOCK_SIZE => s.write_data(&v, b, &mut msg),
             _ => Err(CODE_BAD_OP),
         };
         let code = match result {
