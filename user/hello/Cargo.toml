@@ -8,6 +8,9 @@ name = "hello"
 test = false
 bench = false
 
+[dependencies]
+vanir-user = { path = "../lib" }
+
 [features]
 # Isolation test: read a kernel address from ring 3; must #PF.
 poke-kernel = []

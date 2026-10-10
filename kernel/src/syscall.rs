@@ -1,21 +1,24 @@
 //! `int 0x80` system calls. ABI: rax = number, rdi/rsi = args, result in rax (u64::MAX = error).
 
 use crate::interrupts::TrapFrame;
-use crate::serial;
+use crate::{process, serial};
 use crate::usercopy::{self, copy_from_user};
 
 pub const SYS_WRITE: u64 = 1;
+pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
 
 const ERROR: u64 = u64::MAX;
 
 pub fn dispatch(frame: &mut TrapFrame) {
     assert!(frame.from_user(), "syscall from kernel mode");
-    frame.rax = match frame.rax {
-        SYS_WRITE => sys_write(frame.rdi, frame.rsi),
-        SYS_EXIT => sys_exit(frame.rdi, frame.cs),
-        _ => ERROR,
-    };
+    match frame.rax {
+        SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi),
+        SYS_GETPID => frame.rax = process::current_pid(),
+        // May switch processes: `frame` then holds the next process's registers.
+        SYS_EXIT => process::exit(frame, frame.rdi),
+        _ => frame.rax = ERROR,
+    }
 }
 
 /// write(ptr, len) to the serial port. The buffer is copied in chunks, so a bad pointer returns
@@ -42,9 +45,4 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
         done += n as u64;
     }
     len
-}
-
-fn sys_exit(code: u64, cs: u64) -> ! {
-    println!("[kernel] process exited with code {} (called from CPL {})", code, cs & 3);
-    crate::halt(if code == 0 { 0 } else { 1 })
 }

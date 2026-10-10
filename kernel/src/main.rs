@@ -1,8 +1,8 @@
-//! vanir-os: the minimal layer needed to run one isolated ring-3 process on x86-64.
+//! vanir-os: a minimal x86-64 kernel that runs isolated ring-3 processes.
 //!
 //! Limine puts us in 64-bit long mode with paging on. We then add: serial output, a GDT with
-//! user segments and a TSS, an IDT, user page mappings, an `iretq` into ring 3, and `int 0x80`
-//! syscalls. No scheduler, timer, heap, or filesystem.
+//! user segments and a TSS, an IDT, a page-table tree per process, an ELF loader, `int 0x80`
+//! syscalls, and a static task table run by a round-robin scheduler. No heap or filesystem.
 
 #![no_std]
 #![no_main]
@@ -60,7 +60,7 @@ extern "C" fn kmain() -> ! {
     let memmap = MEMMAP_REQUEST.get_response().expect("no memory map response");
     memory::init(hhdm.offset(), memmap.entries());
 
-    process::run_hello()
+    process::start()
 }
 
 /// We install no IRQ handlers, so keep the 8259 PICs fully masked before user code sets IF=1.

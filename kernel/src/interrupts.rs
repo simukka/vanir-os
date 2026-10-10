@@ -17,7 +17,7 @@ pub const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Saved state at trap time, lowest address first (the reverse of push order).
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TrapFrame {
     pub r15: u64,
     pub r14: u64,
@@ -279,6 +279,7 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     }
     if frame.from_user() {
         process::kill(frame);
+        return;
     }
     crate::halt(3);
 }

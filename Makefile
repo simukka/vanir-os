@@ -1,12 +1,15 @@
 # Build the user program, embed it in the kernel, wrap the kernel in a Limine ISO, run in QEMU.
 #   make run                          normal boot
 #   make run USER_FEATURES=poke-kernel   isolation test: user reads kernel memory, must #PF
+#   make run TASKS="spinner spinner"     choose the task table (name[:cpu budget in ticks] ...)
 #   make run-debug                    also log interrupts/CPU resets to qemu.log
 #   make test                         boot every scenario in tests/run.sh and check the results
 
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
+TASKS          := hello
+USER_PROGS     := hello spinner
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -14,7 +17,7 @@ QEMU           := qemu-system-x86_64
 QEMU_FLAGS     := -M q35 -cpu max -m 128M -cdrom $(ISO) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04
 
-USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features $(USER_FEATURES))
+USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(addprefix hello/,$(USER_FEATURES))")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
 
 .PHONY: all iso kernel user run run-debug test qemu-cmd clean distclean FORCE
@@ -24,12 +27,12 @@ all: $(ISO)
 iso: $(ISO)
 
 user: FORCE
-	cargo build -p hello --$(PROFILE) $(USER_CARGO_FEATURES)
+	cargo build $(addprefix -p ,$(USER_PROGS)) --$(PROFILE) $(USER_CARGO_FEATURES)
 	@mkdir -p build
-	objcopy --strip-all $(TARGET_DIR)/hello build/hello.elf
+	for p in $(USER_PROGS); do objcopy --strip-all $(TARGET_DIR)/$$p build/$$p.elf; done
 
 kernel: user
-	cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
+	VANIR_TASKS="$(TASKS)" cargo build -p vanir-kernel --$(PROFILE) $(KERNEL_CARGO_FEATURES)
 
 limine/limine:
 	git clone --depth=1 --branch=$(LIMINE_BRANCH) https://github.com/limine-bootloader/limine.git limine
