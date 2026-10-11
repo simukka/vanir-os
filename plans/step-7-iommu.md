@@ -6,7 +6,7 @@ Status: planned, not implemented.
 
 A driver task's device can reach its own DMA region and nothing else. Today a driver programs
 its device with physical addresses, and nothing stops it from pointing the device at kernel
-memory, another task's memory, or the storage task's master key. The README lists this as a
+memory, another task's memory, or the storage task's master key. The manual (docs/index.html) lists this as a
 limitation in Drivers, Boot chain and attestation, and Storage. After this step:
 
 - the kernel turns on VT-d DMA remapping before any driver runs
@@ -120,7 +120,7 @@ Each sub-step is a commit with every test passing under TCG and KVM.
   A host whose reference was recorded with the IOMMU on refuses the key to a boot without it
   (test `attest-no-iommu-refused`).
 - `IOMMU=1` becomes the Makefile default; `IOMMU=0` turns it off.
-- README:
+- Manual (docs/index.html):
   - Drivers: what is now enforced; replace the "no IOMMU" limit.
   - Boot chain and Storage: update the limitations lists.
   - Protections table: new rows for DMA confinement and default-deny devices.

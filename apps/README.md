@@ -22,7 +22,7 @@ build fails on unknown keys, duplicate names, unknown `sends` targets or device 
 one supervisor, event reader or TPM task. Each `devices` entry claims the next unclaimed device of that kind
 at boot; a missing device is logged and the task runs without it.
 
-Storage (see "Storage" in the top-level README) goes by task names too: the block driver is
+Storage (see "Storage" in docs/index.html) goes by task names too: the block driver is
 `blockdev`, the storage task `disk` (give it `sends = ["blockdev"]`, plus `"keys"` to fetch the key
 from the key server and `"telemetry"` to report storage events), and only tasks named `keys` or
 `attest` may unlock it. Each client's volume is named after the client.

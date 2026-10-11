@@ -5,7 +5,7 @@
 #   make run-debug                    also log interrupts/CPU resets to qemu.log
 #   make test                         boot every scenario in tests/run.sh and check the results
 #   make test ACCEL=kvm               same, under KVM instead of QEMU's emulator
-#   make run BOOT=uefi-secure ACCEL=kvm   boot through UEFI Secure Boot (see "Boot chain" in README)
+#   make run BOOT=uefi-secure ACCEL=kvm   boot through UEFI Secure Boot (see docs/index.html#boot-chain)
 
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
