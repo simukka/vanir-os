@@ -1,0 +1,38 @@
+# Counters to the host over vsock, where the host agent sets the snapshot interval through the
+# control task.
+[[task]]
+name = "supervisor"
+supervisor = true
+sends = ["telemetry"]
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic", "telemetry"]
+
+[[task]]
+name = "web"
+program = "http"
+sends = ["net", "telemetry"]
+listen = [{ port = 80, max_connections = 64 }]
+
+[[task]]
+name = "uplink"
+program = "virtio-vsock"
+devices = ["virtio-vsock"]
+dma_pages = 32
+
+[[task]]
+name = "telemetry"
+events = true
+sends = ["uplink"]
+
+[[task]]
+name = "control"
+sends = ["uplink", "telemetry"]

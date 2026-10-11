@@ -6,6 +6,9 @@
 //! 431) and arrive within `HEADER_TICKS` of its first byte (else 408); bodies are refused above
 //! `BODY_LIMIT` (413).
 //!
+//! Every snapshot interval we send telemetry our request counters by status class and a
+//! latency histogram (from a request's first byte to its response, in fixed buckets).
+//!
 //! When `net` tells us to drain, we stop accepting, answer what is in flight with
 //! `Connection: close`, close idle connections, and say `OP_DONE` once none are left.
 
@@ -14,7 +17,8 @@
 
 use core::fmt::Write;
 use vanir_user::net::{self, CODE_CLOSED, EV_ACCEPT, EV_CLOSED, EV_DRAIN, EV_READ, EV_WRITE, Event};
-use vanir_user::{err, getpid, lookup, println, sleep, task_name, uptime};
+use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
+use vanir_user::{err, getpid, lookup, println, rdtsc, sleep, task_name, uptime};
 
 vanir_user::entry!(main);
 
@@ -27,6 +31,8 @@ const HEADER_TICKS: u64 = 500;
 /// A keep-alive connection idle this long between requests is closed.
 const IDLE_TICKS: u64 = 1500;
 const OUT: usize = 512;
+/// Upper bounds of the latency buckets, in milliseconds (the last bucket is everything above).
+const LATENCY_MS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 
 #[derive(Clone, Copy)]
 struct Conn {
@@ -36,8 +42,9 @@ struct Conn {
     len: usize,
     /// Body bytes still to skip (of a request we answered without reading its body).
     discard: usize,
-    /// When the current request's first byte came.
+    /// When the current request's first byte came, in ticks and TSC cycles.
     started: Option<u64>,
+    started_tsc: u64,
     /// When the last response went out (or the connection opened).
     idle_since: u64,
     /// Response bytes net had no room for yet.
@@ -54,6 +61,7 @@ impl Conn {
         len: 0,
         discard: 0,
         started: None,
+        started_tsc: 0,
         idle_since: 0,
         out: [0; OUT],
         out_len: 0,
@@ -71,6 +79,13 @@ struct Server {
     draining: bool,
     done_sent: bool,
     requests: u64,
+    /// Responses by status class: 2xx, 4xx, 5xx.
+    status: [u64; 3],
+    latency: [u64; LATENCY_MS.len() + 1],
+    cycles_per_tick: u64,
+    telemetry: Option<u64>,
+    interval: u64,
+    next_snapshot: u64,
     #[cfg(feature = "exit-on-request")]
     exit: bool,
 }
@@ -278,7 +293,9 @@ impl Server {
     }
 
     fn respond(&mut self, i: usize, status: u16, body: &[u8], head: bool, keep_alive: bool, now: u64) {
-        let keep_alive = keep_alive && !self.draining && status < 400;
+        // After these we can't trust where the next request starts (or it took too long).
+        let unsure = matches!(status, 400 | 408 | 413 | 431 | 501 | 505);
+        let keep_alive = keep_alive && !self.draining && !unsure;
         let c = &mut self.conns[i];
         let mut w = Buf { buf: &mut c.out, len: 0 };
         let _ = write!(
@@ -295,9 +312,19 @@ impl Server {
         c.out_len = header + n;
         c.out_at = 0;
         c.close_after = !keep_alive;
+        if c.started.is_some() {
+            let us = (rdtsc() - c.started_tsc) * 10_000 / self.cycles_per_tick.max(1);
+            let bucket = LATENCY_MS.iter().position(|&ms| us <= ms * 1000).unwrap_or(LATENCY_MS.len());
+            self.latency[bucket] += 1;
+        }
         c.started = None;
         c.idle_since = now;
         self.requests += 1;
+        match status {
+            200..=299 => self.status[0] += 1,
+            400..=499 => self.status[1] += 1,
+            _ => self.status[2] += 1,
+        }
         #[cfg(feature = "crash-after-50-requests")]
         if self.requests == 50 && getpid() >> 16 == 0 {
             println!("{}: crashing after 50 requests", self.name());
@@ -333,7 +360,10 @@ impl Server {
             if c.len == 0 {
                 return;
             }
-            c.started.get_or_insert(now);
+            if c.started.is_none() {
+                c.started = Some(now);
+                c.started_tsc = rdtsc();
+            }
             let (status, body_skip, keep_alive, head): (u16, usize, bool, bool);
             let mut body = [0u8; 64];
             let mut body_len = 0;
@@ -415,6 +445,34 @@ impl Server {
         next
     }
 
+    /// Send our counters to telemetry, if there is one we may talk to.
+    fn snapshot(&mut self, now: u64) {
+        if self.telemetry.is_none() {
+            self.telemetry = lookup("telemetry").ok();
+        }
+        let Some(t) = self.telemetry else { return };
+        let mut r = Record::new("http");
+        r.num("t", now)
+            .num("requests", self.requests)
+            .num("status_2xx", self.status[0])
+            .num("status_4xx", self.status[1])
+            .num("status_5xx", self.status[2]);
+        let mut key = [0u8; 24];
+        for (i, &n) in self.latency.iter().enumerate() {
+            let mut w = Buf { buf: &mut key, len: 0 };
+            let _ = match LATENCY_MS.get(i) {
+                Some(ms) => write!(w, "latency_le_{}ms", ms),
+                None => write!(w, "latency_over_{}ms", LATENCY_MS[LATENCY_MS.len() - 1]),
+            };
+            let len = w.len;
+            r.num(core::str::from_utf8(&key[..len]).unwrap(), n);
+        }
+        match telemetry::counters(t, &r) {
+            Ok(interval) => self.interval = interval,
+            Err(_) => self.telemetry = None,
+        }
+    }
+
     fn start_drain(&mut self) {
         println!("{}: draining", self.name());
         self.draining = true;
@@ -434,6 +492,12 @@ static mut SERVER: Server = Server {
     draining: false,
     done_sent: false,
     requests: 0,
+    status: [0; 3],
+    latency: [0; LATENCY_MS.len() + 1],
+    cycles_per_tick: 0,
+    telemetry: None,
+    interval: DEFAULT_INTERVAL_TICKS,
+    next_snapshot: 0,
     #[cfg(feature = "exit-on-request")]
     exit: false,
 };
@@ -444,12 +508,20 @@ fn main() -> u64 {
     let me = task_name(getpid(), &mut name).unwrap_or("http").len();
     s.name = name;
     s.name_len = me;
+    s.cycles_per_tick = vanir_user::tsc_per_tick();
     s.attach();
 
     let mut events = [Event::default(); 128];
     loop {
         let now = uptime();
-        let next = s.check_deadlines(now);
+        if now >= s.next_snapshot {
+            s.snapshot(now);
+            s.next_snapshot = now + s.interval;
+        }
+        let mut next = s.check_deadlines(now);
+        if s.telemetry.is_some() {
+            next = Some(next.map_or(s.next_snapshot, |n| n.min(s.next_snapshot)));
+        }
         if s.draining && !s.done_sent && s.conns.iter().all(|c| c.handle == 0) {
             s.done_sent = true;
             println!("{}: drained, {} requests served", s.name(), s.requests);

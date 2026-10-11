@@ -1,6 +1,10 @@
 //! Telemetry: forwards the kernel event log to the host as newline-delimited JSON through the
-//! console driver, adds a heartbeat every second, and forwards `OP_LOG` text and `OP_STORAGE`
-//! events (volume created, locked, unlocked, integrity error) from other tasks.
+//! console driver, adds a heartbeat every second, and forwards `OP_LOG` text, `OP_STORAGE`
+//! events (volume created, locked, unlocked, integrity error), network events (`OP_NET`) and
+//! counter snapshots (`OP_COUNTERS`) from other tasks.
+//!
+//! The snapshot interval is ours to give out: each `OP_COUNTERS` is answered with it, so every
+//! reporter follows when the host changes it (`OP_SET_INTERVAL`, from the control task).
 //!
 //! Every kernel event keeps its sequence number, so the host can tell when events were lost;
 //! if the kernel's ring wrapped before we read it, a `dropped` record says how many.
@@ -10,7 +14,7 @@
 
 use core::fmt::{self, Write};
 use vanir_user::events::{self, Event};
-use vanir_user::telemetry::{self, OP_LOG};
+use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, OP_COUNTERS, OP_LOG, OP_NET, OP_SET_INTERVAL};
 use vanir_user::{NOTIFY_TIMER, console, err, lookup, println, recv_timeout, reply, sleep, task_index, task_name, uptime};
 
 vanir_user::entry!(main);
@@ -156,6 +160,44 @@ fn storage_line(out: &mut Out, sender: u64, msg: &[u8]) {
     out.end_line();
 }
 
+/// `key=value`, if the key is a plain name.
+fn field(f: &[u8]) -> Option<(&[u8], &[u8])> {
+    let eq = f.iter().position(|&b| b == b'=')?;
+    let key = &f[..eq];
+    key.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_').then_some((key, &f[eq + 1..]))
+}
+
+/// A `Record` (`name key=value ...`) as a JSON line: `{"t":..,"task":..,"id":..,<kind>:<name>,
+/// <key>:<value>,...}`. Numbers stay numbers. A `t` field (the reporter's uptime) replaces ours.
+/// The sender's name comes from the kernel, so a task can only report as itself.
+fn record_line(out: &mut Out, sender: u64, kind: &str, record: &[u8]) {
+    let mut fields = record.split(|&b| b == b' ').filter(|f| !f.is_empty());
+    let Some(name) = fields.next() else { return };
+    let t = fields.clone().filter_map(field).find(|(k, _)| *k == b"t").map(|(_, v)| v);
+    match t.filter(|v| !v.is_empty() && v.iter().all(u8::is_ascii_digit)) {
+        Some(v) => {
+            let _ = write!(out, "{{\"t\":{}", core::str::from_utf8(v).unwrap());
+        }
+        None => {
+            let _ = write!(out, "{{\"t\":{}", uptime());
+        }
+    }
+    let _ = write!(out, ",\"task\":{},\"id\":{},\"{}\":{}", Name(sender), Id(sender), kind, Text(name));
+    if kind == "scope" {
+        let _ = out.write_str(",\"event\":\"counters\"");
+    }
+    for (key, value) in fields.filter_map(field).filter(|(k, _)| *k != b"t") {
+        let _ = write!(out, ",{}:", Text(key));
+        if !value.is_empty() && value.len() <= 19 && value.iter().all(u8::is_ascii_digit) {
+            let _ = out.write_str(core::str::from_utf8(value).unwrap());
+        } else {
+            let _ = write!(out, "{}", Text(value));
+        }
+    }
+    let _ = out.write_str("}");
+    out.end_line();
+}
+
 /// Forward every event the kernel has logged since the last call.
 fn drain_events(out: &mut Out) {
     let mut batch = [Event::default(); 32];
@@ -211,7 +253,8 @@ fn main() -> u64 {
     let console = lookup("uplink").or_else(|_| lookup("virtio-console")).expect("no uplink task");
     let link_name = if lookup("uplink").is_ok() { "uplink" } else { "virtio-console" };
     let mut out = Out { buf: [0; 4096], len: 0, console, link_name };
-    let mut msg = [0u8; 512];
+    let mut msg = [0u8; 4096];
+    let mut interval = DEFAULT_INTERVAL_TICKS;
     let mut next_heartbeat = uptime() + HEARTBEAT_TICKS;
     let mut heartbeats = 0;
     loop {
@@ -228,6 +271,27 @@ fn main() -> u64 {
                 let _ = reply(m.sender, 0, &[]);
                 drain_events(&mut out);
                 storage_line(&mut out, m.sender, &msg[..m.len]);
+            }
+            Ok(m) if m.op == OP_NET => {
+                let _ = reply(m.sender, 0, &[]);
+                drain_events(&mut out);
+                record_line(&mut out, m.sender, "event", &msg[..m.len]);
+            }
+            Ok(m) if m.op == OP_COUNTERS => {
+                let _ = reply(m.sender, 0, &interval.to_le_bytes());
+                record_line(&mut out, m.sender, "scope", &msg[..m.len]);
+            }
+            Ok(m) if m.op == OP_SET_INTERVAL && m.len == 8 => {
+                let mut name = [0u8; 16];
+                if task_name(m.sender, &mut name) != Ok("control") {
+                    let _ = reply(m.sender, 2, &[]);
+                    continue;
+                }
+                let ms = u64::from_le_bytes(msg[..8].try_into().unwrap()).clamp(100, 60_000);
+                interval = ms / 10;
+                let _ = reply(m.sender, 0, &[]);
+                let _ = write!(out, "{{\"t\":{},\"event\":\"interval\",\"ticks\":{}}}", uptime(), interval);
+                out.end_line();
             }
             Ok(m) => {
                 let _ = reply(m.sender, 1, &[]);

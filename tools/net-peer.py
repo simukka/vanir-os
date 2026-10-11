@@ -310,6 +310,7 @@ class Http:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.pending = b""
         self.closed = False
+        self.sent = self.received = 0  # bytes, for checking the guest's counters
 
     def close(self):
         self.sock.close()
@@ -318,13 +319,16 @@ class Http:
         data = self.sock.recv(65536)
         if not data:
             raise HttpError("connection closed")
+        self.received += len(data)
         self.pending += data
 
     def request(self, path="/", keep_alive=True, method="GET", extra=b""):
         """(status, headers, body); the connection is closed after if the server said so."""
         conn = b"keep-alive" if keep_alive else b"close"
         try:
-            self.sock.sendall(f"{method} {path} HTTP/1.1\r\nHost: vanir\r\n".encode() + b"Connection: " + conn + b"\r\n" + extra + b"\r\n")
+            request = f"{method} {path} HTTP/1.1\r\nHost: vanir\r\n".encode() + b"Connection: " + conn + b"\r\n" + extra + b"\r\n"
+            self.sock.sendall(request)
+            self.sent += len(request)
             while b"\r\n\r\n" not in self.pending:
                 self._fill()
         except OSError as e:
@@ -442,6 +446,53 @@ def http_restart(args):
     if first_failure is not None:
         say(f"first failure at request {first_failure + 1}; the last 50 all ok: {all(results[-50:])}")
     return finish(failed > 0 and len(after) > 50 and all(results[-50:]))
+
+
+@scenario
+def net_counters(args):
+    """A known transfer: 60 requests on one connection (some 404s), then a pause for snapshots.
+    tools/check-net-counters.py compares the guest's counters with the totals we print."""
+    deadline = time.monotonic() + args.timeout
+    c = None
+    while time.monotonic() < deadline and c is None:
+        try:
+            c = Http(timeout=2)
+            if c.request("/")[0] != 200:
+                raise HttpError("not ready")
+        except (OSError, HttpError):
+            c = None
+            time.sleep(0.2)
+    if c is None:
+        say("the guest never answered")
+        return finish(False)
+    statuses = [200]
+    for i in range(59):
+        path = ["/", "/count", "/missing"][i % 3]
+        statuses.append(c.request(path)[0])
+    c.close()
+    time.sleep(2.5)  # two snapshots with nothing moving
+    say(f"totals: requests={len(statuses)} ok={statuses.count(200)} not_found={statuses.count(404)} sent={c.sent} received={c.received}")
+    return finish(set(statuses) == {200, 404})
+
+
+@scenario
+def serve_a_while(args):
+    """GETs for 4 seconds (telemetry interval tests), then end the run."""
+    deadline = time.monotonic() + args.timeout
+    if wait_ready(deadline) is None:
+        say("the guest never answered")
+        return finish(False)
+    end = time.monotonic() + 4
+    ok = n = 0
+    while time.monotonic() < end:
+        n += 1
+        try:
+            ok += get("/")[0] == 200
+        except HttpError:
+            pass
+        time.sleep(0.05)
+    say(f"{ok}/{n} GETs ok")
+    return finish(ok == n)
 
 
 class Echo:

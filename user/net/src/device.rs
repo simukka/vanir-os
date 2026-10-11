@@ -1,7 +1,8 @@
 //! smoltcp's view of the NIC: a `Device` whose frames come from, and go to, the NIC driver task
 //! over IPC (`vanir_user::nic`).
 //!
-//! Received frames arrive in batches (`fetch`); `Interface::poll` then takes them one by one. Each frame smoltcp sends is
+//! Received frames arrive in batches (`fetch`), which the stack may filter (`retain`) before
+//! smoltcp sees them; `Interface::poll` then takes them one by one. Each frame smoltcp sends is
 //! one `OP_SEND_FRAME` message.
 
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
@@ -73,6 +74,23 @@ impl Nic {
 }
 
 impl Batch {
+    /// Keep only the frames `keep` accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
+        let (mut read, mut write) = (self.at, self.at);
+        while read + 2 <= self.len {
+            let n = u16::from_le_bytes([self.buf[read], self.buf[read + 1]]) as usize;
+            if read + 2 + n > self.len {
+                break;
+            }
+            if keep(&self.buf[read + 2..read + 2 + n]) {
+                self.buf.copy_within(read..read + 2 + n, write);
+                write += 2 + n;
+            }
+            read += 2 + n;
+        }
+        self.len = write;
+    }
+
     /// The next frame's place in `buf`.
     fn next(&mut self) -> Option<core::ops::Range<usize>> {
         if self.at + 2 > self.len {

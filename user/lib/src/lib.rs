@@ -560,6 +560,102 @@ pub mod telemetry {
         msg[16..16 + n].copy_from_slice(&name[..n]);
         send(id, OP_STORAGE, &msg[..16 + n], &mut []).map(|_| ())
     }
+
+    /// A network event (`Record`: the event's name, then its fields), e.g. a routing change.
+    pub const OP_NET: u64 = 3;
+    /// A counter snapshot (`Record`: the scope, then the counters, cumulative). Reply: the
+    /// snapshot interval in ticks (u64), which the host may change; send the next one then.
+    pub const OP_COUNTERS: u64 = 4;
+    /// From the task named "control" only: set the snapshot interval, in milliseconds (u64),
+    /// bounded to 100 ms..60 s.
+    pub const OP_SET_INTERVAL: u64 = 5;
+
+    /// Counter snapshots go out this often until the host says otherwise (RFD 1: 1 s).
+    pub const DEFAULT_INTERVAL_TICKS: u64 = 100;
+
+    /// A line of text, `name key=value key=value ...`, that telemetry turns into a JSON
+    /// record: numbers stay numbers, anything else becomes a string. Built in a fixed buffer;
+    /// what doesn't fit is left out.
+    pub struct Record {
+        buf: [u8; 2048],
+        len: usize,
+    }
+
+    impl Record {
+        pub fn new(name: &str) -> Record {
+            let mut r = Record { buf: [0; 2048], len: 0 };
+            r.put(name.as_bytes());
+            r
+        }
+
+        fn put(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                if self.len < self.buf.len() {
+                    // Spaces and '=' separate fields; keep them out of values.
+                    self.buf[self.len] = if b == b' ' || b == b'=' || !(0x21..0x7f).contains(&b) { b'_' } else { b };
+                    self.len += 1;
+                }
+            }
+        }
+
+        pub fn num(&mut self, key: &str, value: u64) -> &mut Record {
+            let mut digits = [0u8; 20];
+            let mut i = digits.len();
+            let mut v = value;
+            loop {
+                i -= 1;
+                digits[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            self.text_bytes(key, &digits[i..])
+        }
+
+        pub fn text(&mut self, key: &str, value: &str) -> &mut Record {
+            self.text_bytes(key, value.as_bytes())
+        }
+
+        pub fn text_bytes(&mut self, key: &str, value: &[u8]) -> &mut Record {
+            if self.len + key.len() + value.len() + 2 <= self.buf.len() {
+                self.buf[self.len] = b' ';
+                self.len += 1;
+                self.put(key.as_bytes());
+                self.buf[self.len] = b'=';
+                self.len += 1;
+                self.put(value);
+            }
+            self
+        }
+
+        pub fn as_bytes(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
+
+    /// Report a network event to telemetry task `id`.
+    pub fn net_event(id: u64, record: &Record) -> Result<(), u64> {
+        send(id, OP_NET, record.as_bytes(), &mut []).map(|_| ())
+    }
+
+    /// Send a counter snapshot to telemetry task `id`; returns the interval for the next one.
+    pub fn counters(id: u64, record: &Record) -> Result<u64, u64> {
+        let mut interval = [0u8; 8];
+        match send(id, OP_COUNTERS, record.as_bytes(), &mut interval) {
+            Ok((0, 8)) => Ok(u64::from_le_bytes(interval).max(1)),
+            Ok(_) => Ok(DEFAULT_INTERVAL_TICKS),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// TSC cycles per timer tick, measured over a few ticks (so it takes about 60 ms).
+pub fn tsc_per_tick() -> u64 {
+    sleep(1); // start on a tick boundary
+    let (t0, c0) = (uptime(), rdtsc());
+    sleep(5);
+    (rdtsc() - c0) / (uptime() - t0).max(1)
 }
 
 /// Client side of the network stack task (`user/net`): TCP on the ports the caller's manifest

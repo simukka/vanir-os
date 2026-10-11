@@ -12,6 +12,8 @@ Sources:
   ... --attest                             once connected, challenge the guest with a fresh
                                            nonce ("attest <hex>"); the challenge is logged; then
                                            tell it "bye"
+  ... --set-interval MS                    once connected, set the counter snapshot interval
+                                           ("interval <ms>", through the control task)
   ... --release-key KEY --reference REF    with --attest: if the quote verifies against REF,
                                            seal the 32-byte master key KEY (made if missing) to
                                            the guest and send it; log key_released/key_refused
@@ -23,6 +25,8 @@ Checks (--check makes any failure the exit status):
   - heartbeats arrive about once a second (--heartbeat-ticks), and at least
     --expect-heartbeats of them
   - --expect EVENT=N: at least N events of that type
+  - --expect-interval TICKS: once telemetry reports that interval, each reporter's counter
+    snapshots (per task and scope) arrive that many ticks apart
 """
 import argparse
 import json
@@ -82,6 +86,8 @@ def lines_from(args):
             open(args.save, "w").close()  # truncate, and tell anyone waiting that we listen
         conn, (cid, port) = listener.accept()
         print(f"host-agent: guest CID {cid} connected from port {port}", file=sys.stderr)
+        if args.set_interval:
+            conn.sendall(f"interval {args.set_interval}\n".encode())
         if not args.attest:
             yield from stream_lines(conn, args.save, append=True)
             return
@@ -132,6 +138,8 @@ def main():
     p.add_argument("--listen-vsock", type=int, metavar="PORT")
     p.add_argument("--save", metavar="FILE")
     p.add_argument("--attest", action="store_true")
+    p.add_argument("--set-interval", type=int, metavar="MS")
+    p.add_argument("--expect-interval", type=int, metavar="TICKS")
     p.add_argument("--release-key", metavar="KEY")
     p.add_argument("--reference", metavar="REF")
     p.add_argument("--check", action="store_true")
@@ -149,6 +157,8 @@ def main():
     unexplained = 0
     last_heartbeat = None
     worst_interval = 0
+    interval_set = False
+    snapshots = {}  # (task, scope, instance) -> uptimes of counter snapshots since the change
 
     for n, line in enumerate(lines_from(args), 1):
         line = line.strip()
@@ -176,6 +186,10 @@ def main():
                 problems.append(f"line {n}: {missing} events missing without a dropped record")
                 unexplained += missing
             last_seq = seq
+        if event == "interval":
+            interval_set = record.get("ticks") == args.expect_interval
+        if event == "counters" and interval_set:
+            snapshots.setdefault((record.get("task"), record.get("scope"), record.get("instance")), []).append(record["t"])
         if event == "heartbeat":
             t = record["t"]
             if last_heartbeat is not None:
@@ -185,6 +199,22 @@ def main():
                     problems.append(f"line {n}: heartbeat {interval} ticks after the previous one")
             last_heartbeat = t
 
+    if args.expect_interval:
+        if not interval_set:
+            problems.append(f"telemetry never reported an interval of {args.expect_interval} ticks")
+        checked = 0
+        tolerance = max(2, args.expect_interval // 5)
+        for key, times in sorted(snapshots.items(), key=str):
+            # A reporter learns the new interval from the reply to its next snapshot.
+            gaps = [b - a for a, b in zip(times[1:], times[2:])]
+            bad = [g for g in gaps if abs(g - args.expect_interval) > tolerance]
+            checked += len(gaps)
+            if bad:
+                problems.append(f"{'/'.join(str(k) for k in key if k)}: snapshot gaps {bad} ticks, expected {args.expect_interval}")
+        if checked < 5:
+            problems.append(f"only {checked} snapshot gaps to check")
+        else:
+            print(f"host-agent: {checked} snapshot gaps of {args.expect_interval} ticks (+-{tolerance})")
     if counts["heartbeat"] < args.expect_heartbeats:
         problems.append(f"{counts['heartbeat']} heartbeats, expected {args.expect_heartbeats}")
     for want in args.expect:

@@ -19,6 +19,7 @@
 #![no_main]
 
 mod device;
+mod filter;
 
 use device::Nic;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -28,6 +29,7 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use vanir_user::net::*;
 use vanir_user::nic::{self, NOTIFY_RX};
+use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
 use vanir_user::{NOTIFY_POST, NOTIFY_TIMER, SYS_RECV, RECV_TIMEOUT, err, getpid, lookup, println, rdtsc, reply, sleep, syscall6, task_index, task_listen, task_name, uptime};
 
 vanir_user::entry!(main);
@@ -58,18 +60,16 @@ struct Budget {
     cycles_per_tick: u64,
     tick: u64,
     used: u64,
-    /// Ticks in which the budget ran out, since the last load report.
+    /// Ticks in which the budget ran out, since the last load report, and in all.
     exhausted: u64,
+    exhausted_total: u64,
     flagged: bool,
 }
 
 impl Budget {
     fn new() -> Budget {
-        sleep(1); // start on a tick boundary
-        let (t0, c0) = (uptime(), rdtsc());
-        sleep(5);
-        let cycles_per_tick = (rdtsc() - c0) / (uptime() - t0).max(1);
-        Budget { cycles_per_tick, tick: 0, used: 0, exhausted: 0, flagged: false }
+        let cycles_per_tick = vanir_user::tsc_per_tick();
+        Budget { cycles_per_tick, tick: 0, used: 0, exhausted: 0, exhausted_total: 0, flagged: false }
     }
 
     fn spend(&mut self, now: u64, cycles: u64) {
@@ -80,6 +80,7 @@ impl Budget {
         if !self.left(now) && !self.flagged {
             self.flagged = true;
             self.exhausted += 1;
+            self.exhausted_total += 1;
         }
     }
 
@@ -118,6 +119,8 @@ struct Slot {
     syn_since: Option<u64>,
     /// The owner was told to wait for room to send.
     want_write: bool,
+    /// An owned connection was found reset (and counted).
+    reset_seen: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +150,32 @@ struct Instance {
     listening: u8,
     /// Its `OP_WAIT`, if one is held: (deadline tick).
     waiting: Option<Option<u64>>,
+    counters: InstanceCounters,
+}
+
+/// Per instance, cumulative (a restarted task is a new instance and starts from zero).
+#[derive(Clone, Copy, Default)]
+struct InstanceCounters {
+    accepted: u64,
+    /// Reset because the instance didn't accept them in time.
+    refused: u64,
+    /// Reset by the peer, or by us for being idle.
+    reset: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    drain_forced: u64,
+}
+
+/// The stack's own counters, cumulative.
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    ipv4_bad_checksum: u64,
+    /// TCP segments for a port nobody listens on (smoltcp answers with a reset).
+    tcp_no_listener: u64,
+    /// Connections reset because their service had no live instance.
+    refused_no_instance: u64,
+    /// TSC cycles spent on received frames.
+    cycles: u64,
 }
 
 struct Stack {
@@ -160,6 +189,13 @@ struct Stack {
     budget: Budget,
     /// Frames received when the load was last reported.
     reported_frames: u64,
+    counters: Counters,
+    /// Where counters and events go, if we may send there.
+    telemetry: Option<u64>,
+    interval: u64,
+    next_snapshot: u64,
+    /// `counters.cycles` at the last snapshot.
+    snapshot_cycles: u64,
     slots: [Slot; SOCKETS],
     ports: [Option<Port>; MAX_PORTS],
     services: [Option<Service>; MAX_SERVICES],
@@ -197,6 +233,7 @@ impl Stack {
         s.since = now;
         s.syn_since = None;
         s.want_write = false;
+        s.reset_seen = false;
     }
 
     /// Reset a connection and give its slot back.
@@ -257,8 +294,15 @@ impl Stack {
         let service = self.service_for(info.service()).ok_or(CODE_NO_SOCKETS)?;
         let k = self.instances.iter().position(Option::is_none).ok_or(CODE_NO_SOCKETS)?;
         self.next_generation = self.next_generation.wrapping_add(1);
-        self.instances[k] =
-            Some(Instance { id: sender, service: service as u8, generation: self.next_generation, ready: false, listening: 0, waiting: None });
+        self.instances[k] = Some(Instance {
+            id: sender,
+            service: service as u8,
+            generation: self.next_generation,
+            ready: false,
+            listening: 0,
+            waiting: None,
+            counters: InstanceCounters::default(),
+        });
         Ok(k)
     }
 
@@ -323,7 +367,16 @@ impl Stack {
                     State::Closed => self.set_use(i, Use::Free, now),
                     _ => self.hand_out(i, port as usize, now),
                 },
-                Use::Pending { .. } if state == State::Closed || now - self.slots[i].since > ACCEPT_TICKS => self.reset(i, now),
+                Use::Pending { instance, .. } if state == State::Closed || now - self.slots[i].since > ACCEPT_TICKS => {
+                    if state != State::Closed {
+                        self.instances[instance as usize].as_mut().unwrap().counters.refused += 1;
+                    }
+                    self.reset(i, now);
+                }
+                Use::Owned { instance, .. } if state == State::Closed && !self.slots[i].reset_seen => {
+                    self.slots[i].reset_seen = true;
+                    self.instances[instance as usize].as_mut().unwrap().counters.reset += 1;
+                }
                 Use::Closing if matches!(state, State::Closed | State::TimeWait) => self.set_use(i, Use::Free, now),
                 _ => {}
             }
@@ -361,7 +414,10 @@ impl Stack {
         let live = self.services[service].unwrap().live.map(|k| k as usize);
         match live.filter(|&k| self.instances[k].is_some_and(|i| i.listening & 1 << port != 0)) {
             Some(k) => self.set_use(slot, Use::Pending { port: port as u8, instance: k as u8 }, now),
-            None => self.reset(slot, now),
+            None => {
+                self.counters.refused_no_instance += 1;
+                self.reset(slot, now);
+            }
         }
     }
 
@@ -484,6 +540,7 @@ impl Stack {
                 };
                 self.set_use(i, Use::Owned { port: p as u8, instance: k as u8 }, now);
                 self.handed_out += 1;
+                self.instances[k].as_mut().unwrap().counters.accepted += 1;
                 #[cfg(feature = "crash-after-50-connections")]
                 if self.handed_out == 50 && getpid() >> 16 == 0 {
                     println!("{}: crashing after handing out 50 connections", self.name);
@@ -503,12 +560,16 @@ impl Stack {
                 self.connection(sender, h).and_then(|i| {
                     let s = self.socket(i);
                     let max = (max as usize).min(out.len());
-                    match s.recv_slice(&mut out[..max]) {
+                    let r = match s.recv_slice(&mut out[..max]) {
                         Ok(0) if !s.may_recv() => Err(CODE_CLOSED),
                         Ok(0) => Err(CODE_WOULD_BLOCK),
                         Ok(n) => Ok(n),
                         Err(_) => Err(CODE_CLOSED),
+                    };
+                    if let (Ok(n), Use::Owned { instance, .. }) = (r, self.slots[i].use_) {
+                        self.instances[instance as usize].as_mut().unwrap().counters.bytes_in += n as u64;
                     }
+                    r
                 })
             }
             OP_SEND => word(0).ok_or(CODE_BAD_OP).and_then(|h| self.connection(sender, h)).and_then(|i| {
@@ -519,6 +580,9 @@ impl Stack {
                 let n = s.send_slice(&msg[4..]).map_err(|_| CODE_CLOSED)?;
                 if n < msg.len() - 4 {
                     self.slots[i].want_write = true;
+                }
+                if let Use::Owned { instance, .. } = self.slots[i].use_ {
+                    self.instances[instance as usize].as_mut().unwrap().counters.bytes_out += n as u64;
                 }
                 out[..4].copy_from_slice(&(n as u32).to_le_bytes());
                 Ok(4)
@@ -552,7 +616,11 @@ impl Stack {
                 if self.services[service].unwrap().live.is_none() {
                     self.services[service].as_mut().unwrap().live = Some(k as u8);
                     let mut name = [0u8; 32];
-                    println!("{}: {} is live for service {}", self.name, task_name(sender, &mut name).unwrap_or("?"), self.name_of(service));
+                    let instance = task_name(sender, &mut name).unwrap_or("?");
+                    println!("{}: {} is live for service {}", self.name, instance, self.name_of(service));
+                    let mut r = Record::new("route_changed");
+                    r.text("service", self.name_of(service)).text("live", instance);
+                    self.event(&r);
                 }
                 0
             }),
@@ -568,7 +636,11 @@ impl Stack {
         let mut name = [0u8; 32];
         let info = task_listen(sender).map_err(|_| CODE_NOT_ALLOWED)?;
         let Some((max_connections, _per_source)) = info.port(port) else {
-            println!("{}: {} may not listen on port {}: not in its manifest entry", self.name, task_name(sender, &mut name).unwrap_or("?"), port);
+            let task = task_name(sender, &mut name).unwrap_or("?");
+            println!("{}: {} may not listen on port {}: not in its manifest entry", self.name, task, port);
+            let mut r = Record::new("listen_refused");
+            r.text("task", task).num("port", port as u64);
+            self.event(&r);
             return Err(CODE_NOT_ALLOWED);
         };
         let k = self.instance_for(sender, now)?;
@@ -585,7 +657,12 @@ impl Stack {
     /// Take a batch of frames from the driver. Returns whether there may be more.
     fn receive(&mut self) -> bool {
         match self.nic.fetch() {
-            Ok(n) => n > 0,
+            Ok(0) => false,
+            Ok(_) => {
+                let (ports, counters) = (&self.ports, &mut self.counters);
+                self.nic.rx.retain(|frame| inspect(frame, ports, counters));
+                true
+            }
             Err(_) => {
                 self.find_driver();
                 false
@@ -608,6 +685,90 @@ impl Stack {
             self.name, self.budget.exhausted, HOUSEKEEPING_TICKS, frames, full
         );
         self.budget.exhausted = 0;
+    }
+
+    /// Send an event to telemetry (if we may).
+    fn event(&mut self, record: &Record) {
+        if let Some(t) = self.telemetry
+            && telemetry::net_event(t, record).is_err()
+        {
+            self.telemetry = None;
+        }
+    }
+
+    /// Send one counter snapshot per scope: the interface, the stack, each instance.
+    fn snapshot(&mut self, now: u64) {
+        if self.telemetry.is_none() {
+            // Telemetry may have been restarted; or we may not talk to it at all.
+            self.telemetry = lookup("telemetry").ok();
+        }
+        let Some(t) = self.telemetry else { return };
+        let info = nic::info(self.nic.driver()).unwrap_or_default();
+        let mut r = Record::new("interface");
+        r.num("t", now)
+            .num("rx_packets", info.rx_packets)
+            .num("rx_bytes", info.rx_bytes)
+            .num("tx_packets", info.tx_packets)
+            .num("tx_bytes", info.tx_bytes)
+            .num("rx_ring_full", info.rx_ring_full)
+            .num("errors", info.errors)
+            .num("rx_multicast", info.rx_multicast)
+            .num("rx_broadcast", info.rx_broadcast)
+            .num("tx_dropped", self.nic.tx.dropped);
+        match telemetry::counters(t, &r) {
+            Ok(interval) => self.interval = interval,
+            Err(_) => {
+                self.telemetry = None;
+                return;
+            }
+        }
+
+        let (mut used, mut listening, mut connections) = (0, 0, 0);
+        for s in &self.slots {
+            match s.use_ {
+                Use::Free => {}
+                Use::Listening { .. } => listening += 1,
+                Use::Pending { .. } | Use::Owned { .. } => connections += 1,
+                Use::Closing => {}
+            }
+            used += (s.use_ != Use::Free) as u64;
+        }
+        let c = self.counters;
+        let window = self.interval * self.budget.cycles_per_tick;
+        let cpu = (c.cycles - core::mem::replace(&mut self.snapshot_cycles, c.cycles)) * 1000 / window.max(1);
+        let mut r = Record::new("net");
+        r.num("t", now)
+            .num("sockets", SOCKETS as u64)
+            .num("sockets_used", used)
+            .num("listening", listening)
+            .num("connections", connections)
+            .num("frames_in", self.nic.received)
+            .num("ipv4_bad_checksum", c.ipv4_bad_checksum)
+            .num("tcp_no_listener", c.tcp_no_listener)
+            .num("refused_no_instance", c.refused_no_instance)
+            .num("budget_exhausted_ticks", self.budget.exhausted_total)
+            .num("cpu_permille", cpu.min(1000));
+        let _ = telemetry::counters(t, &r);
+
+        for k in 0..MAX_INSTANCES {
+            let Some(instance) = self.instances[k] else { continue };
+            let open = self.slots.iter().filter(|s| matches!(s.use_, Use::Owned { instance, .. } if instance as usize == k)).count();
+            let mut name = [0u8; 32];
+            let c = instance.counters;
+            let mut r = Record::new("instance");
+            r.num("t", now)
+                .text("instance", task_name(instance.id, &mut name).unwrap_or("?"))
+                .text("service", self.name_of(instance.service as usize))
+                .num("live", (self.services[instance.service as usize].unwrap().live == Some(k as u8)) as u64)
+                .num("accepted", c.accepted)
+                .num("refused", c.refused)
+                .num("reset", c.reset)
+                .num("open", open as u64)
+                .num("bytes_in", c.bytes_in)
+                .num("bytes_out", c.bytes_out)
+                .num("drain_forced", c.drain_forced);
+            let _ = telemetry::counters(t, &r);
+        }
     }
 
     /// After the driver died: talk to its next incarnation, once it runs.
@@ -650,6 +811,22 @@ impl Stack {
     fn poll_delay(&mut self, now: u64) -> Option<u64> {
         self.iface.poll_delay(instant(now), &self.sockets).map(|d| d.total_millis().div_ceil(10))
     }
+}
+
+/// Count what smoltcp would drop without telling us. Returns whether the frame goes on to it.
+fn inspect(frame: &[u8], ports: &[Option<Port>; MAX_PORTS], counters: &mut Counters) -> bool {
+    let Some(ip) = filter::ipv4(frame) else { return true };
+    if !ip.checksum_ok {
+        counters.ipv4_bad_checksum += 1;
+        return false;
+    }
+    if ip.proto == 6
+        && let Some(tcp) = filter::tcp(ip.payload)
+        && !ports.iter().flatten().any(|p| p.number == tcp.dst_port)
+    {
+        counters.tcp_no_listener += 1;
+    }
+    true
 }
 
 /// `net` drives `nic`; `<x>-net` drives `nic-<x>` (e.g. `mgmt-net` and `nic-mgmt`).
@@ -696,7 +873,7 @@ fn main() -> u64 {
             socket.set_timeout(Some(IDLE));
             socket.set_ack_delay(None); // 10 ms ticks would make delayed ACKs slow
             socket.set_nagle_enabled(false); // services send whole responses
-            Slot { handle: sockets.add(socket), generation: 1, use_: Use::Free, since: 0, syn_since: None, want_write: false }
+            Slot { handle: sockets.add(socket), generation: 1, use_: Use::Free, since: 0, syn_since: None, want_write: false, reset_seen: false }
         })
     };
 
@@ -726,6 +903,11 @@ fn main() -> u64 {
         nic_name,
         budget: Budget::new(),
         reported_frames: 0,
+        counters: Counters::default(),
+        telemetry: lookup("telemetry").ok(),
+        interval: DEFAULT_INTERVAL_TICKS,
+        next_snapshot: 0,
+        snapshot_cycles: 0,
         slots,
         ports: [None; MAX_PORTS],
         services: [None; MAX_SERVICES],
@@ -750,7 +932,13 @@ fn main() -> u64 {
         stack.poll(now); // send what tending changed (RSTs)
         stack.serve_waiters(now);
         if receiving {
-            stack.budget.spend(now, rdtsc() - start);
+            let cycles = rdtsc() - start;
+            stack.budget.spend(now, cycles);
+            stack.counters.cycles += cycles;
+        }
+        if now >= stack.next_snapshot {
+            stack.snapshot(now);
+            stack.next_snapshot = now + stack.interval;
         }
         if now >= next_housekeeping {
             next_housekeeping = now + HOUSEKEEPING_TICKS;
@@ -762,7 +950,7 @@ fn main() -> u64 {
         }
 
         // Wait for a request, a notification, or the next timer; only poll if frames are waiting.
-        let wake = [stack.poll_delay(now).map(|d| now + d.max(1)), stack.next_deadline(), Some(next_housekeeping)];
+        let wake = [stack.poll_delay(now).map(|d| now + d.max(1)), stack.next_deadline(), Some(next_housekeeping), Some(stack.next_snapshot)];
         let wake = wake.into_iter().flatten().min().unwrap();
         let ticks = match want_rx {
             true if stack.budget.left(uptime()) => 0,
