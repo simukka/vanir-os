@@ -57,4 +57,4 @@
 
 - [apps/README.md](../apps/README.md): manifest format
 - [plans/step-7-iommu.md](../plans/step-7-iommu.md): next planned step (IOMMU)
-- [bench/PLAN.md](../bench/PLAN.md): benchmark plan
+- [plans/step-8-bench.md](../plans/step-8-bench.md): benchmark plan (step 8)
