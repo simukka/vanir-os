@@ -1,5 +1,9 @@
 # vanir-os
 
+> **Full manual:** [`docs/index.html`](docs/index.html) (serve it with GitHub Pages from `/docs`).
+> It covers the same ground with diagrams, a from-scratch guide to each layer, and a section
+> for coding agents; [`docs/llms.txt`](docs/llms.txt) is the agent index.
+
 A minimal x86-64 kernel in Rust, booted by [Limine](https://github.com/limine-bootloader/limine), that runs
 isolated ring-3 processes. It provides serial output, GDT/TSS, IDT, an ELF loader, a page-table tree
 per process, a 100 Hz local APIC timer with round-robin preemption, synchronous IPC between

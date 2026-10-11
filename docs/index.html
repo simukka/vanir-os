@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vanir-os Reference</title>
+<meta name="description" content="Reference manual for vanir-os: a minimal x86-64 kernel in stable Rust with isolated ring-3 tasks, synchronous IPC, driver tasks, measured boot, attestation and encrypted storage.">
+<link rel="alternate" type="text/plain" title="Agent index" href="llms.txt">
+<link rel="icon" type="image/png" href="favicon.png">
+<meta name="theme-color" content="#0a0f0d">
+<style>
+:root {
+  /* Palette from logo.png: foreground #0DE2AA on background #0A0F0D (hue ~164deg). */
+  --bg: #0a0f0d;          /* logo background */
+  --bg-raised: #0f1714;
+  --bg-code: #0c1311;
+  --border: #1b2a24;
+  --border-strong: #26403a;
+  --text: #d5e3dd;        /* body: near-white with a trace of the logo green */
+  --text-strong: #b8f7e3; /* bold: light tint of the logo green */
+  --text-heading: #ebf8f3;
+  --text-dim: #8fa69d;
+  --text-faint: #5c7068;
+  --accent: #0de2aa;      /* logo foreground: links, numbers, labels */
+  --accent-hover: #6ff0cb;
+  --accent-deep: #0a9f78; /* rules, active borders */
+  --accent-dim: rgba(13, 226, 170, 0.07);
+  --code-text: #9eeed4;   /* inline code */
+  --diagram: #a3c9bc;
+  --info: #3fc9e0;        /* "in plain terms": the logo green shifted toward cyan */
+  --info-dim: rgba(63, 201, 224, 0.07);
+  --warn: #f0b545;        /* limits and warnings: warm complement */
+  --warn-dim: rgba(240, 181, 69, 0.07);
+  --mono: "GT America Mono", "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  --sans: "Suisse Intl", Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --toc-w: 290px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 16px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); text-decoration: underline; text-underline-offset: 3px; }
+::selection { background: rgba(13, 226, 170, 0.28); color: var(--text-heading); }
+
+/* Layout: fixed table of contents on the left, document on the right (as in Asciidoctor's toc2). */
+#toc { position: fixed; top: 0; left: 0; bottom: 0; width: var(--toc-w); overflow-y: auto; padding: 24px 20px 40px;
+  border-right: 1px solid var(--border); background: var(--bg); font: 13px/1.5 var(--mono); }
+#toc .brand { display: block; margin-bottom: 10px; }
+#toc .brand img { width: 44px; height: 44px; display: block; }
+#toc .title { color: var(--accent); letter-spacing: 0.12em; text-transform: uppercase; font-size: 12px; margin: 0 0 18px; }
+#toc ol { list-style: none; margin: 0; padding: 0; }
+#toc ol ol { padding-left: 14px; }
+#toc li { margin: 2px 0; }
+#toc a { color: var(--text-dim); display: block; padding: 1px 0; }
+#toc a:hover, #toc a.active { color: var(--accent); text-decoration: none; }
+#toc .part { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.12em; font-size: 11px; margin: 18px 0 6px; }
+main { margin-left: var(--toc-w); padding: 48px 56px 120px; max-width: calc(var(--toc-w) + 900px); }
+main > * { max-width: 860px; }
+
+/* Headings: monospace, Oxide style */
+h1, h2, h3, h4 { font-family: var(--mono); font-weight: 500; line-height: 1.3; color: var(--text-heading); }
+h1 { margin: 0 0 6px; }
+h1 img { display: block; width: min(560px, 100%); height: auto; margin-left: -12px; }
+h2 { font-size: 22px; margin: 72px 0 16px; padding-top: 20px; border-top: 1px solid var(--border-strong); }
+h3 { font-size: 17px; margin: 40px 0 10px; }
+h4 { font-size: 14px; margin: 28px 0 8px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
+h2 .num, h3 .num { color: var(--accent); margin-right: 10px; }
+.part-title { font: 500 12px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.16em; color: var(--accent); margin: 96px 0 -40px; }
+.anchor { color: var(--text-faint); margin-left: 8px; opacity: 0; font-weight: 400; }
+h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+.lede { color: var(--text-dim); font-size: 18px; margin: 8px 0 28px; }
+.meta { font: 12px var(--mono); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.1em; }
+
+p, ul, ol { margin: 0 0 14px; }
+li { margin: 4px 0; }
+strong { color: var(--text-strong); font-weight: 600; }
+code { font: 0.86em var(--mono); color: var(--code-text); background: var(--bg-code); border: 1px solid var(--border); border-radius: 3px; padding: 0.05em 0.35em; }
+pre { font: 13px/1.5 var(--mono); background: var(--bg-code); border: 1px solid var(--border); border-radius: 4px;
+  padding: 14px 16px; overflow-x: auto; margin: 0 0 18px; }
+pre { color: var(--text); }
+pre code { background: none; border: 0; padding: 0; font-size: inherit; color: inherit; }
+pre.diagram { color: var(--diagram); border-left: 2px solid var(--accent-deep); line-height: 1.35; }
+pre.diagram b { color: var(--accent); font-weight: 400; }
+figure { margin: 0 0 22px; }
+figcaption { font: 12px var(--mono); color: var(--text-faint); margin-top: -10px; }
+figcaption::before { content: "Figure: "; color: var(--accent); }
+
+table { border-collapse: collapse; width: 100%; margin: 0 0 22px; font-size: 14px; display: block; overflow-x: auto; }
+th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+tr:hover td { background: var(--accent-dim); }
+th { background: var(--bg-raised); font: 500 12px var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); }
+td code { white-space: nowrap; }
+
+/* Admonitions */
+.admonition { border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--accent-dim);
+  border-radius: 4px; padding: 12px 16px; margin: 0 0 20px; }
+.admonition > :last-child { margin-bottom: 0; }
+.admonition .label { display: block; font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: 0.14em; color: var(--accent); margin-bottom: 4px; }
+.admonition.plain { border-left-color: var(--info); background: var(--info-dim); }
+.admonition.plain .label { color: var(--info); }
+.admonition.warning { border-left-color: var(--warn); background: var(--warn-dim); }
+.admonition.warning .label { color: var(--warn); }
+
+/* "For agents" blocks: dense, structured, machine-friendly */
+.agent { border: 1px dashed var(--border); border-radius: 4px; padding: 10px 14px; margin: 6px 0 24px; font: 13px/1.55 var(--mono); background: var(--bg-raised); }
+.agent .label { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.14em; font-size: 11px; display: block; margin-bottom: 4px; }
+.agent dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; }
+.agent dt { color: var(--accent); }
+.agent { border-color: var(--border-strong); }
+.agent dd { margin: 0; color: var(--text-dim); }
+.agent code { font-size: 12px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 0 0 24px; }
+.card:hover { border-color: var(--accent-deep); }
+.card { border: 1px solid var(--border); border-radius: 4px; padding: 14px 16px; background: var(--bg-raised); }
+.card h4 { margin: 0 0 6px; color: var(--accent); }
+.card p { margin: 0; font-size: 14px; color: var(--text-dim); }
+
+#toc-toggle { display: none; }
+@media (max-width: 960px) {
+  #toc { position: static; width: auto; border-right: 0; border-bottom: 1px solid var(--border); max-height: none; display: none; }
+  #toc.open { display: block; }
+  #toc-toggle { display: block; position: sticky; top: 0; z-index: 2; width: 100%; padding: 10px 16px; background: var(--bg-raised);
+    color: var(--accent); border: 0; border-bottom: 1px solid var(--border); font: 13px var(--mono); text-align: left; cursor: pointer; }
+  main { margin-left: 0; padding: 28px 16px 80px; }
+  h2 { margin-top: 48px; }
+  .part-title { margin: 64px 0 -24px; }
+}
+</style>
+</head>
+<body>
+
+<button id="toc-toggle" aria-controls="toc" aria-expanded="false">&#9776; Contents</button>
+
+<nav id="toc" aria-label="Contents">
+<a class="brand" href="#introduction"><img src="mark.png" alt="vanir-os"></a>
+<p class="title">vanir-os reference</p>
+<p class="part">Guide</p>
+<ol>
+  <li><a href="#introduction">1. Introduction</a></li>
+  <li><a href="#quick-start">2. Quick start</a></li>
+  <li><a href="#layers">3. The layers, from scratch</a>
+    <ol>
+      <li><a href="#layers-machine">3.1 The machine</a></li>
+      <li><a href="#layers-privilege">3.2 Privilege</a></li>
+      <li><a href="#layers-memory">3.3 Virtual memory</a></li>
+      <li><a href="#layers-traps">3.4 Traps</a></li>
+      <li><a href="#layers-tasks">3.5 Tasks and messages</a></li>
+      <li><a href="#layers-devices">3.6 Devices</a></li>
+      <li><a href="#layers-trust">3.7 Trust</a></li>
+    </ol>
+  </li>
+</ol>
+<p class="part">Reference</p>
+<ol>
+  <li><a href="#boot">4. Boot</a></li>
+  <li><a href="#memory">5. Memory and address spaces</a></li>
+  <li><a href="#tasks">6. Tasks and scheduling</a></li>
+  <li><a href="#manifests">7. App manifests</a></li>
+  <li><a href="#ipc">8. IPC</a></li>
+  <li><a href="#supervisor">9. Supervisor</a></li>
+  <li><a href="#drivers">10. Drivers</a></li>
+  <li><a href="#telemetry">11. Telemetry</a></li>
+  <li><a href="#boot-chain">12. Boot chain and attestation</a></li>
+  <li><a href="#storage">13. Storage</a>
+    <ol>
+      <li><a href="#storage-format">13.1 On-disk format</a></li>
+      <li><a href="#storage-keys">13.2 Keys</a></li>
+      <li><a href="#storage-release">13.3 Key release</a></li>
+      <li><a href="#storage-restarts">13.4 Restarts and events</a></li>
+    </ol>
+  </li>
+  <li><a href="#syscalls">14. Syscalls</a></li>
+  <li><a href="#protections">15. Protections</a></li>
+  <li><a href="#limitations">16. Limitations</a></li>
+</ol>
+<p class="part">Working on vanir-os</p>
+<ol>
+  <li><a href="#agents">17. Agent quick reference</a></li>
+  <li><a href="#build">18. Build, run, test</a></li>
+  <li><a href="#tests">19. Test catalogue</a></li>
+  <li><a href="#repo-map">20. Repository map</a></li>
+  <li><a href="#recipes">21. Recipes</a></li>
+  <li><a href="#invariants">22. Invariants</a></li>
+  <li><a href="#troubleshooting">23. Troubleshooting</a></li>
+  <li><a href="#dependencies">24. System dependencies</a></li>
+  <li><a href="#glossary">25. Glossary</a></li>
+</ol>
+</nav>
+
+<main>
+
+<p class="meta">Reference manual &middot; x86-64 &middot; stable Rust &middot; Limine</p>
+<h1><img src="logo.png" alt="vanir-os" width="560" height="136"></h1>
+<p class="lede">A minimal x86-64 kernel that runs isolated, unprivileged tasks which talk only by
+messages. Drivers, storage and attestation are ordinary tasks, and the system is fixed at build
+time.</p>
+
+<div class="admonition plain">
+<span class="label">How to read this</span>
+<p><strong>Part one</strong> explains each layer from scratch, for readers who haven't built
+an operating system before. <strong>Part two</strong> is the reference: what each subsystem
+does, its interfaces, and the tests that prove it. <strong>Part three</strong> is for working on
+the code, by people or by coding agents: commands, file locations, recipes, rules and fixes.
+Agents should start at <a href="#agents">17. Agent quick reference</a> or fetch
+<a href="llms.txt"><code>llms.txt</code></a>.</p>
+</div>
+
+<!-- ============================================================ GUIDE -->
+<p class="part-title">Part one: guide</p>
+
+<h2 id="introduction"><span class="num">1</span>Introduction<a class="anchor" href="#introduction">#</a></h2>
+
+<p>vanir-os is a small kernel written in stable Rust and booted by
+<a href="https://github.com/limine-bootloader/limine">Limine</a>. Its design follows Oxide's
+<a href="https://hubris.oxide.computer/">Hubris</a>: a fixed set of tasks is declared at build
+time, each runs in its own address space in ring 3, and they cooperate through synchronous
+send/receive/reply messages. Things a larger kernel does internally, such as device drivers,
+restarting failed programs, storage and talking to a host, are separate tasks here.</p>
+
+<p>The kernel provides:</p>
+<ul>
+  <li>serial output, GDT/TSS, IDT, and an ELF loader that enforces W^X</li>
+  <li>a page-table tree per process, with SMEP, SMAP and NX</li>
+  <li>a 100 Hz local APIC timer, round-robin preemption and CPU budgets</li>
+  <li>synchronous IPC with a per-task allowlist of who may send to whom</li>
+  <li>supervisor notifications and task restarts with generation-checked ids</li>
+  <li>PCI device grants, MSI-X interrupts and DMA regions for driver tasks</li>
+  <li>a kernel event log, signature checks on task images, and boot measurements into a TPM</li>
+</ul>
+
+<p>On top of that, as tasks: virtio console, vsock and block drivers; telemetry streamed to a
+host agent; TPM remote attestation; and encrypted per-task storage whose key the host releases
+only to a boot it has attested.</p>
+
+<div class="cards">
+  <div class="card"><h4>Static</h4><p>No <code>fork</code> or <code>exec</code>. The manifest fixes every task, its budget and who it may talk to.</p></div>
+  <div class="card"><h4>Isolated</h4><p>Each task has its own page tables. A crash ends that task, not the system.</p></div>
+  <div class="card"><h4>Mechanism, not policy</h4><p>The kernel reports deaths; the supervisor task decides what to do.</p></div>
+  <div class="card"><h4>Verifiable</h4><p>Signed images, Secure Boot, measured boot and TPM quotes, all checked by tests.</p></div>
+</div>
+
+<h2 id="quick-start"><span class="num">2</span>Quick start<a class="anchor" href="#quick-start">#</a></h2>
+
+<p>Install the dependencies (<a href="#dependencies">24</a>), then:</p>
+<pre><code>make run                                   # build the ISO and boot it in QEMU
+make test                                  # boot all 70 scenarios and check each one
+make test ACCEL=kvm                        # the same under KVM
+make run APP=tests/apps/two-spinners.toml  # boot a different set of tasks</code></pre>
+
+<p>A normal boot prints the banner, the kernel's setup steps, then each task's output, and ends
+when nothing is left to run:</p>
+<pre><code>[kernel] GDT, TSS and IDT loaded
+...
+[kernel] pci 00:03.0 1af4:1043 virtio-console
+[kernel] pid 1 (hello): 8704-byte ELF, signed version 1, entry 0x400000
+[kernel] tpm: none found; the boot is not measured
+[kernel] entering ring 3
+hello world
+[kernel] pid 1 (hello) exited with code 0 (called from CPL 3)
+[kernel] no process can run:
+[kernel]   pid 1 (hello): exited 0, 1 ticks
+[kernel] frames in use: 3 (all task memory freed)</code></pre>
+
+<h2 id="layers"><span class="num">3</span>The layers, from scratch<a class="anchor" href="#layers">#</a></h2>
+
+<p>An operating system is a stack of layers, each depending on the one below. This part walks
+up the stack once, saying in plain terms what each layer is for and how vanir-os does it. The
+reference in part two goes into detail.</p>
+
+<figure>
+<pre class="diagram">
+ +---------------------------------------------------------------+
+ | <b>ring 3</b>   tasks: hello, supervisor, drivers, storage, attest   |  unprivileged; one
+ |          (each in its own address space)                      |  address space each
+ +--------------------------- int 0x80 ---------------------------+
+ | <b>ring 0</b>   vanir kernel: traps, page tables, scheduler, IPC,    |  privileged; small
+ |          device grants, event log, measurements               |
+ +---------------------------------------------------------------+
+ | <b>Limine</b>   boot loader: loads the kernel and task images        |  runs once
+ +---------------------------------------------------------------+
+ | <b>firmware</b> SeaBIOS (BIOS) or OVMF (UEFI with Secure Boot)       |  runs once
+ +---------------------------------------------------------------+
+ | <b>QEMU / KVM</b> virtual machine: CPU, RAM, virtio devices, TPM     |  the "hardware"
+ +---------------------------------------------------------------+
+</pre>
+<figcaption>The stack, bottom to top</figcaption>
+</figure>
+
+<h3 id="layers-machine"><span class="num">3.1</span>The machine<a class="anchor" href="#layers-machine">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>A computer is a processor that runs instructions from memory, plus devices (disk, network,
+serial port) it talks to through special addresses. When it powers on, it runs
+<strong>firmware</strong> burned into the board, which finds a <strong>boot loader</strong> on
+a disk, which loads the <strong>kernel</strong> into memory and jumps to it. From then on the
+kernel is in charge.</p></div>
+<p>vanir-os runs in QEMU, which emulates the machine in software (TCG) or uses the host CPU's
+virtualization (KVM). The firmware is SeaBIOS or OVMF; the boot loader is Limine, which also
+loads every task's ELF file and signature as "modules" next to the kernel.</p>
+
+<h3 id="layers-privilege"><span class="num">3.2</span>Privilege<a class="anchor" href="#layers-privilege">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>x86 processors have privilege levels called <strong>rings</strong>. Code in
+<strong>ring 0</strong> can do anything: change memory maps, talk to hardware, turn off
+interrupts. Code in <strong>ring 3</strong> can't, and if it tries, the processor stops it and
+hands control to ring 0. The kernel runs in ring 0; programs run in ring 3. That's what keeps a
+buggy or hostile program from taking over the machine.</p></div>
+<p>The kernel sets this up with a GDT (segment descriptors for each ring), a TSS (which stack to
+switch to when ring 3 traps into ring 0), and CPU features: <strong>SMEP</strong> stops the
+kernel running user code, <strong>SMAP</strong> stops it reading or writing user memory except
+inside explicit copy routines, <strong>NX</strong> marks data pages non-executable, and
+<strong>CR0.WP</strong> makes read-only pages read-only for the kernel too.</p>
+
+<h3 id="layers-memory"><span class="num">3.3</span>Virtual memory<a class="anchor" href="#layers-memory">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>Programs don't see physical memory directly. Every address they use goes through
+<strong>page tables</strong>, a tree the processor walks to translate a virtual address to a
+physical one, 4 KiB at a time. Each page also has permissions: present, writable, user-visible,
+executable. Give each program its own page tables and it can't even name another program's
+memory.</p></div>
+<figure>
+<pre class="diagram">
+  virtual address (48 bits used)
+  +---------+---------+---------+---------+--------------+
+  | PML4 idx| PDPT idx|  PD idx |  PT idx | page offset  |
+  |  9 bits |  9 bits |  9 bits |  9 bits |   12 bits    |
+  +----+----+----+----+----+----+----+----+------+-------+
+       |         |         |         |           |
+  CR3 -+-> PML4 -+-> PDPT -+-> PD ---+-> PT -----+-> 4 KiB frame + offset
+           (one tree per task; the kernel half is shared, supervisor-only)
+</pre>
+<figcaption>Four-level page-table walk</figcaption>
+</figure>
+
+<h3 id="layers-traps"><span class="num">3.4</span>Traps: syscalls, faults, interrupts<a class="anchor" href="#layers-traps">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>There are three ways into the kernel. A <strong>syscall</strong> is a program asking for
+something on purpose (here, with the <code>int 0x80</code> instruction). A
+<strong>fault</strong> is the processor reporting a mistake, such as touching unmapped memory.
+An <strong>interrupt</strong> is a device or timer asking for attention. All three save where
+the program was, switch to ring 0, and run a handler listed in the <strong>IDT</strong>.</p></div>
+<figure>
+<pre class="diagram">
+  ring 3 task                    ring 0 kernel
+  -----------                    --------------------------------------------
+  int 0x80  / fault / IRQ  ----&gt; trap stub: push registers (TrapFrame)
+                                 dispatch: syscall | fault | timer | device IRQ
+                                 maybe switch task: swap TrapFrame, load CR3
+  continues (same or other) &lt;--- zero scratch registers, iretq
+</pre>
+<figcaption>One trap path for everything</figcaption>
+</figure>
+<p>The timer interrupt fires 100 times a second. It's how the kernel takes the CPU back from a
+task that never gives it up (<strong>preemption</strong>) and how it counts CPU budgets.</p>
+
+<h3 id="layers-tasks"><span class="num">3.5</span>Tasks and messages<a class="anchor" href="#layers-tasks">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>A <strong>task</strong> (or process) is a program with its own memory and saved registers.
+The kernel switches between them quickly so they seem to run at once. Isolated tasks still
+need to cooperate, so they send each other <strong>messages</strong>: a client sends a request
+and waits; the server receives it, does the work and replies. The kernel copies the bytes
+between their memories and checks who is allowed to talk to whom.</p></div>
+<p>vanir-os declares every task in an app manifest. The kernel never creates tasks at run time;
+it can only restart one, when the supervisor task asks.</p>
+
+<h3 id="layers-devices"><span class="num">3.6</span>Devices<a class="anchor" href="#layers-devices">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>Software controls a device by writing to its <strong>registers</strong>, which appear as
+memory addresses (MMIO). Fast devices also read and write main memory themselves:
+<strong>DMA</strong>, direct memory access. When they finish, they raise an
+<strong>interrupt</strong>. A <strong>driver</strong> is the code that knows a device's
+registers and protocol.</p></div>
+<p>Here a driver is an ordinary ring-3 task. The kernel maps only that device's registers into
+the driver, gives it a fixed DMA region, and turns the device's interrupts into messages. A
+crashing driver is just a crashing task.</p>
+
+<h3 id="layers-trust"><span class="num">3.7</span>Trust: signatures, measurements, keys<a class="anchor" href="#layers-trust">#</a></h3>
+<div class="admonition plain"><span class="label">In plain terms</span>
+<p>Isolation protects tasks from each other, but how do you know the right code is running at
+all? Each boot stage <strong>checks a signature</strong> on the next before running it. Each
+stage also <strong>measures</strong> (hashes) what it runs into a <strong>TPM</strong>, a small
+security chip that keeps a running hash it can't be made to forget. Later the TPM can sign a
+<strong>quote</strong> of those hashes, so a remote host can verify what booted. Only then does
+the host hand over secrets, such as the key that decrypts the disk.</p></div>
+
+<!-- ============================================================ REFERENCE -->
+<p class="part-title">Part two: reference</p>
+
+<h2 id="boot"><span class="num">4</span>Boot<a class="anchor" href="#boot">#</a></h2>
+
+<p>Limine (base revision 3) loads the higher-half kernel at <code>0xffffffff80000000</code>,
+plus one module per task image and one per signature, and jumps to <code>kmain</code>:</p>
+
+<figure>
+<pre class="diagram">
+ kmain
+  |-- serial::init, banner                 COM1 at 0x3f8: the boot log
+  |-- cpu::enable_protections              SMEP, SMAP, NX, CR0.WP
+  |-- gdt::init, interrupts::init          GDT + TSS, IDT (one trap path)
+  |-- modules::init                        task images + .sig files from Limine
+  |-- memory::init                         frame allocator over the memory map, HHDM
+  |-- apic::init                           local APIC timer, 100 Hz (calibrated on the PIT)
+  |-- pci::init                            discover devices, size BARs, set up MSI-X
+  '-- process::start(kernel file)
+        |-- verify each task image         Ed25519 signature, min_version
+        |-- measure into PCR 12            kernel, manifest, each task (if a TPM exists)
+        |-- load ELFs, build page tables   W^X per segment, stack, device + DMA mappings
+        '-- enter ring 3                   first task runs; the scheduler takes over
+</pre>
+<figcaption>Kernel initialisation order (kernel/src/main.rs)</figcaption>
+</figure>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/src/main.rs</code>, <code>limine.conf</code>, <code>kernel/linker.ld</code>, <code>kernel/src/modules.rs</code></dd>
+<dt>debug</dt><dd><code>make run-debug</code> logs interrupts and CPU resets to <code>qemu.log</code> (use it for triple faults)</dd>
+<dt>note</dt><dd>Task images are found by module string = program name; <code>build/limine.conf</code> is generated by the Makefile</dd>
+</dl></div>
+
+<h2 id="memory"><span class="num">5</span>Memory and address spaces<a class="anchor" href="#memory">#</a></h2>
+
+<p>Physical memory is handed out in 4 KiB frames from Limine's memory map, with a free list so
+frames return when a task dies. The kernel reaches physical memory through the HHDM (Limine's
+direct map). Each task gets its own PML4; the kernel half is shared and supervisor-only.</p>
+
+<figure>
+<pre class="diagram">
+ 0xffff_ffff_8000_0000  +---------------------------+  kernel image (shared, supervisor-only)
+                        |  ...                      |
+ HHDM offset            +---------------------------+  all physical memory (supervisor-only)
+                        :                           :
+ 0x0000_8000_0000_0000  +===========================+  USER_END: nothing user-visible above
+ 0x7fff_ffff_f000       +---------------------------+  user stack top (16 pages, 64 KiB, NX)
+                        :                           :
+ 0x30_0000_0000         +---------------------------+  TPM CRB page (tpm = true task only)
+ 0x20_0000_0000         +---------------------------+  DMA region (dma_pages, pinned frames)
+ 0x10_0000_0000         +---------------------------+  device BARs, uncached
+                        |                           |  (0x1000_0000 per device, 0x200_0000 per BAR)
+ 0x40_0000              +---------------------------+  ELF segments: code R-X, rodata R--, data RW-
+ 0x0                    +---------------------------+  unmapped (null page faults)
+</pre>
+<figcaption>A task's address space</figcaption>
+</figure>
+
+<p>Two software bits in page-table entries record ownership: <code>DEVICE</code> (bit 9, MMIO,
+never freed) and <code>PINNED</code> (bit 10, DMA frames owned by the task slot, kept across
+restarts). Everything else a task maps is freed when it dies; the <code>no-leak</code> and
+<code>restart-no-leak</code> tests check the frame count returns to its baseline.</p>
+
+<p>The kernel touches user memory only through <code>copy_from_user</code> and friends, which
+open a SMAP window (<code>stac</code>/<code>clac</code>) and recover from page faults through an
+exception table, so a bad pointer in a syscall returns an error instead of crashing the
+kernel.</p>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/src/memory.rs</code> (frames, page tables), <code>kernel/src/usercopy.rs</code>, <code>kernel/src/elf.rs</code>, constants at the top of <code>kernel/src/process.rs</code></dd>
+<dt>rule</dt><dd>Never dereference a user pointer directly; check ranges with the address space's <code>check_range</code> and copy with <code>usercopy</code></dd>
+<dt>tests</dt><dd><code>poke-kernel</code>, <code>bad-pointer</code>, <code>exec-stack</code>, <code>write-code</code>, <code>smap</code>, <code>address-spaces</code>, <code>no-leak</code></dd>
+</dl></div>
+
+<h2 id="tasks"><span class="num">6</span>Tasks and scheduling<a class="anchor" href="#tasks">#</a></h2>
+
+<ul>
+  <li><strong>Static task table.</strong> The tasks are fixed at build time by an app manifest
+    (<a href="#manifests">7</a>). Tasks get ids 1, 2, &hellip; in manifest order.</li>
+  <li><strong>One kernel stack.</strong> A trap saves the user's registers on it. A context
+    switch stores that frame in the current task, copies the next task's saved frame over it,
+    switches <code>CR3</code>, and returns through the normal <code>iretq</code>. Kernel code
+    never waits in the middle of a syscall: a task that must wait is marked blocked with its
+    registers saved, and whoever completes the operation writes the results into those saved
+    registers.</li>
+  <li><strong>Round-robin preemption</strong> on the 100 Hz timer. A task with a
+    <code>budget</code> is killed after that many ticks of CPU.</li>
+  <li><strong>Outcomes.</strong> A task ends by <code>exit</code>, by faulting, or by using up
+    its budget; the others keep running. When nothing can run, the kernel prints a summary and
+    halts with a status (<a href="#build">18</a>). Tasks waiting in <code>recv</code> count as
+    idle servers; tasks stuck in <code>send</code> mean a deadlock.</li>
+</ul>
+
+<figure>
+<pre class="diagram">
+              scheduled                   send / recv / sleep
+   +-------+ ----------&gt; +---------+ ----------------------------&gt; +-----------------+
+   | Ready |             | Running |                               | SendBlocked     |
+   +-------+ &lt;---------- +---------+ &lt;---------------------------- | ReplyBlocked    |
+       ^      timer tick     |  |       reply / message / wake-up  | RecvBlocked     |
+       |                     |  |                                  | Sleeping        |
+       |   restart(id)       |  +-- exit(code) -----&gt; Exited(code) +-----------------+
+       +---------------------+----- fault ----------&gt; Faulted(vector)
+         (supervisor only)   '----- budget spent ---&gt; OverBudget
+</pre>
+<figcaption>Task states</figcaption>
+</figure>
+
+<h2 id="manifests"><span class="num">7</span>App manifests<a class="anchor" href="#manifests">#</a></h2>
+
+<p>An app manifest is a TOML file listing every task. <code>kernel/build.rs</code> turns it
+into the kernel's task table at build time. Pick one with <code>make run APP=&hellip;</code>
+(default <code>apps/default.toml</code>; tests use <code>tests/apps/</code>).</p>
+
+<pre><code>[[task]]
+name = "client"        # unique task name; also the program, unless `program` is set
+program = "hello"      # optional: build/&lt;program&gt;.elf (any program under user/)
+budget = 50            # optional: CPU budget in 10 ms ticks (default: unlimited)
+supervisor = true      # optional: told when other tasks die (at most one)
+sends = ["echo"]       # optional: tasks this one may send IPC messages to
+devices = ["virtio-console"]  # optional: PCI devices to drive (kernel/src/pci_kinds.rs)
+dma_pages = 16         # optional: contiguous DMA region in 4 KiB pages (max 256)
+events = true          # optional: may read the kernel event log and stats (at most one)
+min_version = 2        # optional: refuse images signed with an older version
+tpm = true             # optional: gets the TPM mapped, for attestation (at most one)</code></pre>
+
+<p>The build fails on unknown keys, duplicate names, unknown <code>sends</code> targets or
+device names, or more than one supervisor, event reader or TPM task. Each <code>devices</code>
+entry claims the next unclaimed device of that kind; a missing device is logged and the task
+runs without it.</p>
+
+<h4>Names with meaning</h4>
+<table>
+<tr><th>Name</th><th>Found by</th><th>Role</th></tr>
+<tr><td><code>uplink</code></td><td>telemetry, control</td><td>host link driver (e.g. <code>virtio-vsock</code>); otherwise telemetry uses <code>virtio-console</code></td></tr>
+<tr><td><code>telemetry</code></td><td>supervisor, storage</td><td>receives <code>log</code> lines and storage events</td></tr>
+<tr><td><code>blockdev</code></td><td>storage</td><td>the virtio-blk driver</td></tr>
+<tr><td><code>disk</code></td><td>clients, keys, attest</td><td>the storage task (or, in <code>blk*</code> tests, the driver itself)</td></tr>
+<tr><td><code>keys</code></td><td>storage</td><td>key server that gives <code>disk</code> the master key</td></tr>
+<tr><td><code>attest</code></td><td>control, storage</td><td>TPM quotes; opens the host's released key</td></tr>
+</table>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/build.rs</code> (parser, <code>known</code> keys), <code>apps/README.md</code>, <code>apps/*.toml</code>, <code>tests/apps/*.toml</code></dd>
+<dt>remember</dt><dd>A task may only <code>send</code> to tasks in its <code>sends</code>; <code>lookup(name)</code> succeeds regardless, and a refused send logs an <code>ipc_refused</code> event</dd>
+<dt>attestation</dt><dd>The manifest is measured into PCR 12: editing a manifest changes the expected PCR value</dd>
+</dl></div>
+
+<h2 id="ipc"><span class="num">8</span>IPC<a class="anchor" href="#ipc">#</a></h2>
+
+<p>Synchronous send/receive/reply, as in Hubris. A client's <code>send</code> waits until the
+server has received the message and replied. The kernel copies messages and replies between
+address spaces, up to 4 KiB each. A task may only send to the tasks listed in its manifest
+<code>sends</code>.</p>
+
+<figure>
+<pre class="diagram">
+  client                      kernel                             server
+     |                           |                                  |
+     |- send(server, op, msg) --&gt;| check sends allowlist            |
+     |  [SendBlocked]            | queued until server recvs        |
+     |                           |&lt;-- recv(buf) --------------------|
+     |  [ReplyBlocked]           |--------------------- copy msg --&gt;| (sender, op, len)
+     |                           |                                  |  ... does the work ...
+     |                           |&lt;-- reply(sender, code, data) ----|
+     |&lt;-- (code, reply_len) -----|                                  |  reply never blocks
+     |                           |                                  |
+</pre>
+<figcaption>A send/recv/reply round trip</figcaption>
+</figure>
+
+<p>Task ids carry a <strong>generation</strong> (<code>slot + 1 | generation &lt;&lt; 16</code>)
+that changes on restart. A client holding an id from before a restart gets <code>DEAD</code>
+instead of silently reaching a fresh server that lost its state; it can <code>lookup</code>
+the name again and resend. Kernel notifications arrive as messages from sender 0.</p>
+
+<table>
+<tr><th>Error (top bit set)</th><th>Meaning</th></tr>
+<tr><td><code>DEAD</code></td><td>the target has died, or was restarted since the id was obtained</td></tr>
+<tr><td><code>NOT_ALLOWED</code></td><td>the target is not in the sender's <code>sends</code> (or: supervisor-only call)</td></tr>
+<tr><td><code>BAD_TARGET</code></td><td>no such task, or sending to yourself</td></tr>
+<tr><td><code>BAD_BUFFER</code></td><td>a buffer is unmapped, read-only where it must be written, or not in user memory</td></tr>
+<tr><td><code>TOO_LONG</code></td><td>a message or reply is over 4 KiB or bigger than the receiving buffer</td></tr>
+<tr><td><code>BAD_ARGUMENT</code></td><td>a reply code with the top bit set; restart of a live or already-restarted task</td></tr>
+</table>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd>kernel: <code>send</code>/<code>recv</code>/<code>reply</code> in <code>kernel/src/process.rs</code>; user: <code>send</code>, <code>recv</code>, <code>recv_flags</code>, <code>recv_timeout</code>, <code>reply</code> in <code>user/lib/src/lib.rs</code></dd>
+<dt>pattern</dt><dd>Servers loop on <code>recv</code> and always <code>reply</code>, even with an error code; reply codes are the server's protocol (top bit clear)</dd>
+<dt>pattern</dt><dd>Clients of restartable servers retry on <code>DEAD</code> after <code>lookup</code> returns a different id (see <code>with_disk</code> in <code>user/blktest</code>)</dd>
+<dt>tests</dt><dd><code>ipc-*</code>, <code>stale-id</code></dd>
+</dl></div>
+
+<h2 id="supervisor"><span class="num">9</span>Supervisor<a class="anchor" href="#supervisor">#</a></h2>
+
+<p>One task may be marked <code>supervisor = true</code> (<code>user/supervisor</code>). The
+kernel reports every other task's death to it as a message from sender 0 with
+<code>NOTIFY_DEATH</code> and a death record: how it ended, exit code or fault vector,
+<code>rip</code>, <code>cr2</code>, error code and ticks used. The supervisor decides what to
+do and may call <code>restart(id)</code>, which reloads the task's ELF into fresh memory with a
+new generation. The policy lives in the supervisor, not the kernel. If the supervisor itself
+dies, the kernel halts.</p>
+
+<figure>
+<pre class="diagram">
+  task faults ---&gt; kernel: free its memory, mark Faulted, log "fault" event
+                     |
+                     '--&gt; NOTIFY_DEATH {kind, code, rip, cr2, ...} --&gt; supervisor
+                                                                          |
+       exited 0: done   |   fault / non-zero exit / over budget: restart (max 3)
+                                                                          |
+  new generation &lt;--- kernel: reload ELF, fresh page tables, id' = id + (1 &lt;&lt; 16)
+  clients holding the old id get DEAD; they lookup() the name again
+</pre>
+<figcaption>Death and restart</figcaption>
+</figure>
+
+<h2 id="drivers"><span class="num">10</span>Drivers<a class="anchor" href="#drivers">#</a></h2>
+
+<p>Device drivers are ordinary tasks. The kernel discovers PCI devices at boot and a manifest
+grants one to a task (<code>devices = ["virtio-console"]</code>). The driver gets:</p>
+<ul>
+  <li>the device's register BARs mapped into its address space (uncached), except the BAR
+    holding the MSI-X table: the kernel programs interrupt routing itself;</li>
+  <li>read-only access to the device's PCI configuration space;</li>
+  <li>a physically contiguous DMA region (<code>dma_pages</code>), the same physical pages for
+    the life of the task slot and zeroed on every restart;</li>
+  <li>the device's interrupts as notifications in <code>recv</code> (sender 0,
+    <code>NOTIFY_IRQ</code>). A driver with work in flight passes <code>RECV_EXPECT_IRQ</code>
+    so the kernel idles for it instead of ending the run.</li>
+</ul>
+
+<figure>
+<pre class="diagram">
+     driver task (ring 3)                       device (virtio PCI)
+  +-----------------------------+           +-----------------------------+
+  | BAR window  0x10_0000_0000  |-- MMIO --&gt;| common cfg, notify, ISR     |
+  | DMA region  0x20_0000_0000  |           |                             |
+  |   virtqueues + buffers      |&lt;-- DMA ---| reads requests, writes data |
+  | recv(): NOTIFY_IRQ &lt;--+     |           +---------------+-------------+
+  +-----------------------+-----+                           | MSI-X
+                          '---- kernel irq.rs &lt;-------------'
+
+  clients ---- IPC (block / console protocol) ----&gt; driver
+</pre>
+<figcaption>What a driver task can reach</figcaption>
+</figure>
+
+<p>Drivers: <code>virtio-console</code>, <code>virtio-vsock</code> (one stream to host CID 2,
+port 5000) and <code>virtio-blk</code>, all on the shared <code>user/virtio</code> crate
+(virtio 1.x modern PCI, split virtqueues). A crashing driver is restarted by the supervisor; it
+resets the device and carries on, and its clients see <code>DEAD</code> and retry against the
+new id (<code>console-restart</code>, <code>blk-restart</code>).</p>
+
+<div class="admonition warning"><span class="label">Limit</span>
+<p>There is no IOMMU yet. A driver programs its device with physical addresses, so a malicious
+driver could make the device read or write any memory, kernel included. Driver tasks are
+isolated from mistakes (bad pointers, crashes, runaway loops), not from malice. Step 7 plans
+VT-d DMA remapping (<code>plans/step-7-iommu.md</code>).</p></div>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/src/pci.rs</code>, <code>kernel/src/pci_kinds.rs</code>, <code>kernel/src/irq.rs</code>, <code>user/virtio/</code>, <code>user/virtio-*/</code></dd>
+<dt>syscalls</dt><dd><code>device_bar</code>, <code>pci_config_read</code>, <code>dma_info</code>; <code>recv_flags(.., RECV_EXPECT_IRQ)</code></dd>
+<dt>tests</dt><dd><code>device-*</code>, <code>dma-*</code>, <code>console-*</code>, <code>blk-*</code></dd>
+</dl></div>
+
+<h2 id="telemetry"><span class="num">11</span>Telemetry<a class="anchor" href="#telemetry">#</a></h2>
+
+<p>The kernel logs events at its control points into a 128-entry ring: task start, exit, fault
+(vector, <code>rip</code>, <code>cr2</code>), CPU-budget kill, restart, refused IPC sends and
+rejected images. The task with <code>events = true</code> (<code>user/telemetry</code>)
+forwards them as newline-delimited JSON through the uplink driver, with a heartbeat every
+second, <code>log</code> lines from other tasks, and storage events.</p>
+
+<figure>
+<pre class="diagram">
+  kernel event ring --read_events--+
+  (128 entries, seq numbered)       |
+  supervisor --OP_LOG---------------+--&gt; telemetry --console write--&gt; uplink driver --&gt; host
+  disk (storage) --OP_STORAGE-------+     (JSON lines,                (virtio-console     |
+                                          heartbeat 1/s)               or virtio-vsock)    v
+                                                                       tools/host-agent.py
+</pre>
+<figcaption>The telemetry path</figcaption>
+</figure>
+
+<pre><code>{"seq":5,"t":1,"task":"crasher","id":"2","event":"fault","vector":14,"rip":"0x400182","cr2":"0x10"}
+{"seq":6,"t":2,"task":"crasher","id":"2.1","event":"restart","previous":"2"}
+{"t":3,"event":"log","from":"supervisor","msg":"giving up on task 2 after 3 restarts"}
+{"t":5,"event":"dropped","count":37}
+{"t":102,"event":"heartbeat","n":1,"frames":89,"irqs":3,"events":11,"tasks":[...]}</code></pre>
+
+<p><code>t</code> is in 10 ms ticks since boot; ids are <code>slot</code> or
+<code>slot.generation</code>. Kernel events carry <code>seq</code>; if the ring wraps before
+telemetry reads it, a <code>dropped</code> record says how many were lost. The uplink is the
+virtio console by default (QEMU writes it to <code>build/telemetry.log</code>), or vsock with
+<code>TRANSPORT=vsock</code> and an <code>uplink</code> task running
+<code>virtio-vsock</code>.</p>
+
+<pre><code>tools/host-agent.py build/telemetry.log            # console uplink
+tools/host-agent.py --listen-vsock 5000 &amp;          # vsock: listen first, then boot
+make run TRANSPORT=vsock ACCEL=kvm APP=tests/apps/telemetry-vsock.toml</code></pre>
+
+<p><code>host-agent.py</code> checks that every line is JSON with an <code>event</code>, that
+sequence gaps are covered by <code>dropped</code>, and heartbeat spacing;
+<code>--check</code> turns problems into the exit status and <code>--expect EVENT=N</code>
+requires counts.</p>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/src/events.rs</code>, <code>user/telemetry/src/main.rs</code> (<code>event_line</code>, <code>storage_line</code>), <code>tools/host-agent.py</code></dd>
+<dt>gotcha</dt><dd>telemetry never exits on its own; tests build it with <code>telemetry/exit-after-3-heartbeats</code> so the run can end</dd>
+<dt>gotcha</dt><dd>vsock needs <code>/dev/vhost-vsock</code> (the <code>kvm</code> group) and KVM</dd>
+</dl></div>
+
+<h2 id="boot-chain"><span class="num">12</span>Boot chain and attestation<a class="anchor" href="#boot-chain">#</a></h2>
+
+<p>With <code>BOOT=uefi-secure</code> every link checks the next before running it:</p>
+
+<figure>
+<pre class="diagram">
+  OVMF (Secure Boot on, snakeoil keys)
+    | checks sbsign signature on BOOTX64.EFI ............. refuses: sb-unsigned-loader
+    v                                       measures --&gt; PCR 0-7
+  Limine
+    | checks its own config hash (enroll-config) ......... refuses: sb-edited-config
+    | checks kernel BLAKE2b hash pinned in limine.conf .. refuses: sb-tampered-kernel
+    v
+  vanir kernel                              measures --&gt; PCR 12: kernel, manifest, tasks
+    | checks each task image: Ed25519 sig, name, version  refuses: sig-*
+    v
+  tasks (ring 3)
+    attest: TPM quote of PCR 0,4,7,12 over host nonce --&gt; host verifies --&gt; releases key
+</pre>
+<figcaption>Secure Boot, measured boot and attestation</figcaption>
+</figure>
+
+<p>Task images ship as boot modules beside the kernel, each with a <code>.sig</code> file
+(<code>VNRSIG01</code>, program name, version and SHA-256 of the ELF, signed with Ed25519). The
+kernel refuses an image that is unsigned, changed, signed for another program, signed by
+another key, or older than the manifest's <code>min_version</code>. A refused task never runs;
+the supervisor and telemetry are told why. Images can be updated without rebuilding the kernel,
+as long as they are signed.</p>
+
+<p><strong>Measured boot</strong> (<code>TPM=1</code>, swtpm): the firmware measures the boot
+loader and Secure Boot state into PCRs 0&ndash;7. Before any task runs, the kernel extends
+<strong>PCR 12</strong> with SHA-256 of the kernel file, of the app manifest, and of each
+task's signed statement (zeros for a refused image). <code>tools/expected-pcrs.py</code>
+computes PCR 12 from the build output alone.</p>
+
+<p><strong>Attestation</strong>: the <code>attest</code> task (<code>tpm = true</code>) holds
+an attestation key in the TPM (restricted ECDSA P-256 under the endorsement hierarchy). When
+the host sends <code>attest &lt;nonce&gt;</code> over the vsock uplink, <code>control</code>
+asks <code>attest</code>, which returns a TPM quote of PCRs 0, 4, 7 and 12.
+<code>tools/verify-quote.py</code> checks it is genuine TPM output, over this nonce, correctly
+signed, consistent with the reported PCRs and the kernel's measurement log, and equal to an
+approved reference.</p>
+
+<pre><code>make image BOOT=uefi-secure APP=tests/apps/attest.toml USER_FEATURES=control/one-shot
+tools/host-agent.py --listen-vsock 5000 --save build/telemetry.log --attest &amp;
+make run BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock APP=tests/apps/attest.toml USER_FEATURES=control/one-shot
+tools/verify-quote.py --record build/attest-reference.json \
+    --expected-pcr12 $(tools/expected-pcrs.py --app tests/apps/attest.toml)   # known-good boot
+tools/verify-quote.py --reference build/attest-reference.json                  # later boots</code></pre>
+
+<div class="admonition warning"><span class="label">What this does not prove yet</span>
+<ul>
+  <li><strong>Development keys.</strong> Secure Boot uses Debian's snakeoil keys, whose private
+    key is public, and the image key is a local dev key in <code>keys/</code>.</li>
+  <li><strong>Trust on first use.</strong> The attestation key isn't tied to the TPM's
+    endorsement certificate yet, so the verifier trusts the key recorded with the reference.</li>
+  <li><strong>Recorded firmware values.</strong> PCRs 0, 4 and 7 are compared with a recorded
+    known-good boot, not computed independently; only PCR 12 is.</li>
+  <li><strong>No IOMMU.</strong> A signed but malicious driver can still use DMA after
+    measurement.</li>
+</ul></div>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/src/verify.rs</code>, <code>kernel/src/measure.rs</code>, <code>kernel/src/tpm.rs</code>, <code>user/tpm2/</code>, <code>user/attest/</code>, <code>user/control/</code>, <code>tools/sign-image.py</code>, <code>tools/verify-quote.py</code>, <code>tools/vanir_attest.py</code>, <code>tools/expected-pcrs.py</code></dd>
+<dt>gotcha</dt><dd>Any change to the kernel, a manifest or a task image changes PCR 12; the <code>attest-record</code> and <code>attest-storage-record</code> cases re-record references, so run attestation cases in suite order</dd>
+<dt>gotcha</dt><dd>TPM state persists in <code>build/tpm</code>; delete it if the TPM reports lockout</dd>
+</dl></div>
+
+<h2 id="storage"><span class="num">13</span>Storage<a class="anchor" href="#storage">#</a></h2>
+
+<p><code>DISK=1</code> attaches <code>build/disk.img</code> (64 MiB, kept between runs) as a
+virtio block device. Three tasks share the work:</p>
+
+<figure>
+<pre class="diagram">
+  client-a ---+                                              +--&gt; keys   (key server)
+  client-b ---+--block IPC--&gt; disk (storage) --OP_MASTER_KEY-+
+              |  per-volume    |  encrypt / decrypt          '--&lt; attest (OP_UNLOCK, after
+              |  block numbers |  XChaCha20-Poly1305                 the host releases the key)
+              |                v
+              |           blockdev (virtio-blk) --DMA--&gt; disk image (ciphertext only)
+              x
+  only "disk" may send to "blockdev" (storage-no-driver)
+</pre>
+<figcaption>Storage tasks</figcaption>
+</figure>
+
+<table>
+<tr><th>Task</th><th>Program</th><th>Role</th></tr>
+<tr><td><code>blockdev</code></td><td><code>virtio-blk</code></td><td>the driver: reads and writes raw 4 KiB blocks; only <code>disk</code> may send to it</td></tr>
+<tr><td><code>disk</code></td><td><code>storage</code></td><td>gives every client its own encrypted volume</td></tr>
+<tr><td><code>keys</code> or <code>attest</code></td><td><code>unlocker</code>, <code>attest</code></td><td>hands <code>disk</code> the master key</td></tr>
+</table>
+
+<p>Clients send <code>disk</code> block requests (<code>vanir_user::block</code>: read, write,
+flush, info) with block numbers relative to their volume. There is no file system: a volume is
+256 numbered 4 KiB blocks (1 MiB). The volume is chosen by the client's manifest name, which
+the storage task gets from the kernel (<code>task_name</code> of the sender), so a client can
+neither name nor reach another task's volume. A task's first request creates its volume.</p>
+
+<h3 id="storage-format"><span class="num">13.1</span>On-disk format<a class="anchor" href="#storage-format">#</a></h3>
+
+<figure>
+<pre class="diagram">
+ block 0        superblock: "VNRSTOR2", next free block                 plain text
+ block 1        volume table: 64 x {name[32], start, size}              plain text
+ blocks 2..259  volume "client-a"
+                  +-- 2 metadata blocks: per data block {counter u64, tag[16]}
+                  '-- 256 data blocks:   XChaCha20-Poly1305 ciphertext
+ blocks 260..   volume "client-b" (same layout), in creation order ...
+</pre>
+<figcaption>Disk layout (4 KiB blocks)</figcaption>
+</figure>
+
+<p>Block <code>b</code> of a volume is encrypted with the volume key, nonce = <code>b</code>
+&#8214; counter, and associated data = volume name &#8214; <code>b</code> &#8214; counter. The
+counter goes up on every write, so a nonce is never reused. Ciphertext that was changed, moved
+to another block or volume, or paired with another counter fails to decrypt: the client gets
+<code>INTEGRITY</code> and telemetry an <code>integrity_error</code>. A block never written
+(counter 0) reads as zeros. A disk without the magic is formatted on first use.</p>
+
+<h3 id="storage-keys"><span class="num">13.2</span>Keys<a class="anchor" href="#storage-keys">#</a></h3>
+
+<figure>
+<pre class="diagram">
+  master key (32 bytes; only in disk's memory, never on the disk)
+     |
+     +-- HKDF-SHA256(salt "vanir-storage-v1", info "client-a") --&gt; volume key A
+     +-- HKDF-SHA256(salt "vanir-storage-v1", info "client-b") --&gt; volume key B
+                                                                     |
+                     per block: XChaCha20-Poly1305(key, nonce = block || counter,
+                                                   aad = name || block || counter)
+</pre>
+<figcaption>Key hierarchy</figcaption>
+</figure>
+
+<p>The storage task starts <strong>locked</strong>, answering <code>LOCKED</code> to every
+request until it has the master key. It gets it from one of two places:</p>
+<ul>
+  <li><strong>The key server</strong> (<code>keys</code>, <code>user/unlocker</code>): a test
+    stand-in for a local key store, with the key compiled in. If <code>disk</code> may send to
+    <code>keys</code>, it asks for the key when it starts. <code>keys</code> gives it only to
+    the task named <code>disk</code>.</li>
+  <li><strong>The host, after attestation</strong> (<code>tests/apps/attest-storage.toml</code>).
+    The key lives on the host (<code>keys/master.key</code>, made by <code>host-agent.py</code>,
+    never in the image).</li>
+</ul>
+
+<h3 id="storage-release"><span class="num">13.3</span>Key release<a class="anchor" href="#storage-release">#</a></h3>
+
+<figure>
+<pre class="diagram">
+  host-agent.py                       control         attest (TPM)                  disk
+       | ----------- "attest &lt;nonce&gt;" --&gt; |---- OP_QUOTE --&gt;|                         |
+       |                                  |                 | new X25519 pair         |
+       |                                  |                 | quote(PCR 0,4,7,12,     |
+       | &lt;-- quote JSON + kx_pub -------- |&lt;----------------|  SHA256(nonce||kx_pub)) |
+       |                                  |                 |                         |
+  verify quote vs reference;              |                 |                         |
+  mismatch -&gt; "key_refused", stop         |                 |                         |
+  seal: X25519(eph, kx_pub)               |                 |                         |
+    -&gt; HKDF(salt = nonce,                 |                 |                         |
+         "vanir key release")             |                 |                         |
+    -&gt; ChaCha20-Poly1305(                 |                 |                         |
+         master, aad = nonce)             |                 |                         |
+       | --- "key &lt;eph_pub||ct||tag&gt;" --&gt; |--- OP_UNWRAP --&gt;| open with kx secret     |
+       |                                  |                 |--- OP_UNLOCK(master) --&gt;| unlocked
+       | &lt;-- "unlocked" ----------------- |                 |                         |
+</pre>
+<figcaption>Attested key release</figcaption>
+</figure>
+
+<p>A boot that measures differently (a changed kernel, manifest or task image) gets no key, and
+the sealed key is useless to anything but that boot's <code>attest</code> task.
+<code>OP_UNLOCK</code> is accepted only from tasks named <code>keys</code> or
+<code>attest</code>.</p>
+
+<h3 id="storage-restarts"><span class="num">13.4</span>Restarts and events<a class="anchor" href="#storage-restarts">#</a></h3>
+
+<p>The supervisor restarts <code>disk</code> and <code>blockdev</code> like any task. A
+restarted <code>blockdev</code> resets the device; <code>disk</code> sees <code>DEAD</code>,
+finds the new driver and resends, keeping its key (<code>storage-blk-restart</code>). A
+restarted <code>disk</code> starts locked and must get the key again: from <code>keys</code> it
+asks for it itself (<code>storage-restart</code>); clients see <code>DEAD</code> and resend.</p>
+
+<p>If <code>disk</code> may send to <code>telemetry</code>, it reports:</p>
+<pre><code>{"t":6,"task":"disk","id":"3","event":"storage_locked"}
+{"t":6,"task":"disk","id":"3","event":"storage_unlocked","by":"keys"}
+{"t":7,"task":"disk","id":"3","event":"volume_created","volume":"client-a","start":2}
+{"t":9,"task":"disk","id":"3","event":"integrity_error","volume":"client-a","block":0}</code></pre>
+<p><code>task</code> comes from the kernel, so no other task can report storage events in
+<code>disk</code>'s name.</p>
+
+<pre><code>make run DISK=1 DISK_RESET=1 APP=tests/apps/storage.toml   # fresh disk: two clients write and check
+make run DISK=1 APP=tests/apps/storage.toml                # same disk: they find their data
+make run DISK=1 DISK_CORRUPT=client-a:0 APP=...            # flip a byte of client-a's block 0 first</code></pre>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>user/storage/src/main.rs</code>, <code>user/virtio-blk/</code>, <code>user/unlocker/</code>, <code>user/blktest/</code>, <code>block</code>/<code>keys</code>/<code>telemetry</code> modules in <code>user/lib/src/lib.rs</code>, <code>tools/corrupt-disk.py</code></dd>
+<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7</dd>
+<dt>constants</dt><dd><code>MAGIC "VNRSTOR2"</code>, <code>DATA_BLOCKS 256</code>, <code>META_BLOCKS 2</code>, <code>META_ENTRY 24</code>; changing the format needs a new magic and an update to <code>tools/corrupt-disk.py</code></dd>
+<dt>gotcha</dt><dd><code>storage-*</code> cases depend on the disk image the previous case left; <code>DISK_RESET=1</code> starts clean</dd>
+</dl></div>
+
+<h2 id="syscalls"><span class="num">14</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
+
+<p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
+r8, r9</code>; results in <code>rax</code> (then <code>rdx</code>, <code>rsi</code>). Simple
+calls return <code>u64::MAX</code> on error; IPC calls return the IPC error codes.</p>
+
+<table>
+<tr><th>Syscall</th><th>No.</th><th>Notes</th></tr>
+<tr><td><code>write(ptr, len)</code></td><td>1</td><td>to the serial port; bad pointers return an error</td></tr>
+<tr><td><code>sched_yield()</code></td><td>24</td><td>give up the rest of the time slice</td></tr>
+<tr><td><code>getpid()</code></td><td>39</td><td>task id: 1, 2, &hellip; in manifest order (generation in bits 16+)</td></tr>
+<tr><td><code>exit(code)</code></td><td>60</td><td></td></tr>
+<tr><td><code>send(target, op, msg, len, reply_buf, reply_cap)</code></td><td>100</td><td>&rarr; <code>(code, reply_len)</code></td></tr>
+<tr><td><code>recv(buf, cap)</code></td><td>101</td><td>&rarr; <code>(sender, op, len)</code>; sender 0 is the kernel</td></tr>
+<tr><td><code>reply(sender, code, buf, len)</code></td><td>102</td><td>never blocks</td></tr>
+<tr><td><code>restart(id)</code></td><td>103</td><td>supervisor only &rarr; new id</td></tr>
+<tr><td><code>task_state(id)</code></td><td>104</td><td>supervisor only &rarr; <code>(state, current id)</code></td></tr>
+<tr><td><code>lookup(name, len)</code></td><td>105</td><td>&rarr; id of the task with that manifest name</td></tr>
+<tr><td><code>sleep(ticks)</code></td><td>106</td><td>uses no CPU while waiting</td></tr>
+<tr><td><code>uptime()</code></td><td>107</td><td>ticks (10 ms) since boot</td></tr>
+<tr><td><code>task_name(id, buf, cap)</code></td><td>108</td><td>&rarr; length of the task's manifest name</td></tr>
+<tr><td><code>device_bar(device, bar)</code></td><td>110</td><td>&rarr; <code>(address, size)</code> of a granted device's mapped BAR</td></tr>
+<tr><td><code>pci_config_read(device, offset)</code></td><td>111</td><td>read-only, granted devices only</td></tr>
+<tr><td><code>dma_info()</code></td><td>112</td><td>&rarr; <code>(address, physical address, length)</code> of the DMA region</td></tr>
+<tr><td><code>read_events(buf, cap)</code></td><td>113</td><td>event reader only &rarr; <code>(count, dropped)</code></td></tr>
+<tr><td><code>stats(buf, cap)</code></td><td>114</td><td>event reader only: uptime, memory, interrupts, per-task state</td></tr>
+<tr><td><code>measurements(buf, cap)</code></td><td>115</td><td>TPM task only &rarr; <code>(count, TPM address)</code>; the boot measurement log</td></tr>
+</table>
+
+<p><code>recv</code> flags (in <code>rdx</code>): <code>RECV_EXPECT_IRQ</code> (1),
+<code>RECV_TIMEOUT</code> (2, ticks in <code>r10</code>; then sender 0,
+<code>NOTIFY_TIMER</code>). Kernel notifications come as sender 0 with op
+<code>NOTIFY_DEATH</code> (1, supervisor), <code>NOTIFY_IRQ</code> (2, drivers) or
+<code>NOTIFY_TIMER</code> (3).</p>
+
+<h2 id="protections"><span class="num">15</span>Protections<a class="anchor" href="#protections">#</a></h2>
+
+<table>
+<tr><th>Protection</th><th>What it stops</th><th>Test</th></tr>
+<tr><td>Supervisor-only kernel pages</td><td>user code reading kernel memory</td><td><code>poke-kernel</code></td></tr>
+<tr><td>SMAP (<code>stac</code>/<code>clac</code> around user copies, <code>clac</code> on every trap)</td><td>the kernel touching user memory by accident</td><td><code>smap</code></td></tr>
+<tr><td>SMEP</td><td>the kernel executing user pages</td><td>(enabled, no test)</td></tr>
+<tr><td>Fault-tolerant <code>copy_from_user</code></td><td>a bad syscall pointer crashing the kernel</td><td><code>bad-pointer</code></td></tr>
+<tr><td>NX on non-code pages</td><td>executing data or stack</td><td><code>exec-stack</code></td></tr>
+<tr><td>W^X segments, <code>CR0.WP</code></td><td>modifying code</td><td><code>write-code</code></td></tr>
+<tr><td>Registers zeroed before <code>iretq</code></td><td>kernel values leaking into ring 3</td><td>every run</td></tr>
+<tr><td>Page-table tree per process</td><td>processes reading or writing each other's memory</td><td><code>address-spaces</code></td></tr>
+<tr><td>Kill on fault, not halt</td><td>one process's crash stopping the others</td><td><code>fault-isolated</code></td></tr>
+<tr><td>Timer preemption</td><td>a process that never yields hogging the CPU</td><td><code>preemption</code></td></tr>
+<tr><td>CPU budgets</td><td>a runaway process running forever</td><td><code>cpu-budget</code></td></tr>
+<tr><td>IPC <code>sends</code> allowlist</td><td>tasks talking to services they weren't given</td><td><code>ipc-not-allowed</code></td></tr>
+<tr><td>Kernel-checked IPC copies</td><td>a bad buffer crashing the kernel or the server</td><td><code>ipc-bad-buffer</code></td></tr>
+<tr><td>Restart generations in task ids</td><td>clients silently reaching a restarted server</td><td><code>stale-id</code></td></tr>
+<tr><td>Device grants; MSI-X table not mapped</td><td>drivers touching other devices or redirecting interrupts</td><td><code>device-no-grant</code>, <code>device-msix</code></td></tr>
+<tr><td>Per-slot DMA regions, zeroed on restart</td><td>a dead driver's device scribbling on reused memory</td><td><code>dma-region</code></td></tr>
+<tr><td>Signed task images, <code>min_version</code></td><td>unsigned, modified, swapped or rolled-back programs</td><td><code>sig-*</code></td></tr>
+<tr><td>Secure Boot chain</td><td>a modified boot loader, config or kernel</td><td><code>sb-*</code></td></tr>
+<tr><td>Measured boot + TPM quotes</td><td>a host trusting a VM that booted something else</td><td><code>measured-*</code>, <code>attest-*</code></td></tr>
+<tr><td>Only the storage task may use the block driver</td><td>tasks reading the raw disk</td><td><code>storage-no-driver</code></td></tr>
+<tr><td>A volume per task, chosen by kernel-checked name</td><td>tasks reading or writing each other's data</td><td><code>storage-isolation</code></td></tr>
+<tr><td>Encryption at rest (XChaCha20-Poly1305)</td><td>plain text on the disk image</td><td><code>storage-at-rest</code></td></tr>
+<tr><td>Authenticated blocks, bound to volume, block and counter</td><td>changed or moved ciphertext read as data</td><td><code>storage-tampered</code>, <code>storage-bad-block</code></td></tr>
+<tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
+<tr><td>Key released only to an attested boot</td><td>a modified system getting the key</td><td><code>attest-unlock-refused</code></td></tr>
+<tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
+</table>
+
+<h2 id="limitations"><span class="num">16</span>Limitations<a class="anchor" href="#limitations">#</a></h2>
+
+<p>Stated plainly, in one place:</p>
+<ul>
+  <li><strong>No IOMMU.</strong> Driver tasks can point their devices at any memory, including
+    the storage task's key. Planned for step 7.</li>
+  <li><strong>No KPTI.</strong> The kernel and the physical-memory map are mapped
+    (supervisor-only) into every task. On Meltdown-affected CPUs (such as the development
+    host's i7-7500U) user code could read them.</li>
+  <li><strong>The hypervisor sees everything.</strong> Keys and plain text are in guest memory,
+    which the host can read. Protecting against the host needs AMD SEV-SNP or Intel TDX.</li>
+  <li><strong>Development keys and trust on first use</strong> in the boot chain
+    (<a href="#boot-chain">12</a>).</li>
+  <li><strong>No storage rollback protection.</strong> An older data block written back with its
+    older counter and tag still decrypts. Fixing it needs a root of freshness, e.g. a Merkle
+    root in TPM NV storage.</li>
+  <li><strong>Plain-text volume table.</strong> Task names, volume positions and which blocks
+    were ever written are visible; editing the table is a denial of service.</li>
+  <li><strong>Storage isn't crash-consistent.</strong> Data is written before its metadata; a
+    crash in between leaves that block failing its integrity check until rewritten. Nothing is
+    guaranteed durable before a flush.</li>
+  <li><strong>Fixed-size volumes.</strong> 256 blocks each; no <code>volume_blocks</code>
+    manifest key; volumes are never freed.</li>
+  <li><strong>One key release per boot.</strong> In the attested flow the host says
+    <code>bye</code> after releasing the key, so a <code>disk</code> restarted later stays
+    locked until the next boot.</li>
+  <li><strong>One CPU</strong>, no IPC priorities, messages copied (no memory lending).</li>
+</ul>
+
+<!-- ============================================================ WORKING ON IT -->
+<p class="part-title">Part three: working on vanir-os</p>
+
+<h2 id="agents"><span class="num">17</span>Agent quick reference<a class="anchor" href="#agents">#</a></h2>
+
+<p>Dense facts for coding agents (and people in a hurry). Every command runs from the
+repository root.</p>
+
+<div class="agent"><span class="label">Essentials</span><dl>
+<dt>language</dt><dd>stable Rust, <code>no_std</code>, target <code>x86_64-unknown-none</code> (set in <code>.cargo/config.toml</code>); no nightly features</dd>
+<dt>build</dt><dd><code>make image APP=&lt;manifest&gt; [VARS]</code> &mdash; builds user programs, signs them, builds the kernel with the manifest baked in, makes the ISO or ESP</dd>
+<dt>run</dt><dd><code>make run APP=tests/apps/&lt;name&gt;.toml [USER_FEATURES="pkg/feature ..."] [KERNEL_FEATURES=...]</code></dd>
+<dt>one test</dt><dd><code>ONLY='^storage-restart$' make test</code> (regex over case names)</dd>
+<dt>all tests</dt><dd><code>make test ACCEL=tcg &amp;&amp; make test ACCEL=kvm</code> &mdash; both must pass before committing</dd>
+<dt>pass/fail</dt><dd>a case passes when QEMU's exit status and the expected output both match; output is serial log + <code>build/telemetry.log</code> after a <code>--- build/telemetry.log ---</code> marker</dd>
+<dt>exit status</dt><dd>1 clean, 3 a task exited non-zero, 5 a task was killed, 7 kernel panic or supervisor died, 9 deadlock, 124 timeout</dd>
+<dt>new program</dt><dd>see <a href="#recipe-program">21.1</a>; must be in workspace <code>Cargo.toml</code> and Makefile <code>USER_PROGS</code></dd>
+<dt>secrets</dt><dd><code>keys/</code> (signing key, storage master key) and <code>build/</code> are git-ignored; never commit them</dd>
+<dt>serial log</dt><dd>kernel lines start <code>[kernel]</code>; tasks print <code>&lt;program&gt;: ...</code>; tests match these strings, so changing a message can break a test</dd>
+</dl></div>
+
+<h4>Where to change what</h4>
+<table>
+<tr><th>To change&hellip;</th><th>Edit</th><th>Then check</th></tr>
+<tr><td>a syscall</td><td><code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td>docs table <a href="#syscalls">14</a></td></tr>
+<tr><td>scheduling, budgets, IPC, restarts</td><td><code>kernel/src/process.rs</code></td><td><code>ONLY='^(ipc|supervisor|restart|stale|sleep|cpu|preemption)'</code></td></tr>
+<tr><td>page tables, frames</td><td><code>kernel/src/memory.rs</code></td><td><code>no-leak</code>, <code>restart-no-leak</code>, <code>address-spaces</code></td></tr>
+<tr><td>a manifest key</td><td><code>kernel/build.rs</code>, <code>Task</code> in <code>kernel/src/process.rs</code></td><td><code>apps/README.md</code>, docs <a href="#manifests">7</a></td></tr>
+<tr><td>a device kind</td><td><code>kernel/src/pci_kinds.rs</code>, QEMU flags in <code>Makefile</code></td><td><code>device-*</code></td></tr>
+<tr><td>a kernel event</td><td><code>kernel/src/events.rs</code>, <code>user/lib</code> <code>events</code>, <code>user/telemetry</code> <code>event_line</code></td><td><code>telemetry*</code></td></tr>
+<tr><td>supervisor policy</td><td><code>user/supervisor/src/main.rs</code></td><td><code>supervisor-*</code>, <code>*-restart</code></td></tr>
+<tr><td>image signing</td><td><code>tools/sign-image.py</code>, <code>kernel/src/verify.rs</code></td><td><code>sig-*</code></td></tr>
+<tr><td>measurements</td><td><code>kernel/src/measure.rs</code>, <code>tools/expected-pcrs.py</code> (keep in sync)</td><td><code>measured-*</code>, <code>attest-*</code></td></tr>
+<tr><td>storage format or crypto</td><td><code>user/storage</code>, <code>tools/corrupt-disk.py</code></td><td><code>ONLY='^(storage|blk|attest-)'</code></td></tr>
+<tr><td>host tooling</td><td><code>tools/*.py</code> (Python 3.11+, <code>cryptography</code>)</td><td>vsock/attest cases need KVM + kvm group</td></tr>
+</table>
+
+<h2 id="build"><span class="num">18</span>Build, run, test<a class="anchor" href="#build">#</a></h2>
+
+<pre><code>make                                  # build build/vanir-os.iso
+make run                              # boot in QEMU, serial output on the terminal
+make test                             # boot every scenario in tests/run.sh; PASS/FAIL each
+make test ACCEL=kvm                   # same, under KVM (needs /dev/kvm)
+ONLY='^storage' make test             # only cases whose names match
+make run APP=tests/apps/budget.toml   # choose the app manifest
+make run USER_FEATURES=hello/poke-kernel   # turn on a test feature
+make run-debug                        # also log interrupts and CPU resets to qemu.log
+make clean                            # remove build outputs (distclean also removes limine/)</code></pre>
+
+<h4>Make variables</h4>
+<table>
+<tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+<tr><td><code>APP</code></td><td><code>apps/default.toml</code></td><td>app manifest baked into the kernel</td></tr>
+<tr><td><code>USER_FEATURES</code></td><td></td><td>cargo features for user programs, <code>pkg/feature</code> space-separated</td></tr>
+<tr><td><code>KERNEL_FEATURES</code></td><td></td><td>cargo features for the kernel (e.g. <code>smap-selftest</code>)</td></tr>
+<tr><td><code>ACCEL</code></td><td><code>tcg</code></td><td><code>kvm</code> uses <code>-enable-kvm -cpu host</code></td></tr>
+<tr><td><code>BOOT</code></td><td><code>bios</code></td><td><code>uefi-secure</code>: OVMF with Secure Boot and the signed chain</td></tr>
+<tr><td><code>TPM</code></td><td></td><td><code>1</code>: swtpm (state in <code>build/tpm</code>) via <code>tools/with-swtpm.sh</code></td></tr>
+<tr><td><code>TRANSPORT</code></td><td><code>console</code></td><td><code>vsock</code> adds vhost-vsock (guest CID 3)</td></tr>
+<tr><td><code>DISK</code></td><td></td><td><code>1</code>: attach <code>build/disk.img</code> (64 MiB, persistent)</td></tr>
+<tr><td><code>DISK_RESET</code></td><td></td><td><code>1</code>: recreate the disk image from zeros</td></tr>
+<tr><td><code>DISK_CORRUPT</code></td><td></td><td><code>volume:block</code>: flip a byte of that data block before boot</td></tr>
+<tr><td><code>SIGN_VERSION</code></td><td><code>1</code></td><td>version signed into every task image</td></tr>
+<tr><td><code>SIGNING_KEY</code>, <code>TRUSTED_PUB</code></td><td><code>keys/dev-signing.*</code></td><td>key images are signed with / key compiled into the kernel</td></tr>
+<tr><td><code>TAMPER</code>, <code>UNSIGNED</code>, <code>SWAP_SIGS</code></td><td></td><td>signature tests: modify after signing, ship unsigned, swap <code>a:b</code></td></tr>
+<tr><td><code>SB_TAMPER_KERNEL</code>, <code>SB_EDIT_CONFIG</code>, <code>SB_UNSIGNED_LOADER</code></td><td></td><td>boot-chain tests</td></tr>
+</table>
+
+<p>Test-only settings in a case's variables column: <code>TIMEOUT=&lt;s&gt;</code> (default 60),
+<code>ATTEST=1</code> (host agent challenges the guest), <code>RELEASE=&lt;reference&gt;</code>
+(host agent releases <code>keys/master.key</code> if the quote matches).</p>
+
+<h4>Exit status</h4>
+<p>QEMU exits with <code>(code &lt;&lt; 1) | 1</code> through the <code>isa-debug-exit</code>
+device:</p>
+<table>
+<tr><th>Status</th><th>Meaning</th></tr>
+<tr><td>1</td><td>every process exited 0 (<code>make run</code> treats this as success)</td></tr>
+<tr><td>3</td><td>some process exited with a non-zero code</td></tr>
+<tr><td>5</td><td>some process was killed by a fault or its CPU budget</td></tr>
+<tr><td>7</td><td>kernel fault or panic, or the supervisor died</td></tr>
+<tr><td>9</td><td>deadlock: processes waiting on each other with nothing left to run</td></tr>
+<tr><td>124</td><td>timeout (from <code>timeout</code> in the test harness; expected for refused Secure Boot)</td></tr>
+</table>
+
+<h4>Test case format</h4>
+<p>Each row of <code>CASES</code> in <code>tests/run.sh</code>:</p>
+<pre><code>"name | app | user features | kernel features | make variables | expected status | expected text"</code></pre>
+<p>Expected text is a fixed string; with <code>re:</code>, a Perl regex over the whole output
+(<code>grep -Pz</code>, so <code>[\s\S]*</code> spans lines; use lookaheads for order-independent
+matches; avoid quotes); with <code>cmd:</code>, a shell command that reads the output on stdin
+and must succeed.</p>
+
+<h2 id="tests"><span class="num">19</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
+
+<p>70 cases, run in this order. Order matters: later cases reuse the disk image, TPM state and
+attestation references earlier ones leave behind.</p>
+<table>
+<tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
+<tr><td>isolation, faults</td><td><code>normal</code> <code>bad-pointer</code> <code>poke-kernel</code> <code>exec-stack</code> <code>write-code</code> <code>smap</code></td><td></td></tr>
+<tr><td>scheduling</td><td><code>timer-ticks</code> <code>preemption</code> <code>address-spaces</code> <code>cpu-budget</code> <code>no-leak</code> <code>fault-isolated</code></td><td></td></tr>
+<tr><td>IPC</td><td><code>ipc-echo</code> <code>ipc-queued</code> <code>ipc-bad-buffer</code> <code>ipc-not-allowed</code> <code>ipc-server-dies</code> <code>ipc-deadlock</code></td><td></td></tr>
+<tr><td>supervisor, sleep</td><td><code>supervisor-restart</code> <code>restart-no-leak</code> <code>stale-id</code> <code>sleep-idle</code> <code>sleep-busy</code></td><td></td></tr>
+<tr><td>devices</td><td><code>device-grant</code> <code>device-no-grant</code> <code>device-msix</code> <code>dma-region</code> <code>dma-none</code> <code>console-write</code> <code>console-restart</code></td><td></td></tr>
+<tr><td>telemetry</td><td><code>telemetry</code> <code>telemetry-flood</code> <code>telemetry-vsock</code></td><td>vsock: KVM + kvm group</td></tr>
+<tr><td>signatures</td><td><code>sig-tamper</code> <code>sig-unsigned</code> <code>sig-swapped</code> <code>sig-rogue-key</code> <code>sig-rollback</code> <code>sig-supervised</code></td><td></td></tr>
+<tr><td>Secure Boot</td><td><code>sb-boot</code> <code>sb-tampered-kernel</code> <code>sb-edited-config</code> <code>sb-unsigned-loader</code></td><td>KVM, OVMF</td></tr>
+<tr><td>measured boot, attestation</td><td><code>measured-boot</code> <code>measured-rejected</code> <code>no-tpm</code> <code>attest-record</code> <code>attest-verify</code> <code>attest-replay</code> <code>attest-tampered</code> <code>attest-other-version</code></td><td>KVM, swtpm, vsock</td></tr>
+<tr><td>block</td><td><code>blk-rw</code> <code>blk-persist</code> <code>blk-persist-negative</code> <code>blk-restart</code></td><td></td></tr>
+<tr><td>storage</td><td><code>storage-isolation</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
+<tr><td>key release</td><td><code>attest-storage-record</code> <code>attest-unlock</code> <code>attest-unlock-persist</code> <code>attest-unlock-refused</code></td><td>KVM, swtpm, vsock</td></tr>
+</table>
+<p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>
+isn't writable even through <code>sg kvm</code>.</p>
+
+<h2 id="repo-map"><span class="num">20</span>Repository map<a class="anchor" href="#repo-map">#</a></h2>
+
+<pre><code>kernel/build.rs           generates the task table from the app manifest
+kernel/linker.ld          higher half at 0xffffffff80000000, Limine request sections
+kernel/src/main.rs        Limine requests, kernel entry, halt/panic, banner
+kernel/src/cpu.rs         enables SMEP, SMAP, NX, CR0.WP
+kernel/src/apic.rs        local APIC timer (calibrated against the PIT), PIC remap
+kernel/src/serial.rs      COM1 serial output
+kernel/src/gdt.rs         GDT + TSS (kernel stack for ring 3 -&gt; 0 transitions)
+kernel/src/interrupts.rs  IDT and the shared trap entry path
+kernel/src/memory.rs      frame allocator, per-process page tables, kernel MMIO mappings
+kernel/src/elf.rs         ELF loader (per-segment permissions, W^X)
+kernel/src/usercopy.rs    copy_from_user with page-fault recovery
+kernel/src/process.rs     task table, scheduler, budgets, IPC, supervisor and device calls
+kernel/src/pci.rs         PCI discovery, BAR sizing, MSI-X (device kinds in pci_kinds.rs)
+kernel/src/irq.rs         device interrupts to task notifications
+kernel/src/events.rs      kernel event log
+kernel/src/modules.rs     task images and signatures as Limine boot modules
+kernel/src/verify.rs      Ed25519 task image signatures
+kernel/src/tpm.rs         TPM 2.0 (CRB): PCR extend/read, kernel use at boot only
+kernel/src/measure.rs     measured boot into PCR 12
+kernel/src/syscall.rs     int 0x80 dispatch
+user/lib/                 shared runtime: entry!, syscall wrappers, println!, block/keys/telemetry protocols
+user/hello/               greeting plus the attack tests (features)
+user/spinner/ isolation/ runaway/ sleeper/     scheduling and isolation tests
+user/echo/ client/ deadlock/                   IPC server, client, deadlock
+user/supervisor/ crasher/                      restart policy; a task that faults at once
+user/devprobe/ dmatest/                        device grant and DMA region tests
+user/virtio/              virtio 1.x PCI transport and split virtqueues
+user/virtio-console/      console driver; crash-after-50 test feature
+user/virtio-vsock/        vsock driver: one stream to host CID 2 port 5000
+user/virtio-blk/          block driver; crash-after-10 test feature
+user/chatter/             writes 200 numbered lines through the console driver
+user/telemetry/           event log + heartbeats + log/storage events -&gt; JSON lines -&gt; uplink
+user/tpm2/                TPM 2.0 client library: attestation key, quote, PCR read
+user/attest/              quotes; opens the released key and unlocks storage
+user/control/             host commands from the uplink (attest, key, bye)
+user/storage/             encrypted volume per task; crash-after-16 test feature
+user/blktest/             block client: writes, reads back and checks a pattern
+user/unlocker/            key server "keys" (test stand-in)
+apps/                     app manifests and their format (apps/README.md)
+tests/apps/               manifests the tests boot
+tests/run.sh              the test harness
+tools/host-agent.py       receives and checks telemetry; attests; releases the key
+tools/vanir_attest.py     quote checks and key sealing (shared)
+tools/verify-quote.py     verifies a TPM quote against a reference
+tools/expected-pcrs.py    computes PCR 12 from the build output
+tools/sign-image.py       makes the signing key; signs task images
+tools/with-swtpm.sh       runs QEMU with a software TPM
+tools/corrupt-disk.py     flips a byte of a volume's block in the disk image
+tools/check_lines.py      checks numbered lines arrived in order
+plans/, bench/            plans for future steps (not built)
+keys/                     signing key and storage master key (generated, git-ignored)
+docs/                     this manual (GitHub Pages) and llms.txt</code></pre>
+
+<h2 id="recipes"><span class="num">21</span>Recipes<a class="anchor" href="#recipes">#</a></h2>
+
+<h3 id="recipe-program"><span class="num">21.1</span>Add a user program<a class="anchor" href="#recipe-program">#</a></h3>
+<ol>
+  <li>Copy <code>user/hello/</code> to <code>user/&lt;name&gt;/</code> (keep <code>build.rs</code>: it
+    applies <code>user/linker.ld</code>). Rename the package and <code>[[bin]]</code>.</li>
+  <li>Write <code>src/main.rs</code>:
+<pre><code>#![no_std]
+#![no_main]
+
+use vanir_user::println;
+
+vanir_user::entry!(main);
+
+fn main() -&gt; u64 {
+    println!("&lt;name&gt;: hello");
+    0 // exit code
+}</code></pre></li>
+  <li>Add <code>"user/&lt;name&gt;"</code> to <code>members</code> in the root <code>Cargo.toml</code>
+    and <code>&lt;name&gt;</code> to <code>USER_PROGS</code> in the <code>Makefile</code>
+    (that also makes it a boot module and signs it).</li>
+  <li>Reference it from a manifest: <code>program = "&lt;name&gt;"</code>.</li>
+</ol>
+
+<h3 id="recipe-test"><span class="num">21.2</span>Add a test case<a class="anchor" href="#recipe-test">#</a></h3>
+<ol>
+  <li>Add a manifest in <code>tests/apps/</code> if no existing one fits.</li>
+  <li>Put test-only behaviour behind a cargo feature in the program's <code>Cargo.toml</code>,
+    with a comment saying what it tests.</li>
+  <li>Add a row to <code>CASES</code> in <code>tests/run.sh</code>, after the cases whose state
+    it depends on.</li>
+  <li>Run it alone (<code>ONLY='^name$' make test</code>), then break the protection on purpose
+    and confirm the case fails, then restore and run both full suites.</li>
+  <li>Add it to <a href="#tests">19</a> and, for a protection, <a href="#protections">15</a>.</li>
+</ol>
+
+<h3 id="recipe-syscall"><span class="num">21.3</span>Add a syscall<a class="anchor" href="#recipe-syscall">#</a></h3>
+<ol>
+  <li>Pick an unused number; add <code>SYS_&lt;NAME&gt;</code> to <code>kernel/src/syscall.rs</code>
+    and a <code>dispatch</code> arm.</li>
+  <li>Implement the handler (in <code>kernel/src/process.rs</code> if it touches the task table).
+    Read arguments from the <code>TrapFrame</code>; write results to <code>rax</code>/<code>rdx</code>/<code>rsi</code>.
+    Validate every user pointer with the address space's <code>check_range</code> and copy through
+    <code>usercopy</code>. Never block inside the handler: mark the task blocked and switch.</li>
+  <li>Add the same constant and a wrapper to <code>user/lib/src/lib.rs</code>.</li>
+  <li>Restrict privileged calls to the right task (as <code>restart</code> is supervisor-only)
+    and return <code>NOT_ALLOWED</code> otherwise.</li>
+  <li>Document it in <a href="#syscalls">14</a>.</li>
+</ol>
+
+<h3 id="recipe-event"><span class="num">21.4</span>Add a kernel or storage event<a class="anchor" href="#recipe-event">#</a></h3>
+<ol>
+  <li>Kernel event: a constant in <code>kernel/src/events.rs</code> (document what
+    <code>a</code>, <code>b</code>, <code>c</code> hold), <code>events::log(...)</code> at the
+    control point, the same constant in <code>user/lib</code> <code>events</code>, and a format
+    arm in <code>event_line</code> in <code>user/telemetry</code>.</li>
+  <li>Storage event: a kind constant in <code>user/lib</code> <code>telemetry</code>, a format
+    arm in <code>storage_line</code>, and <code>self.event(kind, block, name)</code> in
+    <code>user/storage</code>.</li>
+  <li>Check it with <code>tools/host-agent.py - --quiet --check --expect &lt;event&gt;=1</code>
+    in a <code>cmd:</code> test.</li>
+</ol>
+
+<h3 id="recipe-device"><span class="num">21.5</span>Add a device kind or driver<a class="anchor" href="#recipe-device">#</a></h3>
+<ol>
+  <li>Add <code>(name, vendor, &amp;[device ids])</code> to <code>KINDS</code> in
+    <code>kernel/src/pci_kinds.rs</code> (shared with <code>build.rs</code>, which validates
+    manifests).</li>
+  <li>Add the QEMU device to <code>QEMU_FLAGS</code> (behind a variable, as <code>DISK</code>
+    is) with <code>disable-legacy=on</code> for virtio.</li>
+  <li>Write the driver on <code>user/virtio</code>; take requests by IPC; handle
+    <code>NOTIFY_IRQ</code>; use <code>RECV_EXPECT_IRQ</code> while work is in flight.</li>
+  <li>Add a crash feature and a restart test, as <code>virtio-blk/crash-after-10</code>.</li>
+</ol>
+
+<h3 id="recipe-manifest"><span class="num">21.6</span>Add a manifest key<a class="anchor" href="#recipe-manifest">#</a></h3>
+<ol>
+  <li>Add it to <code>known</code> in <code>kernel/build.rs</code>, parse and validate it, and
+    emit it in the generated <code>Task</code> literal.</li>
+  <li>Add the field to <code>Task</code> in <code>kernel/src/process.rs</code>.</li>
+  <li>Document it in <code>apps/README.md</code> and <a href="#manifests">7</a>.</li>
+</ol>
+
+<h2 id="invariants"><span class="num">22</span>Invariants<a class="anchor" href="#invariants">#</a></h2>
+
+<p>Rules the code relies on. Breaking one is a bug even when the tests pass.</p>
+<ol>
+  <li><strong>Every commit passes the full suite under both TCG and KVM.</strong></li>
+  <li><strong>Stable Rust only.</strong> No nightly features or <code>-Z</code> flags.</li>
+  <li><strong>The kernel never blocks mid-syscall.</strong> Waiting means saving registers,
+    marking the task blocked, and writing results into its saved frame later.</li>
+  <li><strong>User pointers are untrusted.</strong> Range-checked and copied with fault recovery
+    under SMAP; never dereferenced directly.</li>
+  <li><strong>Identity comes from the kernel.</strong> Servers decide who a client is with
+    <code>task_name(sender)</code>, never from message contents.</li>
+  <li><strong>W^X everywhere.</strong> No mapping is both writable and executable.</li>
+  <li><strong>Mechanism in the kernel, policy in tasks.</strong> Restart decisions belong to the
+    supervisor; key decisions to <code>keys</code>/<code>attest</code>/the host.</li>
+  <li><strong>Default deny.</strong> No IPC without <code>sends</code>; no device without a grant;
+    storage locked until keyed.</li>
+  <li><strong>Secrets stay out of git and out of images.</strong> <code>keys/</code> is ignored;
+    the storage master key is never on the disk.</li>
+  <li><strong>Crypto uses the portable backends.</strong> The <code>--cfg</code> flags in
+    <code>.cargo/config.toml</code> select them; removing them makes rustc crash (SIGILL) on this
+    target.</li>
+  <li><strong>The measured set is the source of truth.</strong> Kernel, manifest and task
+    statements go into PCR 12; <code>tools/expected-pcrs.py</code> must compute the same value.</li>
+</ol>
+
+<h2 id="troubleshooting"><span class="num">23</span>Troubleshooting<a class="anchor" href="#troubleshooting">#</a></h2>
+
+<table>
+<tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+<tr><td>QEMU resets in a loop or exits at once</td><td>triple fault in early kernel code</td><td><code>make run-debug</code>, read <code>qemu.log</code> for the last exception</td></tr>
+<tr><td>Status 9 with "DEADLOCKED in send"</td><td>a send cycle, or a server that never replies</td><td>every <code>recv</code> path must <code>reply</code>; check <code>sends</code> for cycles</td></tr>
+<tr><td>Status 7 with <code>[kernel] PANIC</code></td><td>kernel bug or failed assertion; or the supervisor died</td><td>read the panic message and the last <code>[kernel]</code> lines</td></tr>
+<tr><td>rustc crashes with SIGILL building crypto</td><td>SIMD backends selected</td><td>keep the <code>poly1305_backend</code>/<code>chacha20_backend</code> cfg in <code>.cargo/config.toml</code></td></tr>
+<tr><td>vsock cases <code>SKIP</code> or "permission denied"</td><td>no access to <code>/dev/vhost-vsock</code></td><td>join the <code>kvm</code> group; older shells need <code>sg kvm</code> or a new login</td></tr>
+<tr><td>TPM errors after many killed runs</td><td>dictionary-attack lockout in swtpm state</td><td><code>rm -rf build/tpm</code></td></tr>
+<tr><td><code>attest-*</code> refuse after you changed code</td><td>PCR 12 changed; reference is stale</td><td>run the suite in order so <code>attest-record</code>/<code>attest-storage-record</code> re-record</td></tr>
+<tr><td><code>storage-*</code> fail with INTEGRITY or wrong contents</td><td>disk state from another case or manual run</td><td>start from <code>DISK_RESET=1</code> or run the cases in order</td></tr>
+<tr><td>Cases fail at random during a suite run</td><td>sources edited while the suite builds them</td><td>don't edit the tree during <code>make test</code></td></tr>
+<tr><td>Run never ends (timeout)</td><td>a task sleeps or waits forever (e.g. telemetry without <code>exit-after-3-heartbeats</code>)</td><td>make long-running tasks exit in tests or wait only in <code>recv</code></td></tr>
+<tr><td>"Limine base revision 3 not supported"</td><td>wrong Limine binaries</td><td><code>make distclean</code>; the Makefile fetches branch <code>v11.x-binary</code></td></tr>
+</table>
+
+<h2 id="dependencies"><span class="num">24</span>System dependencies<a class="anchor" href="#dependencies">#</a></h2>
+
+<table>
+<tr><th>Dependency</th><th>Used for</th><th>Debian/Ubuntu package</th></tr>
+<tr><td>Rust (stable) via <code>rustup</code></td><td>building kernel and user programs</td><td>&mdash;</td></tr>
+<tr><td><code>x86_64-unknown-none</code> target</td><td>bare-metal compilation</td><td>&mdash;</td></tr>
+<tr><td><code>make</code>, <code>git</code>, <code>cc</code></td><td>build; fetching and building the Limine host tool</td><td><code>make</code>, <code>git</code>, <code>gcc</code></td></tr>
+<tr><td><code>objcopy</code></td><td>stripping user ELFs</td><td><code>binutils</code></td></tr>
+<tr><td><code>xorriso</code></td><td>the bootable ISO</td><td><code>xorriso</code></td></tr>
+<tr><td><code>qemu-system-x86_64</code></td><td>running it (<code>-cpu max</code> or KVM)</td><td><code>qemu-system-x86</code></td></tr>
+<tr><td>Python 3.11+ with <code>cryptography</code></td><td>signing, quote verification, test tools</td><td><code>python3-cryptography</code></td></tr>
+<tr><td>OVMF</td><td>UEFI firmware for <code>BOOT=uefi-secure</code></td><td><code>ovmf</code></td></tr>
+<tr><td><code>sbsign</code>, <code>openssl</code>, <code>b2sum</code></td><td>signing the boot loader, pinning hashes</td><td><code>sbsigntool</code>, <code>openssl</code>, <code>coreutils</code></td></tr>
+<tr><td><code>swtpm</code></td><td>software TPM for <code>TPM=1</code></td><td><code>swtpm</code>, <code>swtpm-tools</code></td></tr>
+</table>
+
+<pre><code>sudo apt install make git gcc binutils xorriso qemu-system-x86
+sudo apt install python3-cryptography ovmf sbsigntool swtpm swtpm-tools   # boot chain, TPM
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh             # if Rust isn't installed
+rustup target add x86_64-unknown-none</code></pre>
+<p>Nightly Rust isn't required. Limine (branch <code>v11.x-binary</code>) is cloned into
+<code>limine/</code> on the first build.</p>
+
+<h2 id="glossary"><span class="num">25</span>Glossary<a class="anchor" href="#glossary">#</a></h2>
+
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>AEAD</td><td>authenticated encryption: encrypts and detects any change (XChaCha20-Poly1305, ChaCha20-Poly1305)</td></tr>
+<tr><td>BAR</td><td>base address register: where a PCI device's registers appear in memory</td></tr>
+<tr><td>CR3</td><td>the register holding the current page-table root</td></tr>
+<tr><td>DMA</td><td>a device reading or writing main memory by itself</td></tr>
+<tr><td>Generation</td><td>restart counter in a task id's upper bits; stale ids get <code>DEAD</code></td></tr>
+<tr><td>HHDM</td><td>Limine's higher-half direct map of physical memory</td></tr>
+<tr><td>HKDF</td><td>key derivation: turns one key into many independent keys</td></tr>
+<tr><td>IOMMU</td><td>hardware that restricts which memory each device can DMA to (Intel VT-d)</td></tr>
+<tr><td>Manifest</td><td>the TOML file that fixes the task set at build time</td></tr>
+<tr><td>MSI-X</td><td>interrupts delivered as memory writes, routed by the kernel</td></tr>
+<tr><td>PCR</td><td>TPM platform configuration register: a hash chain of measurements</td></tr>
+<tr><td>Quote</td><td>TPM-signed statement of PCR values over a caller's nonce</td></tr>
+<tr><td>Ring 0 / ring 3</td><td>x86 privilege levels: kernel / user</td></tr>
+<tr><td>SMAP / SMEP</td><td>CPU features stopping the kernel accessing / executing user pages</td></tr>
+<tr><td>TCG</td><td>QEMU's software CPU emulator (no KVM)</td></tr>
+<tr><td>TrapFrame</td><td>the saved registers of a task, pushed on every trap</td></tr>
+<tr><td>virtio</td><td>standard paravirtual device interface (queues of buffers in shared memory)</td></tr>
+<tr><td>W^X</td><td>write xor execute: a page is writable or executable, never both</td></tr>
+</table>
+
+</main>
+
+<script>
+// Highlight the current section in the table of contents; toggle it on narrow screens.
+(function () {
+  var toc = document.getElementById("toc");
+  var toggle = document.getElementById("toc-toggle");
+  toggle.addEventListener("click", function () {
+    var open = toc.classList.toggle("open");
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  var links = {};
+  toc.querySelectorAll('a[href^="#"]').forEach(function (a) { links[a.getAttribute("href").slice(1)] = a; });
+  if (!("IntersectionObserver" in window)) return;
+  var current = null;
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting && links[e.target.id]) {
+        if (current) current.classList.remove("active");
+        current = links[e.target.id];
+        current.classList.add("active");
+      }
+    });
+  }, { rootMargin: "0px 0px -75% 0px" });
+  document.querySelectorAll("main h2[id], main h3[id]").forEach(function (h) { observer.observe(h); });
+})();
+</script>
+</body>
+</html>

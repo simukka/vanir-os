@@ -1,0 +1,60 @@
+# vanir-os
+
+> Minimal x86-64 kernel in stable Rust, booted by Limine. A fixed set of ring-3 tasks (declared in a TOML app manifest at build time) talk by Hubris-style synchronous send/recv/reply IPC. Drivers (virtio console, vsock, block), a supervisor, telemetry, TPM attestation and encrypted storage are ordinary tasks. Full manual: index.html (one page; section anchors below).
+
+## Rules for agents
+
+- Every commit must pass `make test ACCEL=tcg` and `make test ACCEL=kvm` (70 cases each). Run one case with `ONLY='^name$' make test`.
+- Stable Rust only, `no_std`, target `x86_64-unknown-none`. Keep the soft-backend `--cfg` flags in `.cargo/config.toml` (SIMD crypto backends crash rustc with SIGILL).
+- Never commit `keys/` (image-signing key, storage master key) or `build/`.
+- The kernel never blocks mid-syscall; user pointers are always range-checked and copied with fault recovery; servers identify clients with `task_name(sender)`, never from message contents.
+- Test cases in `tests/run.sh` run in order and share state (disk image, TPM state, attestation references). Tests match serial-log strings, so changing a println can break a test.
+- Changing the kernel, a manifest or a task image changes PCR 12; the `attest-record` / `attest-storage-record` cases re-record references.
+- Don't edit sources while a test suite is running: each case builds from the working tree.
+
+## Commands
+
+- `make run APP=tests/apps/<name>.toml USER_FEATURES="pkg/feature ..." KERNEL_FEATURES=...`
+- Make variables: ACCEL=tcg|kvm, BOOT=bios|uefi-secure, TPM=1, TRANSPORT=console|vsock, DISK=1, DISK_RESET=1, DISK_CORRUPT=volume:block, SIGN_VERSION, TAMPER, UNSIGNED, SWAP_SIGS, SB_TAMPER_KERNEL, SB_EDIT_CONFIG, SB_UNSIGNED_LOADER
+- Exit status (QEMU isa-debug-exit): 1 clean, 3 a task exited non-zero, 5 a task was killed, 7 kernel panic or supervisor died, 9 deadlock, 124 timeout
+- Test row: `"name | app | user features | kernel features | make variables | status | text"`; text is a fixed string, `re:` (grep -Pz) or `cmd:` (shell, output on stdin)
+- `make run-debug` writes interrupts and CPU resets to qemu.log
+
+## Guide
+
+- [Introduction](index.html#introduction): what vanir-os is
+- [Quick start](index.html#quick-start)
+- [The layers, from scratch](index.html#layers): privilege, virtual memory, traps, tasks, devices, trust, for newcomers
+
+## Reference
+
+- [Boot](index.html#boot): kmain init order
+- [Memory and address spaces](index.html#memory): task address-space layout, PTE software bits
+- [Tasks and scheduling](index.html#tasks): states, preemption, budgets, outcomes
+- [App manifests](index.html#manifests): keys name, program, budget, supervisor, sends, devices, dma_pages, events, min_version, tpm; task names with meaning (uplink, telemetry, blockdev, disk, keys, attest)
+- [IPC](index.html#ipc): send/recv/reply, generations, error codes
+- [Supervisor](index.html#supervisor): death records, restart(id)
+- [Drivers](index.html#drivers): BARs, DMA regions, IRQ notifications
+- [Telemetry](index.html#telemetry): event ring, JSON line format, host-agent.py
+- [Boot chain and attestation](index.html#boot-chain): Secure Boot, signatures, PCR 12, quotes
+- [Storage](index.html#storage): on-disk format, key hierarchy, attested key release, restarts, storage events
+- [Syscalls](index.html#syscalls): numbers and ABI (int 0x80; rdi, rsi, rdx, r10, r8, r9)
+- [Protections](index.html#protections): each protection and the test proving it
+- [Limitations](index.html#limitations)
+
+## Working on vanir-os
+
+- [Agent quick reference](index.html#agents): where to change what
+- [Build, run, test](index.html#build): Make variables, exit status, test format
+- [Test catalogue](index.html#tests): all 70 cases by area and what they need
+- [Repository map](index.html#repo-map)
+- [Recipes](index.html#recipes): add a program, test, syscall, event, device, manifest key
+- [Invariants](index.html#invariants)
+- [Troubleshooting](index.html#troubleshooting)
+- [System dependencies](index.html#dependencies)
+
+## Optional
+
+- [apps/README.md](../apps/README.md): manifest format
+- [plans/step-7-iommu.md](../plans/step-7-iommu.md): next planned step (IOMMU)
+- [bench/PLAN.md](../bench/PLAN.md): benchmark plan
