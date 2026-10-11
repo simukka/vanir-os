@@ -513,6 +513,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "switcher"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
 name = "syn"
 version = "3.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

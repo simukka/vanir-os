@@ -311,6 +311,7 @@ class Http:
         self.pending = b""
         self.closed = False
         self.sent = self.received = 0  # bytes, for checking the guest's counters
+        self.served = 0
 
     def close(self):
         self.sock.close()
@@ -346,6 +347,7 @@ class Http:
         body, self.pending = self.pending[:length], self.pending[length:]
         if headers.get("connection", "").lower() == "close":
             self.closed = True
+        self.served += 1
         return status, headers, body.decode("latin-1")
 
 
@@ -493,6 +495,87 @@ def serve_a_while(args):
         time.sleep(0.05)
     say(f"{ok}/{n} GETs ok")
     return finish(ok == n)
+
+
+def wait_for_instance(name, deadline):
+    """Retry GETs until `name` answers one (the switcher makes it live)."""
+    while time.monotonic() < deadline:
+        try:
+            if get("/", timeout=2) == (200, f"hello from {name}\n"):
+                return True
+        except HttpError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+@scenario
+def swap_under_load(args):
+    """Eight keep-alive clients request without pause while the switcher makes web-2 live and
+    drains web-1. No request may fail, and each client must move from web-1 to web-2 for good."""
+    deadline = time.monotonic() + args.timeout - 5
+    if not wait_for_instance("web-1", deadline):
+        say("web-1 never answered")
+        return finish(False)
+    answers = [[] for _ in range(8)]
+    failures = []
+    stop = threading.Event()
+
+    def client(i):
+        c = None
+        while not stop.is_set() and time.monotonic() < deadline:
+            try:
+                if c is None:
+                    c = Http()
+                status, _, body = c.request("/")
+                if status == 200:
+                    answers[i].append(body.split()[-1])
+                else:
+                    failures.append(f"status {status}")
+                if c.closed:  # Connection: close (web-1 draining): reconnect
+                    c.close()
+                    c = None
+            except (HttpError, OSError) as e:
+                served = c.served if c else 0
+                last = answers[i][-1] if answers[i] else "none"
+                failures.append(f"{e} (client {i}, request {served + 1} on its connection, last answer from {last})")
+                c = None
+
+    threads = [threading.Thread(target=client, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    while time.monotonic() < deadline and not all(a.count("web-2") >= 50 for a in answers):
+        time.sleep(0.1)
+    stop.set()
+    for t in threads:
+        t.join()
+    moved = sum(1 for a in answers if "web-2" in a and "web-1" not in a[a.index("web-2"):])
+    total = sum(len(a) for a in answers)
+    say(f"{total} requests: {sum(a.count('web-1') for a in answers)} from web-1, {sum(a.count('web-2') for a in answers)} from web-2, {len(failures)} failed")
+    for f in failures[:5]:
+        say(f"failure: {f}")
+    say(f"clients that moved to web-2 for good: {moved}/8")
+    time.sleep(1)  # let the drain finish
+    return finish(not failures and moved == 8)
+
+
+@scenario
+def drain_deadline(args):
+    """Hold a connection to web-1 open without sending anything while it is drained: it is
+    reset at the drain's deadline."""
+    deadline = time.monotonic() + args.timeout - 5
+    if not wait_for_instance("web-1", deadline):
+        say("web-1 never answered")
+        return finish(False)
+    held = socket.create_connection(("127.0.0.1", NET_PORT), timeout=30)
+    start = time.monotonic()
+    try:
+        data = held.recv(4096)
+        how = "closed" if not data else f"answered {data[:20]!r}"
+    except OSError as e:
+        how = f"reset ({e.__class__.__name__})"
+    say(f"the held connection ended after {time.monotonic() - start:.1f} s: {how}")
+    return finish(wait_for_instance("web-2", deadline))
 
 
 class Echo:

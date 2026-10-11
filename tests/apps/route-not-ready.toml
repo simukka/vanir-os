@@ -1,0 +1,42 @@
+# An instance that never says it is ready can't be made live.
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic"]
+
+[[task]]
+name = "web-1"
+program = "http"
+service = "web"
+sends = ["net"]
+listen = [{ port = 80, max_connections = 64 }]
+
+[[task]]
+name = "web-2"
+program = "http"
+service = "web"
+sends = ["net"]
+listen = [{ port = 80, max_connections = 64 }]
+
+
+# Declares the port but never talks to net.
+[[task]]
+name = "web-idle"
+program = "echo"
+service = "web"
+listen = [{ port = 80 }]
+
+[[task]]
+name = "switcher"
+routes = true
+sends = ["net"]

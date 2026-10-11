@@ -9,8 +9,10 @@
 //! Every snapshot interval we send telemetry our request counters by status class and a
 //! latency histogram (from a request's first byte to its response, in fixed buckets).
 //!
-//! When `net` tells us to drain, we stop accepting, answer what is in flight with
-//! `Connection: close`, close idle connections, and say `OP_DONE` once none are left.
+//! When `net` tells us to drain, we stop accepting and answer each connection's next request
+//! with `Connection: close`, then say `OP_DONE` once none are left. Idle connections are left
+//! to their clients (closing one as its client sends a request would fail that request), or to
+//! the drain's deadline.
 
 #![no_std]
 #![no_main]
@@ -425,7 +427,7 @@ impl Server {
             if c.handle == 0 {
                 continue;
             }
-            let (started, out_len, len) = (c.started, c.out_len, c.len);
+            let (started, out_len) = (c.started, c.out_len);
             let deadline = match c.started {
                 Some(t) => t + HEADER_TICKS,
                 None => c.idle_since + IDLE_TICKS,
@@ -436,8 +438,6 @@ impl Server {
                     self.flush(i);
                 }
                 self.close(i);
-            } else if self.draining && started.is_none() && out_len == 0 && len == 0 {
-                self.close(i); // idle while draining: nothing in flight
             } else {
                 next = Some(next.map_or(deadline, |n| n.min(deadline)));
             }

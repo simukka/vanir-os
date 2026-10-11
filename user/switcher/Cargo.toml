@@ -1,0 +1,19 @@
+[package]
+name = "switcher"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "switcher"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# Each runs one script against the stack named "net" (see src/main.rs).
+script-swap = []
+script-drain-deadline = []
+script-not-ready = []
+script-not-allowed = []

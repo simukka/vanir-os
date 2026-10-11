@@ -14,6 +14,11 @@
 //!   checksums, and for each new connection the per-source cap, the port's connection cap and
 //!   its cap on half-open connections, which drops the oldest handshake first (smoltcp has no
 //!   SYN cookies).
+//! - Routing (RFD 1, P3, P4): each service has one live instance, which gets its new
+//!   connections; a task with `routes = true` changes it (`OP_ROUTE`, only to an instance that
+//!   said `OP_READY`) and drains instances (`OP_DRAIN`): no new connections, an `EV_DRAIN`,
+//!   and at the deadline a reset for what is still open (counted as `drain_forced`). The drain
+//!   is answered once the instance says `OP_DONE` and has no connections left.
 //! - Every table is fixed at build time: no heap.
 //!
 //! The same program runs the data stack (`net`, driver `nic`) and the management stack
@@ -160,11 +165,26 @@ struct Instance {
     /// Bumped when the entry is reused, for listener handles.
     generation: u16,
     ready: bool,
+    drain: Option<Drain>,
     /// Ports (bit per `ports` entry) it listens on.
     listening: u8,
     /// Its `OP_WAIT`, if one is held: (deadline tick).
     waiting: Option<Option<u64>>,
     counters: InstanceCounters,
+}
+
+/// An instance being drained.
+#[derive(Clone, Copy)]
+struct Drain {
+    /// Who asked; its `OP_DRAIN` is answered when the drain is over.
+    by: u64,
+    deadline: u64,
+    /// `EV_DRAIN` not yet delivered.
+    tell: bool,
+    /// The deadline passed and what was left got reset.
+    forced: bool,
+    /// The instance said `OP_DONE`.
+    done: bool,
 }
 
 /// Per instance, cumulative (a restarted task is a new instance and starts from zero).
@@ -330,6 +350,7 @@ impl Stack {
             generation: self.next_generation,
             ready: false,
             listening: 0,
+            drain: None,
             waiting: None,
             counters: InstanceCounters::default(),
         });
@@ -363,6 +384,10 @@ impl Stack {
             if matches!(self.slots[i].use_, Use::Owned { instance, .. } | Use::Pending { instance, .. } if instance as usize == k) {
                 self.reset(i, now);
             }
+        }
+        if let Some(d) = self.instances[k].unwrap().drain {
+            let forced = self.instances[k].unwrap().counters.drain_forced;
+            let _ = reply(d.by, CODE_OK, &forced.to_le_bytes()); // gone counts as drained
         }
         let instance = self.instances[k].take().unwrap();
         let service = self.services[instance.service as usize].as_mut().unwrap();
@@ -493,6 +518,12 @@ impl Stack {
                 push(Event { handle: connection_handle(i, self.slots[i].generation), flags });
             }
         }
+        if let Some(d) = self.instances[k].as_mut().unwrap().drain.as_mut()
+            && d.tell
+        {
+            d.tell = false;
+            push(Event { handle: 0, flags: EV_DRAIN });
+        }
         n
     }
 
@@ -513,9 +544,10 @@ impl Stack {
         }
     }
 
-    /// The earliest held `OP_WAIT` deadline.
+    /// The earliest held `OP_WAIT` or drain deadline.
     fn next_deadline(&self) -> Option<u64> {
-        self.instances.iter().flatten().filter_map(|i| i.waiting.flatten()).min()
+        let drains = self.instances.iter().flatten().filter_map(|i| i.drain.filter(|d| !d.forced).map(|d| d.deadline));
+        self.instances.iter().flatten().filter_map(|i| i.waiting.flatten()).chain(drains).min()
     }
 
     // ---- Requests ---------------------------------------------------------------------------
@@ -625,9 +657,10 @@ impl Stack {
                 if h & LISTENER != 0 && op == OP_CLOSE {
                     self.listener(sender, h).map(|(k, p)| {
                         self.instances[k].as_mut().unwrap().listening &= !(1 << p);
+                        // Connections it never accepted go to the live instance, if it listens.
                         for i in 0..SOCKETS {
                             if self.slots[i].use_ == (Use::Pending { port: p as u8, instance: k as u8 }) {
-                                self.reset(i, now);
+                                self.hand_out(i, p, now);
                             }
                         }
                         0
@@ -642,6 +675,31 @@ impl Stack {
                     })
                 }
             }
+            OP_ROUTE | OP_DRAIN => {
+                let routes = task_listen(sender).is_ok_and(|i| i.may_route());
+                let id = msg.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+                let ticks = msg.get(8..16).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+                match (routes, id, op) {
+                    (false, _, _) => {
+                        let mut name = [0u8; 32];
+                        println!("{}: {} may not route", self.name, task_name(sender, &mut name).unwrap_or("?"));
+                        Err(CODE_NOT_ALLOWED)
+                    }
+                    (_, None, _) | (_, _, OP_DRAIN) if ticks.is_none() => Err(CODE_BAD_OP),
+                    (_, Some(id), OP_ROUTE) => self.route(id),
+                    (_, Some(id), _) => return self.drain(sender, id, ticks.unwrap(), now),
+                    _ => Err(CODE_BAD_OP),
+                }
+            }
+            OP_DONE => match self.instance_of(sender) {
+                Some(k) => {
+                    if let Some(d) = self.instances[k].as_mut().unwrap().drain.as_mut() {
+                        d.done = true;
+                    }
+                    Ok(0)
+                }
+                None => Err(CODE_BAD_HANDLE),
+            },
             OP_BLOCK => {
                 let routes = task_listen(sender).is_ok_and(|i| i.may_route());
                 match msg.get(..16) {
@@ -683,6 +741,81 @@ impl Stack {
             Ok(n) => (CODE_OK, n),
             Err(code) => (code, 0),
         })
+    }
+
+    /// Make instance `id` its service's live instance.
+    fn route(&mut self, id: u64) -> Result<usize, u64> {
+        let mut name = [0u8; 32];
+        let instance = task_name(id, &mut name).unwrap_or("?");
+        let Some(k) = self.instance_of(id).filter(|&k| self.instances[k].unwrap().ready && self.instances[k].unwrap().drain.is_none()) else {
+            println!("{}: {} can't be made live: it hasn't said it is ready", self.name, instance);
+            return Err(CODE_NOT_READY);
+        };
+        let service = self.instances[k].unwrap().service as usize;
+        let previous = self.services[service].unwrap().live;
+        self.services[service].as_mut().unwrap().live = Some(k as u8);
+        println!("{}: {} is live for service {}", self.name, instance, self.name_of(service));
+        let mut previous_name = [0u8; 32];
+        let previous = previous.filter(|&p| p as usize != k).and_then(|p| self.instances[p as usize]);
+        let previous = previous.map_or("none", |p| task_name(p.id, &mut previous_name).unwrap_or("?"));
+        let mut r = Record::new("route_changed");
+        r.text("service", self.name_of(service)).text("live", instance).text("previous", previous);
+        self.event(&r);
+        Ok(0)
+    }
+
+    /// Start draining instance `id`; the reply to `by` waits until it is drained.
+    fn drain(&mut self, by: u64, id: u64, ticks: u64, now: u64) -> Option<(u64, usize)> {
+        let mut name = [0u8; 32];
+        let Some(k) = self.instance_of(id).filter(|&k| self.instances[k].unwrap().drain.is_none()) else {
+            return Some((CODE_BAD_HANDLE, 0));
+        };
+        let instance = self.instances[k].as_mut().unwrap();
+        instance.drain = Some(Drain { by, deadline: now + ticks, tell: true, forced: false, done: false });
+        let service = instance.service as usize;
+        if self.services[service].unwrap().live == Some(k as u8) {
+            self.services[service].as_mut().unwrap().live = None; // new connections get a reset
+        }
+        let instance = task_name(id, &mut name).unwrap_or("?");
+        println!("{}: draining {} (deadline in {} ticks)", self.name, instance, ticks);
+        let mut r = Record::new("drain_started");
+        r.text("instance", instance).num("deadline_ticks", ticks);
+        self.event(&r);
+        None
+    }
+
+    /// Move drains along: reset what is left at the deadline, and answer the drains that are
+    /// over (the instance is done and has no connections).
+    fn tend_drains(&mut self, now: u64) {
+        for k in 0..MAX_INSTANCES {
+            let Some(Instance { id, drain: Some(d), .. }) = self.instances[k] else { continue };
+            let mine = |u: Use| matches!(u, Use::Owned { instance, .. } | Use::Pending { instance, .. } if instance as usize == k);
+            if now >= d.deadline && !d.forced {
+                let mut forced = 0;
+                for i in 0..SOCKETS {
+                    if mine(self.slots[i].use_) && self.socket(i).state() != State::Closed {
+                        self.socket(i).abort();
+                        forced += 1;
+                    }
+                }
+                let instance = self.instances[k].as_mut().unwrap();
+                instance.counters.drain_forced += forced;
+                instance.drain.as_mut().unwrap().forced = true;
+            }
+            let open = (0..SOCKETS).any(|i| mine(self.slots[i].use_));
+            if d.done && !open {
+                let forced = self.instances[k].unwrap().counters.drain_forced;
+                self.instances[k].as_mut().unwrap().drain = None;
+                self.instances[k].as_mut().unwrap().listening = 0;
+                let _ = reply(d.by, CODE_OK, &forced.to_le_bytes());
+                let mut name = [0u8; 32];
+                let instance = task_name(id, &mut name).unwrap_or("?");
+                println!("{}: {} is drained ({} connections reset at the deadline)", self.name, instance, forced);
+                let mut r = Record::new("drained");
+                r.text("instance", instance).num("drain_forced", forced);
+                self.event(&r);
+            }
+        }
     }
 
     fn listen(&mut self, sender: u64, port: u16, now: u64) -> Result<u32, u64> {
@@ -969,6 +1102,22 @@ struct Gate<'a> {
 }
 
 impl Gate<'_> {
+    /// Set a free socket listening on port `p`.
+    fn listen_another(&mut self, p: usize, number: u16) -> bool {
+        for i in 0..SOCKETS {
+            if self.slots[i].use_ != Use::Free {
+                continue;
+            }
+            let s = self.sockets.get_mut::<tcp::Socket>(self.slots[i].handle);
+            if s.state() == State::Closed && s.remote_endpoint().is_none() && s.listen(number).is_ok() {
+                let slot = &mut self.slots[i];
+                (slot.use_, slot.since, slot.syn_since) = (Use::Listening { port: p as u8 }, self.now, None);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether a received frame goes on to smoltcp. Counts what smoltcp would drop without
     /// telling us, drops blocked sources, and applies the connection limits to each new
     /// connection before a socket takes it.
@@ -1031,16 +1180,21 @@ impl Gate<'_> {
             return false;
         }
         if listening <= self.promised[p] {
-            // No listening socket left for it: the oldest handshake makes room.
-            let Some((_, i)) = oldest else {
+            // No listening socket left for it: set another one listening while the port has
+            // room for handshakes, else the oldest handshake makes room.
+            let opened = half_open + self.promised[p] < HALF_OPEN && self.listen_another(p, port.number);
+            if opened {
+                // the new socket takes it
+            } else if let Some((_, i)) = oldest {
+                let s = self.sockets.get_mut::<tcp::Socket>(self.slots[i].handle);
+                s.abort();
+                let _ = s.listen(port.number);
+                self.slots[i].syn_since = None;
+                self.counters.half_open_dropped += 1;
+            } else {
                 self.counters.dropped_max_connections += 1;
                 return false;
-            };
-            let s = self.sockets.get_mut::<tcp::Socket>(self.slots[i].handle);
-            s.abort();
-            let _ = s.listen(port.number);
-            self.slots[i].syn_since = None;
-            self.counters.half_open_dropped += 1;
+            }
         }
         self.promised[p] += 1;
         true
@@ -1152,6 +1306,7 @@ fn main() -> u64 {
         stack.poll(now);
         stack.tend(now);
         stack.poll(now); // send what tending changed (RSTs)
+        stack.tend_drains(now);
         stack.serve_waiters(now);
         if receiving {
             let cycles = rdtsc() - start;
