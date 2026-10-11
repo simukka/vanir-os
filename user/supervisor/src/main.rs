@@ -1,6 +1,9 @@
 //! The supervisor: the kernel reports every task's death here, and this task decides what to do.
 //! Policy: a task that exited 0 is done; a task that faulted, exited non-zero or ran out of CPU
 //! budget is restarted, up to `MAX_RESTARTS` times, then left dead.
+//!
+//! With the `halt-on-exit` feature (for tests whose servers never go idle), the first task to
+//! exit, cleanly or not, stops the system.
 
 #![no_std]
 #![no_main]
@@ -30,7 +33,7 @@ fn report(telemetry: Option<u64>, args: core::fmt::Arguments) {
 
 fn main() -> u64 {
     let telemetry = lookup("telemetry").ok();
-    let mut restarts = [0u32; 16];
+    let mut restarts = [0u32; 17];
     let mut buf = [0u8; 256];
     loop {
         let m = match recv(&mut buf) {
@@ -52,6 +55,11 @@ fn main() -> u64 {
         let task = task_index(d.id) as usize;
         let count = &mut restarts[task];
         let verbose = *count < VERBOSE_RESTARTS || (*count + 1) % 500 == 0;
+        #[cfg(feature = "halt-on-exit")]
+        if d.kind == 1 {
+            println!("supervisor: task {} exited with code {}; stopping the system", task, d.code);
+            vanir_user::halt(d.code);
+        }
         match d.kind {
             1 if d.code == 0 => {
                 println!("supervisor: task {} exited cleanly", task);

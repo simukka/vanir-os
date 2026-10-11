@@ -5,4 +5,5 @@ pub const KINDS: &[(&str, u16, &[u16])] = &[
     ("virtio-console", 0x1af4, &[0x1043, 0x1003]),
     ("virtio-vsock", 0x1af4, &[0x1053]),
     ("virtio-blk", 0x1af4, &[0x1042, 0x1001]),
+    ("virtio-net", 0x1af4, &[0x1041, 0x1000]),
 ];

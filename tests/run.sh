@@ -8,6 +8,10 @@
 # Expected text is a fixed string; with an "re:" prefix, a Perl regex matched against the whole
 # output (so [\s\S]* can span lines and check ordering); with "cmd:", a shell command that gets
 # the output on stdin and must succeed. ONLY=<regex> runs just the cases whose names match.
+#
+# PEER=<scenario> in the make variables runs `tools/net-peer.py <scenario>` next to QEMU (it
+# talks to the guest over NET/NET_MGMT); its output is checked with the serial log, after a
+# "--- peer ---" line. SLOW=0 skips the cases marked SLOW=1 (floods, drains).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -84,6 +88,9 @@ CASES=(
   "attest-unlock         | attest-storage          |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock ATTEST=1 DISK=1 DISK_RESET=1 RELEASE=build/attest-storage-reference.json   | 1 | re:(?=[\s\S]*storage unlocked with the released key)(?=[\s\S]*client-a read back 32 blocks, all correct)[\s\S]*key_released"
   "attest-unlock-persist | attest-storage          |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock ATTEST=1 DISK=1 RELEASE=build/attest-storage-reference.json                | 1 | re:(?=[\s\S]*key_released)(?=[\s\S]*client-a found data from an earlier boot)[\s\S]*client-a read back 32 blocks, all correct"
   "attest-unlock-refused | attest-storage          |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock ATTEST=1 DISK=1 RELEASE=build/attest-storage-reference.json SIGN_VERSION=2 | 3 | re:(?=[\s\S]*the disk stayed LOCKED)[\s\S]*key_refused[^\n]*PCR 12"
+  "nic-arp-ping          | nic-echo                | supervisor/halt-on-exit                                   |               | NET=dgram PEER=arp-ping                                                                                                     | 1 | re:nictest: answered 20 pings \(driver restarted 0 times\)[\s\S]*peer: ARP reply: 52:54:00:00:00:01 \(the right MAC\)[\s\S]*peer: 20 pings answered of 20 sent; PASS"
+  "nic-restart           | nic-echo                | supervisor/halt-on-exit virtio-net/crash-after-10-frames  |               | NET=dgram PEER=arp-ping                                                                                                     | 1 | re:crashing after 10 frames[\s\S]*restarted task 2[\s\S]*answered 20 pings \(driver restarted 1 times\)[\s\S]*peer: 20 pings answered of [0-9]+ sent; PASS"
+  "nic-no-grant          | nic-no-grant            |                                                           |               | NET=dgram                                                                                                                   | 3 | re:pci 00:10\.0 1af4:1041 virtio-net[\s\S]*virtio-net: no device granted"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
@@ -95,6 +102,7 @@ for case in "${CASES[@]}"; do
   [[ "$name" =~ ${ONLY:-.} ]] || continue
   want_status=$(trim "$want_status"); want_text=$(trim "$want_text")
 
+  [[ "${SLOW:-1}" == 0 && " $env " == *" SLOW=1 "* ]] && { echo "SKIP $name: slow"; continue; }
   vars=(ACCEL="${ACCEL:-tcg}" $env)
   limit=60
   for v in $env; do [[ "$v" == TIMEOUT=* ]] && limit=${v#TIMEOUT=}; done
@@ -110,6 +118,13 @@ for case in "${CASES[@]}"; do
     echo "FAIL $name: build failed"; echo "$build_log"; failed=1; continue
   fi
   qemu=$(make -s qemu-cmd "${vars[@]}")
+  peer=""
+  for v in $env; do [[ "$v" == PEER=* ]] && peer=${v#PEER=}; done
+  if [ -n "$peer" ]; then
+    rm -f build/peer.log
+    tools/net-peer.py "$peer" --timeout "$limit" >build/peer.log 2>&1 &
+    peer_pid=$!
+  fi
   if [ ${#wrap[@]} -ne 0 ]; then
     rm -f build/telemetry.log
     agent_args=()
@@ -130,6 +145,12 @@ for case in "${CASES[@]}"; do
   # Firmware consoles (OVMF under BOOT=uefi-secure) position every character with escape codes;
   # match against plain text.
   out=$(sed 's/\x1b\[[0-9;:?=]*[A-Za-z]//g; s/\x1b[()][0-9A-Za-z]//g; s/\r//g' <<<"$out")
+  if [ -n "$peer" ]; then
+    # The peer finishes on its own once the guest is done; give it a moment, then stop it.
+    for _ in $(seq 50); do kill -0 $peer_pid 2>/dev/null || break; sleep 0.1; done
+    kill $peer_pid 2>/dev/null; wait $peer_pid 2>/dev/null
+    out+=$'\n--- peer ---\n'"$(cat build/peer.log)"
+  fi
   # What reached the host over the virtio console, for the checks below.
   out+=$'\n--- build/telemetry.log ---\n'"$(cat build/telemetry.log 2>/dev/null)"
 

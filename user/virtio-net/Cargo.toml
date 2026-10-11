@@ -1,0 +1,17 @@
+[package]
+name = "virtio-net"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "virtio-net"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+virtio = { path = "../virtio" }
+
+[features]
+# First start only: fault after receiving 10 frames (to test that a restart resets the device).
+crash-after-10-frames = []

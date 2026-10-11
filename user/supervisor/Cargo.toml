@@ -14,3 +14,5 @@ vanir-user = { path = "../lib" }
 [features]
 # restart a failing task up to 3000 times (memory-leak stress test)
 restart-3000 = []
+# stop the system when any task exits (tests whose servers never go idle)
+halt-on-exit = []

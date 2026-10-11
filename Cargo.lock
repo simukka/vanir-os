@@ -301,6 +301,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nictest"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
 name = "poly1305"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,6 +560,14 @@ dependencies = [
 
 [[package]]
 name = "virtio-console"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+ "virtio",
+]
+
+[[package]]
+name = "virtio-net"
 version = "0.1.0"
 dependencies = [
  "vanir-user",

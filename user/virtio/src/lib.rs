@@ -239,6 +239,8 @@ pub struct Queue {
 
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
+/// Avail ring flag: don't interrupt when requests complete.
+const AVAIL_NO_INTERRUPT: u16 = 1;
 
 impl Queue {
     /// Post a request made of `buffers` and tell the device. Returns the request's id (its
@@ -274,16 +276,32 @@ impl Queue {
         Some(head)
     }
 
-    /// A completed request: (id from `submit`, bytes the device wrote). Its descriptors return
-    /// to the free list.
-    pub fn take_used(&mut self) -> Option<(u16, u32)> {
+    /// The next completed request, without taking it: (id from `submit`, bytes written).
+    pub fn peek_used(&self) -> Option<(u16, u32)> {
         fence(Ordering::SeqCst);
         if mmio_read::<u16>(self.used + 2) == self.last_used {
             return None;
         }
         let slot = self.used + 4 + 8 * (self.last_used % self.size) as u64;
-        let id = mmio_read::<u32>(slot) as u16;
-        let len = mmio_read::<u32>(slot + 4);
+        Some((mmio_read::<u32>(slot) as u16, mmio_read::<u32>(slot + 4)))
+    }
+
+    /// Ask the device to interrupt (or not) when it completes requests. Only a hint: after
+    /// turning interrupts back on, check `peek_used` for completions that slipped in before.
+    pub fn set_interrupts(&mut self, on: bool) {
+        mmio_write::<u16>(self.avail, if on { 0 } else { AVAIL_NO_INTERRUPT });
+        fence(Ordering::SeqCst);
+    }
+
+    /// Requests the device has not completed yet.
+    pub fn in_flight(&self) -> u16 {
+        self.size - self.free_count
+    }
+
+    /// A completed request: (id from `submit`, bytes the device wrote). Its descriptors return
+    /// to the free list.
+    pub fn take_used(&mut self) -> Option<(u16, u32)> {
+        let (id, len) = self.peek_used()?;
         self.last_used = self.last_used.wrapping_add(1);
 
         // Return the chain to the free list.

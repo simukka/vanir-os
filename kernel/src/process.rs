@@ -146,6 +146,9 @@ pub const NOTIFY_IRQ: u64 = 2;
 pub const NOTIFY_TIMER: u64 = 3;
 /// `recv` flag (in rdx): give up after r10 ticks with a `NOTIFY_TIMER` notification.
 pub const RECV_TIMEOUT: u64 = 2;
+/// `recv` from sender 0 with this op: bits another task posted with `notify`; the length
+/// register holds them.
+pub const NOTIFY_POST: u64 = 4;
 
 /// `recv` flag (in rdx): this task has device work in flight and an interrupt will come, so the
 /// kernel should idle for it rather than conclude that nothing can ever run again.
@@ -171,6 +174,8 @@ struct Process {
     grants: Grants,
     /// While blocked in a `recv` with `RECV_TIMEOUT`: the tick it gives up.
     recv_deadline: Option<u64>,
+    /// Bits posted by other tasks with `notify`, not yet received.
+    posted: u64,
 }
 
 impl Process {
@@ -292,6 +297,7 @@ pub fn start(kernel_file: &[u8]) -> ! {
             death: Death::default(),
             grants,
             recv_deadline: None,
+            posted: 0,
         };
         match checked {
             Ok((version, _statement)) => {
@@ -314,7 +320,7 @@ pub fn start(kernel_file: &[u8]) -> ! {
     measure::boot(kernel_file, MANIFEST, &measured[..TASKS.len()]);
 
     let Some(first) = table.procs.iter().flatten().position(|p| p.state == State::Ready) else {
-        finish(&table) // every image was rejected
+        finish(&table, false) // every image was rejected
     };
     table.current = first;
     let first = table.current();
@@ -595,13 +601,13 @@ fn switch_to_next(table: &mut Table, frame: &mut TrapFrame) {
         // A blocked recv's flags are still in its saved registers.
         let awaiting_device = procs().any(|p| p.state == State::RecvBlocked && p.context.rdx & RECV_EXPECT_IRQ != 0);
         if !sleeping && !awaiting_device {
-            finish(table)
+            finish(table, false)
         }
         if !sleeping {
             let since = *table.stalled_since.get_or_insert(apic::now());
             if apic::now() - since >= STALL_TICKS {
                 println!("[kernel] no process has run for {} ticks while waiting on devices", STALL_TICKS);
-                finish(table)
+                finish(table, false)
             }
         }
         idle();
@@ -710,6 +716,13 @@ pub fn recv(frame: &mut TrapFrame) {
         frame.rsi = bits;
         return;
     }
+    let posted = core::mem::take(&mut table.current().posted);
+    if posted != 0 {
+        frame.rax = 0;
+        frame.rdx = NOTIFY_POST;
+        frame.rsi = posted;
+        return;
+    }
 
     for step in 1..=MAX_PROCESSES {
         let from = (me + step) % MAX_PROCESSES;
@@ -774,6 +787,42 @@ pub fn reply(frame: &mut TrapFrame) {
     client.state = State::Ready;
 }
 
+/// `notify(target, bits) -> 0`: post `bits` (not 0) to a task this one may send to, without
+/// waiting. They reach the target's next `recv` as sender 0, op `NOTIFY_POST`, ORed with any
+/// others not yet received. This is how a server tells a client that something is ready while
+/// only the client ever sends to the server, so the two can't deadlock sending to each other.
+pub fn notify(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let me = table.current;
+    let (target, bits) = (frame.rdi, frame.rsi);
+    let Some(to) = table.slot_of(target).filter(|&s| s != me) else {
+        frame.rax = err::BAD_TARGET;
+        return;
+    };
+    if !table.current().task.sends.contains(&to) {
+        events::log(events::IPC_REFUSED, table.current().id(), target, err::NOT_ALLOWED, 0);
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let peer = table.get(to);
+    if peer.state.is_dead() || peer.id() != target {
+        frame.rax = err::DEAD;
+        return;
+    }
+    if bits == 0 {
+        frame.rax = err::BAD_ARGUMENT;
+        return;
+    }
+    peer.posted |= bits;
+    if peer.state == State::RecvBlocked {
+        peer.context.rax = 0;
+        peer.context.rdx = NOTIFY_POST;
+        peer.context.rsi = core::mem::take(&mut peer.posted);
+        peer.state = State::Ready;
+    }
+    frame.rax = 0;
+}
+
 /// `lookup(name, len) -> id` of the task with that name, or BAD_TARGET.
 pub fn lookup(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
@@ -824,8 +873,23 @@ pub fn restart(frame: &mut TrapFrame) {
     p.state = State::Ready;
     p.ticks = 0;
     p.death = Death::default();
+    p.posted = 0;
     frame.rax = p.id();
     events::log(events::RESTART, p.id(), old_id, 0, 0);
+}
+
+/// `halt(code)`: stop the system now, reporting every task's state as when nothing can run.
+/// Supervisor only: it decides when a run is over (e.g. tests whose servers never go idle).
+pub fn halt(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if table.supervisor != Some(table.current) {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    println!("[kernel] the supervisor stopped the system (code {})", frame.rdi);
+    let current = table.current;
+    table.get(current).context = *frame;
+    finish(&table, true)
 }
 
 /// `task_state(id) -> (state, current id)`: 0 running or ready, 1 blocked in IPC, 2 exited,
@@ -1027,14 +1091,14 @@ pub fn task_name(frame: &mut TrapFrame) {
 
 // ---- The end ---------------------------------------------------------------------------------
 
-/// Nothing can run. If a process is still waiting on a send or a reply, nothing can ever wake
-/// it: that's a deadlock. Otherwise (everything ended, or only servers waiting in `recv`) the
-/// system is done.
+/// Nothing can run, or the supervisor stopped the system (`stopped`). If nothing can run and a
+/// process is still waiting on a send or a reply, nothing can ever wake it: that's a deadlock.
+/// Otherwise (everything ended, or only servers waiting in `recv`) the system is done.
 ///
 /// Exit status: 0 all clean, 1 some exited non-zero, 2 some were killed, 4 deadlock.
-fn finish(table: &Table) -> ! {
+fn finish(table: &Table, stopped: bool) -> ! {
     let mut status = 0;
-    println!("[kernel] no process can run:");
+    println!("[kernel] {}:", if stopped { "stopped" } else { "no process can run" });
     for p in table.procs.iter().flatten() {
         let outcome = match p.state {
             State::Exited(0) => "exited 0",
@@ -1055,10 +1119,12 @@ fn finish(table: &Table) -> ! {
                 "image rejected"
             }
             State::RecvBlocked => "waiting for messages",
+            State::SendBlocked(_) | State::ReplyBlocked(_) if stopped => "waiting in send",
             State::SendBlocked(_) | State::ReplyBlocked(_) => {
                 status = 4;
                 "DEADLOCKED in send"
             }
+            State::Ready | State::Running | State::Sleeping(_) if stopped => "running",
             State::Ready | State::Running | State::Sleeping(_) => unreachable!(),
         };
         println!("[kernel]   {}: {}, {} ticks", p.describe(), outcome, p.ticks);

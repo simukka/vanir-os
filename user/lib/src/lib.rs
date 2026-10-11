@@ -29,6 +29,8 @@ pub const SYS_DMA_INFO: u64 = 112;
 pub const SYS_READ_EVENTS: u64 = 113;
 pub const SYS_STATS: u64 = 114;
 pub const SYS_MEASUREMENTS: u64 = 115;
+pub const SYS_NOTIFY: u64 = 116;
+pub const SYS_HALT: u64 = 117;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -123,6 +125,16 @@ pub fn recv_flags(buf: &mut [u8], flags: u64) -> Result<Message, u64> {
 
 /// Kernel notification (sender 0) op: a `recv_timeout` expired.
 pub const NOTIFY_TIMER: u64 = 3;
+/// Kernel notification (sender 0) op: bits other tasks posted with `notify`; `Message::len`
+/// holds them.
+pub const NOTIFY_POST: u64 = 4;
+
+/// Post `bits` to task `target` (which must be in our `sends`) without waiting: it gets them
+/// in its next `recv` as op `NOTIFY_POST`. Fails like `send` (DEAD, NOT_ALLOWED, ...).
+pub fn notify(target: u64, bits: u64) -> Result<(), u64> {
+    let (status, _, _) = syscall6(SYS_NOTIFY, [target, bits, 0, 0, 0, 0]);
+    if status == 0 { Ok(()) } else { Err(status) }
+}
 /// `recv` flag: give up after a number of ticks with `NOTIFY_TIMER`.
 pub const RECV_TIMEOUT: u64 = 2;
 
@@ -172,6 +184,12 @@ impl DeathRecord {
 pub fn restart(id: u64) -> Result<u64, u64> {
     let (new_id, _, _) = syscall6(SYS_RESTART, [id, 0, 0, 0, 0, 0]);
     if err::is_error(new_id) { Err(new_id) } else { Ok(new_id) }
+}
+
+/// Supervisor only: stop the system, as if nothing could run any more (tests end this way when
+/// their servers never go idle). Returns only on error.
+pub fn halt(code: u64) -> u64 {
+    syscall6(SYS_HALT, [code, 0, 0, 0, 0, 0]).0
 }
 
 /// Supervisor only: (state, current id). State: 0 running/ready, 1 blocked in IPC, 2 exited,
@@ -296,6 +314,72 @@ pub mod block {
             CODE_INTEGRITY => "INTEGRITY",
             CODE_NOT_ALLOWED => "NOT_ALLOWED",
             _ => super::err::name(code),
+        }
+    }
+}
+
+/// The NIC driver's IPC interface (`user/virtio-net`): Ethernet frames in and out. The driver
+/// knows nothing about IP; its one client is the network stack task.
+pub mod nic {
+    /// Message: one Ethernet frame (14..=1514 bytes, no FCS). Replied once the device has it.
+    pub const OP_SEND_FRAME: u64 = 1;
+    /// Reply: the frames received so far, each a little-endian u16 length and then the frame,
+    /// as many as fit in 4 KiB. Never waits. If that empties the receive ring, the driver
+    /// re-enables its receive interrupt and posts `NOTIFY_RX` to the caller when the next frame
+    /// arrives; while frames keep coming the interrupt stays off and the caller polls (NAPI).
+    pub const OP_RECV_FRAMES: u64 = 2;
+    /// Reply: `Info`.
+    pub const OP_INFO: u64 = 3;
+
+    /// Bit posted to the receiving client when frames arrive.
+    pub const NOTIFY_RX: u64 = 1;
+
+    pub const CODE_OK: u64 = 0;
+    /// Every transmit buffer is in use; try again.
+    pub const CODE_BUSY: u64 = 1;
+    pub const CODE_BAD_OP: u64 = 2;
+    /// Not a frame we can send (too short or too long).
+    pub const CODE_BAD_FRAME: u64 = 3;
+
+    /// Largest frame: a 1500-byte payload and the 14-byte Ethernet header.
+    pub const MAX_FRAME: usize = 1514;
+
+    /// The interface's address and counters (cumulative since the driver started).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Info {
+        pub mac: [u8; 6],
+        pub link_up: u8,
+        pub _pad: u8,
+        pub rx_packets: u64,
+        pub rx_bytes: u64,
+        pub tx_packets: u64,
+        pub tx_bytes: u64,
+        /// Times the receive ring was found full: the device drops frames while it is.
+        pub rx_ring_full: u64,
+        /// Frames refused: too short, too long, or no transmit buffer free.
+        pub errors: u64,
+        pub rx_multicast: u64,
+        pub rx_broadcast: u64,
+    }
+
+    /// Call `f` with each frame of an `OP_RECV_FRAMES` reply.
+    pub fn frames(reply: &[u8], mut f: impl FnMut(&[u8])) {
+        let mut at = 0;
+        while at + 2 <= reply.len() {
+            let len = u16::from_le_bytes([reply[at], reply[at + 1]]) as usize;
+            let Some(frame) = reply.get(at + 2..at + 2 + len) else { return };
+            f(frame);
+            at += 2 + len;
+        }
+    }
+
+    pub fn info(driver: u64) -> Result<Info, u64> {
+        let mut out = [0u8; core::mem::size_of::<Info>()];
+        match super::send(driver, OP_INFO, &[], &mut out) {
+            Ok((CODE_OK, n)) if n == out.len() => Ok(unsafe { core::ptr::read_unaligned(out.as_ptr() as *const Info) }),
+            Ok((code, _)) => Err(code),
+            Err(e) => Err(e),
         }
     }
 }

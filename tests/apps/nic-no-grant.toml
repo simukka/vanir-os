@@ -1,0 +1,5 @@
+# The NIC driver's program without a device grant: it must get nothing.
+[[task]]
+name = "nic"
+program = "virtio-net"
+dma_pages = 20

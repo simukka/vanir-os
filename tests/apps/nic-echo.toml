@@ -1,0 +1,15 @@
+# The NIC driver and a test task that answers ARP and ping by hand (no network stack).
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["nictest"]   # NOTIFY_RX
+
+[[task]]
+name = "nictest"
+sends = ["nic"]

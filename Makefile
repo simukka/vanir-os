@@ -11,7 +11,7 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -58,12 +58,30 @@ DISK_RESET     :=
 DISK_CORRUPT   :=
 DISK_FLAGS     = $(if $(DISK),-drive file=build/disk.img$(,)if=none$(,)id=d0$(,)format=raw \
                    -device virtio-blk-pci$(,)drive=d0$(,)disable-legacy=on)
+# Networks. NET adds the data NIC and NET_MGMT the management NIC, each a virtio-net device at a
+# fixed PCI address (data first, so it is the first one a manifest claims):
+#   user   QEMU's NAT (slirp, with DHCP); host port NET_PORT (NET_MGMT_PORT) is forwarded to the
+#          guest's port 80 (7)
+#   dgram  raw Ethernet frames in UDP datagrams between QEMU (port NET_DGRAM_PORT, or
+#          NET_MGMT_DGRAM_PORT) and tools/net-peer.py (the next port up); static addresses
+NET            :=
+NET_MGMT       :=
+NET_PORT       := 8080
+NET_MGMT_PORT  := 8081
+NET_DGRAM_PORT := 18090
+NET_MGMT_DGRAM_PORT := 18092
+# $(call nic,backend,id,host port,guest port,dgram port,peer port,PCI address,MAC)
+nic            = $(if $(1),$(if $(filter user,$(1)),-netdev user$(,)id=$(2)$(,)hostfwd=tcp:127.0.0.1:$(3)-:$(4),\
+                   -netdev dgram$(,)id=$(2)$(,)local.type=inet$(,)local.host=127.0.0.1$(,)local.port=$(5)$(,)remote.type=inet$(,)remote.host=127.0.0.1$(,)remote.port=$(6)) \
+                   -device virtio-net-pci$(,)netdev=$(2)$(,)disable-legacy=on$(,)addr=$(7)$(,)mac=$(8))
+NET_FLAGS      = $(call nic,$(NET),data,$(NET_PORT),80,$(NET_DGRAM_PORT),$(shell echo $$(($(NET_DGRAM_PORT)+1))),0x10,52:54:00:00:00:01) \
+                 $(call nic,$(NET_MGMT),mgmt,$(NET_MGMT_PORT),7,$(NET_MGMT_DGRAM_PORT),$(shell echo $$(($(NET_MGMT_DGRAM_PORT)+1))),0x11,52:54:00:00:00:02)
 UEFI           := $(filter uefi-secure,$(BOOT))
 IMAGE          := $(if $(UEFI),esp,$(ISO))
 BOOT_FLAGS     := $(if $(UEFI),-M q35$(,)smm=on -global driver=cfi.pflash01$(,)property=secure$(,)value=on \
                     -drive if=pflash$(,)format=raw$(,)unit=0$(,)file=$(OVMF_CODE)$(,)readonly=on \
                     -drive if=pflash$(,)format=raw$(,)unit=1$(,)file=build/OVMF_VARS.fd \
-                    -drive format=raw$(,)file=fat:rw:build/esp -nic none -m 256M,-M q35 -cdrom $(ISO) -m 128M)
+                    -drive format=raw$(,)file=fat:rw:build/esp -nic none -m 256M,-M q35 -cdrom $(ISO) -nic none -m 128M)
 CPU_FLAGS      := $(if $(filter kvm,$(ACCEL)),-enable-kvm -cpu host,-cpu max)
 # The virtio console carries telemetry to the host (build/telemetry.log, or build/console.log when
 # vsock does); COM1 stays the boot log.
@@ -73,7 +91,7 @@ QEMU_FLAGS     := $(BOOT_FLAGS) $(CPU_FLAGS) -serial stdio -display none \
                   -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
                   -device virtio-serial-pci,id=vser,disable-legacy=on \
                   -chardev file,id=tel,path=$(CONSOLE_LOG) -device virtconsole,chardev=tel,bus=vser.0 \
-                  $(VSOCK_FLAGS) $(DISK_FLAGS)
+                  $(VSOCK_FLAGS) $(DISK_FLAGS) $(NET_FLAGS)
 
 USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(USER_FEATURES)")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
