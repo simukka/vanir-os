@@ -44,11 +44,24 @@ pub struct Task {
     /// Gets the TPM's registers mapped, and the measurement log (for attestation). The kernel
     /// itself uses the TPM only before tasks start.
     pub tpm: bool,
+    /// The network service this task is an instance of (default: its name).
+    pub service: &'static str,
+    /// TCP ports it may listen on; the network stack asks with `task_listen`.
+    pub listen: &'static [Listen],
+    /// May change the network stack's routing (live instances, drains, blocklist).
+    pub routes: bool,
+}
+
+/// A port a task may listen on, with its connection limits.
+pub struct Listen {
+    pub port: u16,
+    pub max_connections: u16,
+    pub max_per_source: u16,
 }
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
 
-pub const MAX_PROCESSES: usize = 8;
+pub const MAX_PROCESSES: usize = 16;
 const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
 /// 64 KiB: drivers and servers keep several 4 KiB block or message buffers on their stacks.
 const USER_STACK_PAGES: u64 = 16;
@@ -744,7 +757,14 @@ pub fn recv(frame: &mut TrapFrame) {
         frame.rsi = len;
         return;
     }
-    table.current().recv_deadline = (frame.rdx & RECV_TIMEOUT != 0).then(|| apic::now() + frame.r10.max(1));
+    if frame.rdx & RECV_TIMEOUT != 0 && frame.r10 == 0 {
+        // A timeout of 0 only polls: nothing is waiting, so the time is up already.
+        frame.rax = 0;
+        frame.rdx = NOTIFY_TIMER;
+        frame.rsi = 0;
+        return;
+    }
+    table.current().recv_deadline = (frame.rdx & RECV_TIMEOUT != 0).then(|| apic::now() + frame.r10);
     block(&mut table, frame, State::RecvBlocked);
 }
 
@@ -1085,6 +1105,44 @@ pub fn task_name(frame: &mut TrapFrame) {
     }
     match memory::copy_to_user_space(space, buf, name) {
         Ok(()) => frame.rax = name.len() as u64,
+        Err(_) => frame.rax = err::BAD_BUFFER,
+    }
+}
+
+/// What `task_listen` writes: a task's service, flags (bit 0: may route) and ports, each as
+/// (port, max_connections, max_per_source, 0).
+#[repr(C)]
+struct ListenInfo {
+    service: [u8; 32],
+    service_len: u64,
+    flags: u64,
+    count: u64,
+    ports: [[u16; 4]; 8],
+}
+
+/// `task_listen(id, buf, cap) -> bytes`: the network declarations of task `id` (any generation)
+/// from the manifest, as a `ListenInfo`. The network stack uses it to check who may listen
+/// where; the kernel vouches for it as it does for task names.
+pub fn task_listen(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let Some(slot) = table.slot_of(frame.rdi) else {
+        frame.rax = err::BAD_TARGET;
+        return;
+    };
+    let task = table.get(slot).task;
+    let mut info = ListenInfo { service: [0; 32], service_len: task.service.len() as u64, flags: task.routes as u64, count: 0, ports: [[0; 4]; 8] };
+    info.service[..task.service.len()].copy_from_slice(task.service.as_bytes());
+    for (out, l) in info.ports.iter_mut().zip(task.listen) {
+        *out = [l.port, l.max_connections, l.max_per_source, 0];
+        info.count += 1;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(&info as *const ListenInfo as *const u8, size_of::<ListenInfo>()) };
+    if frame.rdx < bytes.len() as u64 {
+        frame.rax = err::TOO_LONG;
+        return;
+    }
+    match memory::copy_to_user_space(table.current().space(), frame.rsi, bytes) {
+        Ok(()) => frame.rax = bytes.len() as u64,
         Err(_) => frame.rax = err::BAD_BUFFER,
     }
 }

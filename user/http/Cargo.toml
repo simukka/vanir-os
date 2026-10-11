@@ -1,0 +1,20 @@
+[package]
+name = "http"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "http"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# For tests: GET /exit answers, then the task exits (with the supervisor's halt-on-exit, the run ends).
+exit-on-request = []
+# First start only: fault after serving 50 requests.
+crash-after-50-requests = []
+# Try to listen on port 81 first (which no manifest declares), then on 80.
+listen-81 = []

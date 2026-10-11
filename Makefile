@@ -11,7 +11,7 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest net http
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -66,10 +66,10 @@ DISK_FLAGS     = $(if $(DISK),-drive file=build/disk.img$(,)if=none$(,)id=d0$(,)
 #          NET_MGMT_DGRAM_PORT) and tools/net-peer.py (the next port up); static addresses
 NET            :=
 NET_MGMT       :=
-NET_PORT       := 8080
-NET_MGMT_PORT  := 8081
-NET_DGRAM_PORT := 18090
-NET_MGMT_DGRAM_PORT := 18092
+NET_PORT       ?= 8080
+NET_MGMT_PORT  ?= 8081
+NET_DGRAM_PORT ?= 18090
+NET_MGMT_DGRAM_PORT ?= 18092
 # $(call nic,backend,id,host port,guest port,dgram port,peer port,PCI address,MAC)
 nic            = $(if $(1),$(if $(filter user,$(1)),-netdev user$(,)id=$(2)$(,)hostfwd=tcp:127.0.0.1:$(3)-:$(4),\
                    -netdev dgram$(,)id=$(2)$(,)local.type=inet$(,)local.host=127.0.0.1$(,)local.port=$(5)$(,)remote.type=inet$(,)remote.host=127.0.0.1$(,)remote.port=$(6)) \

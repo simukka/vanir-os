@@ -1,0 +1,21 @@
+# An HTTP service behind the network stack: driver, stack, service, each its own task.
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]       # NOTIFY_RX
+
+[[task]]
+name = "net"
+sends = ["nic"]
+
+[[task]]
+name = "web"
+program = "http"
+sends = ["net"]
+listen = [{ port = 80, max_connections = 64 }]

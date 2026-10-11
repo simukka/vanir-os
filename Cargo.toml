@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "user/lib", "user/hello", "user/spinner", "user/isolation", "user/runaway", "user/echo", "user/client", "user/deadlock", "user/supervisor", "user/crasher", "user/sleeper", "user/devprobe", "user/dmatest", "user/virtio", "user/virtio-console", "user/chatter", "user/telemetry", "user/virtio-vsock", "user/tpm2", "user/attest", "user/control", "user/virtio-blk", "user/blktest", "user/storage", "user/unlocker", "user/virtio-net", "user/nictest"]
+members = ["kernel", "user/lib", "user/hello", "user/spinner", "user/isolation", "user/runaway", "user/echo", "user/client", "user/deadlock", "user/supervisor", "user/crasher", "user/sleeper", "user/devprobe", "user/dmatest", "user/virtio", "user/virtio-console", "user/chatter", "user/telemetry", "user/virtio-vsock", "user/tpm2", "user/attest", "user/control", "user/virtio-blk", "user/blktest", "user/storage", "user/unlocker", "user/virtio-net", "user/nictest", "user/net", "user/http"]
 
 [profile.dev]
 panic = "abort"

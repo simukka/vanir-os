@@ -150,6 +150,152 @@ def arp_ping(args):
     return 0 if ok else 1
 
 
+class HttpError(Exception):
+    pass
+
+
+class Http:
+    """A minimal HTTP/1.1 client over one TCP connection (so tests see exactly what happens)."""
+
+    def __init__(self, port=NET_PORT, timeout=3.0):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.pending = b""
+        self.closed = False
+
+    def close(self):
+        self.sock.close()
+
+    def _fill(self):
+        data = self.sock.recv(65536)
+        if not data:
+            raise HttpError("connection closed")
+        self.pending += data
+
+    def request(self, path="/", keep_alive=True, method="GET", extra=b""):
+        """(status, headers, body); the connection is closed after if the server said so."""
+        conn = b"keep-alive" if keep_alive else b"close"
+        try:
+            self.sock.sendall(f"{method} {path} HTTP/1.1\r\nHost: vanir\r\n".encode() + b"Connection: " + conn + b"\r\n" + extra + b"\r\n")
+            while b"\r\n\r\n" not in self.pending:
+                self._fill()
+        except OSError as e:
+            raise HttpError(str(e)) from e
+        head, self.pending = self.pending.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        status = int(lines[0].split()[1])
+        headers = {k.strip().lower(): v.strip() for k, v in (line.split(":", 1) for line in lines[1:])}
+        length = int(headers.get("content-length", 0)) if method != "HEAD" else 0
+        try:
+            while len(self.pending) < length:
+                self._fill()
+        except OSError as e:
+            raise HttpError(str(e)) from e
+        body, self.pending = self.pending[:length], self.pending[length:]
+        if headers.get("connection", "").lower() == "close":
+            self.closed = True
+        return status, headers, body.decode("latin-1")
+
+
+def get(path="/", port=NET_PORT, timeout=3.0):
+    """One request on a new connection: (status, body), or raises HttpError."""
+    try:
+        c = Http(port, timeout)
+    except OSError as e:
+        raise HttpError(str(e)) from e
+    try:
+        status, _, body = c.request(path, keep_alive=False)
+        return status, body
+    finally:
+        c.close()
+
+
+def wait_ready(deadline, port=NET_PORT, path="/"):
+    """Retry GETs until the guest answers one; returns the body, or None."""
+    while time.monotonic() < deadline:
+        try:
+            status, body = get(path, port, timeout=2)
+            if status == 200:
+                return body
+        except HttpError:
+            pass
+        time.sleep(0.2)
+    return None
+
+
+def finish(ok, port=NET_PORT):
+    """Ask the HTTP task to exit (exit-on-request), ending the run; say how it went."""
+    try:
+        get("/exit", port, timeout=2)
+    except HttpError:
+        pass
+    say("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+@scenario
+def http_get(args):
+    """100 GETs over one keep-alive connection, then 100 over new connections."""
+    deadline = time.monotonic() + args.timeout
+    body = wait_ready(deadline)
+    if body is None:
+        say("the guest never answered")
+        return finish(False)
+    say(f"first answer: {body.strip()!r}")
+    want = "hello from web\n"
+    ok = 0
+    start = time.monotonic()
+    c = Http()
+    for _ in range(100):
+        try:
+            status, headers, body = c.request("/")
+            ok += status == 200 and body == want and headers.get("connection") == "keep-alive"
+        except HttpError as e:
+            say(f"keep-alive request failed: {e}")
+            break
+    c.close()
+    rate = ok / (time.monotonic() - start)
+    say(f"keep-alive: {ok}/100 ok ({rate:.0f} requests/s)")
+    fresh = 0
+    start = time.monotonic()
+    for _ in range(100):
+        try:
+            status, body = get("/")
+            fresh += status == 200 and body == want
+        except HttpError as e:
+            say(f"request on a new connection failed: {e}")
+    rate = fresh / (time.monotonic() - start)
+    say(f"new connections: {fresh}/100 ok ({rate:.0f} requests/s)")
+    return finish(ok == 100 and fresh == 100)
+
+
+@scenario
+def http_restart(args):
+    """GETs on new connections while the guest restarts net or the HTTP task: the requests in
+    flight at the crash may fail, the ones after must not."""
+    deadline = time.monotonic() + args.timeout
+    if wait_ready(deadline) is None:
+        say("the guest never answered")
+        return finish(False)
+    results = []
+    while len(results) < 400 and time.monotonic() < deadline - 5:
+        try:
+            status, _ = get("/", timeout=2)
+            results.append(status == 200)
+        except HttpError:
+            results.append(False)
+            time.sleep(0.1)
+        if len(results) >= 150 and all(results[-50:]):
+            break
+    failed = results.count(False)
+    first_failure = results.index(False) if False in results else None
+    after = results[first_failure:] if first_failure is not None else []
+    say(f"{results.count(True)} requests ok, {failed} failed")
+    if first_failure is not None:
+        say(f"first failure at request {first_failure + 1}; the last 50 all ok: {all(results[-50:])}")
+    return finish(failed > 0 and len(after) > 50 and all(results[-50:]))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("scenario", choices=sorted(SCENARIOS))

@@ -27,6 +27,7 @@ pub const SYS_STATS: u64 = 114;
 pub const SYS_MEASUREMENTS: u64 = 115;
 pub const SYS_NOTIFY: u64 = 116;
 pub const SYS_HALT: u64 = 117;
+pub const SYS_TASK_LISTEN: u64 = 118;
 
 const ERROR: u64 = u64::MAX;
 
@@ -54,6 +55,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_RESTART => process::restart(frame),
         SYS_NOTIFY => process::notify(frame),
         SYS_HALT => process::halt(frame),
+        SYS_TASK_LISTEN => process::task_listen(frame),
         SYS_TASK_STATE => process::task_state(frame),
         _ => frame.rax = ERROR,
     }

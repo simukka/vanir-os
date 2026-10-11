@@ -91,11 +91,32 @@ CASES=(
   "nic-arp-ping          | nic-echo                | supervisor/halt-on-exit                                   |               | NET=dgram PEER=arp-ping                                                                                                     | 1 | re:nictest: answered 20 pings \(driver restarted 0 times\)[\s\S]*peer: ARP reply: 52:54:00:00:00:01 \(the right MAC\)[\s\S]*peer: 20 pings answered of 20 sent; PASS"
   "nic-restart           | nic-echo                | supervisor/halt-on-exit virtio-net/crash-after-10-frames  |               | NET=dgram PEER=arp-ping                                                                                                     | 1 | re:crashing after 10 frames[\s\S]*restarted task 2[\s\S]*answered 20 pings \(driver restarted 1 times\)[\s\S]*peer: 20 pings answered of [0-9]+ sent; PASS"
   "nic-no-grant          | nic-no-grant            |                                                           |               | NET=dgram                                                                                                                   | 3 | re:pci 00:10\.0 1af4:1041 virtio-net[\s\S]*virtio-net: no device granted"
+  "http-get              | http                    | supervisor/halt-on-exit http/exit-on-request              |               | NET=user PEER=http-get                                                                                                      | 1 | re:net: address 10\.0\.2\.15/24 from DHCP[\s\S]*web: serving HTTP on port 80[\s\S]*peer: keep-alive: 100/100 ok[\s\S]*peer: new connections: 100/100 ok[\s\S]*peer: PASS"
+  "http-undeclared-port  | http                    | supervisor/halt-on-exit http/exit-on-request http/listen-81 |               | NET=user PEER=http-get                                                                                                      | 1 | re:net: web may not listen on port 81: not in its manifest entry[\s\S]*web: listen on port 81 refused: NOT_ALLOWED[\s\S]*peer: new connections: 100/100 ok[\s\S]*peer: PASS"
+  "net-restart           | http                    | supervisor/halt-on-exit http/exit-on-request net/crash-after-50-connections |               | NET=user PEER=http-restart                                                                                                  | 1 | re:(?=[\s\S]*restarted task 3 )(?=[\s\S]*web: the network stack was restarted)net: crashing after handing out 50 connections[\s\S]*peer: first failure at request [0-9]+; the last 50 all ok: True[\s\S]*peer: PASS"
+  "http-restart          | http                    | supervisor/halt-on-exit http/exit-on-request http/crash-after-50-requests |               | NET=user PEER=http-restart                                                                                                  | 1 | re:web: crashing after 50 requests[\s\S]*restarted task 4[\s\S]*net: instance web is gone[\s\S]*peer: first failure at request [0-9]+; the last 50 all ok: True[\s\S]*peer: PASS"
+)
+
+# Manifests that must not build: app | text the build error must contain.
+BUILD_FAILS=(
+  "http-port-clash | port 80 is declared by web (service web) and other (service other)"
 )
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
 
 failed=0
+for case in "${BUILD_FAILS[@]}"; do
+  IFS='|' read -r app want <<<"$case"
+  app=$(trim "$app"); want=$(trim "$want")
+  [[ "build-$app" =~ ${ONLY:-.} ]] || continue
+  if build_log=$(make -s kernel APP="tests/apps/$app.toml" 2>&1); then
+    echo "FAIL build-$app: the manifest built"; failed=1
+  elif grep -qF -- "$want" <<<"$build_log"; then
+    echo "PASS build-$app (refused)"
+  else
+    echo "FAIL build-$app: refused, but without: $want"; tail -5 <<<"$build_log" | sed 's/^/    /'; failed=1
+  fi
+done
 for case in "${CASES[@]}"; do
   IFS='|' read -r name app user kernel env want_status want_text <<<"$case"
   name=$(trim "$name"); app=$(trim "$app"); env=$(trim "$env"); user=$(trim "$user"); kernel=$(trim "$kernel")

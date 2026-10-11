@@ -35,11 +35,16 @@ fn main() {
     let mut supervisors = 0;
     let mut readers = 0;
     let mut tpm_users = 0;
+    // (port, task, service) for every listen declaration so far.
+    let mut ports: Vec<(u16, String, String)> = vec![];
     let mut out = String::from("pub static TASKS: &[Task] = &[\n");
     for (task, name) in tasks.iter().zip(&names) {
         let task = task.as_table().unwrap();
         for key in task.keys() {
-            let known = ["name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events", "min_version", "tpm"];
+            let known = [
+                "name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events", "min_version", "tpm", "service",
+                "listen", "routes",
+            ];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
         let program = task.get("program").and_then(Value::as_str).unwrap_or(name);
@@ -83,10 +88,58 @@ fn main() {
                 .collect(),
         };
 
+        // Network services: the service this task is an instance of, and the TCP ports it may
+        // listen on (`net` asks the kernel, so a task can't claim ports it wasn't given).
+        let service = task.get("service").map_or(*name, |v| v.as_str().expect("service: string"));
+        assert!(!service.is_empty() && service.len() <= 32, "{app}: {name}: service name must be 1..=32 bytes");
+        let routes = task.get("routes").is_some_and(|v| v.as_bool().expect("routes: bool"));
+        let listen: Vec<(u16, u16, u16)> = match task.get("listen") {
+            None => vec![],
+            Some(v) => v
+                .as_array()
+                .expect("listen: array of { port = N, max_connections = N }")
+                .iter()
+                .map(|entry| {
+                    let entry = entry.as_table().unwrap_or_else(|| panic!("{app}: {name}: listen entries are tables"));
+                    for key in entry.keys() {
+                        let known = ["port", "max_connections", "max_per_source"];
+                        assert!(known.contains(&key.as_str()), "{app}: {name}: listen: unknown key {key}");
+                    }
+                    let int = |key: &str, default: Option<i64>, range: std::ops::RangeInclusive<i64>| {
+                        let v = entry.get(key).map(|v| v.as_integer().unwrap_or_else(|| panic!("{app}: {name}: listen: {key} must be an integer")));
+                        let v = v.or(default).unwrap_or_else(|| panic!("{app}: {name}: listen entry without {key}"));
+                        assert!(range.contains(&v), "{app}: {name}: listen: {key} = {v} is outside {range:?}");
+                        v as u16
+                    };
+                    let max = int("max_connections", Some(64), 1..=1024);
+                    (int("port", None, 1..=65535), max, int("max_per_source", Some(max as i64), 1..=max as i64))
+                })
+                .collect(),
+        };
+        assert!(listen.len() <= 8, "{app}: {name}: at most 8 listen entries");
+        for (i, (port, ..)) in listen.iter().enumerate() {
+            assert!(!listen[..i].iter().any(|l| l.0 == *port), "{app}: {name}: port {port} listed twice");
+            if let Some((other, other_service)) = ports.iter().find(|(p, _, _)| p == port).map(|(_, n, s)| (n, s))
+                && *other_service != service
+            {
+                panic!(
+                    "{app}: port {port} is declared by {other} (service {other_service}) and {name} (service {service}); \
+                     only instances of one service may share a port"
+                );
+            }
+            ports.push((*port, name.to_string(), service.to_string()));
+        }
+        let listen: Vec<String> = listen
+            .iter()
+            .map(|(port, max, per_source)| format!("Listen {{ port: {port}, max_connections: {max}, max_per_source: {per_source} }}"))
+            .collect();
+
         writeln!(
             out,
             "    Task {{ name: {name:?}, program: {program:?}, budget_ticks: {budget}, \
-             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events}, min_version: {min_version}, tpm: {tpm} }},"
+             supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events}, min_version: {min_version}, tpm: {tpm}, \
+             service: {service:?}, listen: &[{}], routes: {routes} }},",
+            listen.join(", ")
         )
         .unwrap();
     }

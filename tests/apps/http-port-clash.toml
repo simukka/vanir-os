@@ -1,0 +1,14 @@
+# Must not build: two different services declare port 80.
+[[task]]
+name = "net"
+sends = ["web"]
+
+[[task]]
+name = "web"
+program = "http"
+listen = [{ port = 80 }]
+
+[[task]]
+name = "other"
+program = "http"
+listen = [{ port = 80 }]

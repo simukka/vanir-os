@@ -1,0 +1,19 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "net"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4"] }
+
+[features]
+# 10.0.9.2/24 (gateway 10.0.9.1) instead of DHCP: for the dgram backend, which has no DHCP server.
+static-addr = []
+# First start only: fault after handing out 50 connections (to test a restart of the stack).
+crash-after-50-connections = []

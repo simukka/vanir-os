@@ -31,6 +31,7 @@ pub const SYS_STATS: u64 = 114;
 pub const SYS_MEASUREMENTS: u64 = 115;
 pub const SYS_NOTIFY: u64 = 116;
 pub const SYS_HALT: u64 = 117;
+pub const SYS_TASK_LISTEN: u64 = 118;
 
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
@@ -138,7 +139,8 @@ pub fn notify(target: u64, bits: u64) -> Result<(), u64> {
 /// `recv` flag: give up after a number of ticks with `NOTIFY_TIMER`.
 pub const RECV_TIMEOUT: u64 = 2;
 
-/// Wait for a message for at most `ticks` (at least 1); then get sender 0, op `NOTIFY_TIMER`.
+/// Wait for a message for at most `ticks`; then get sender 0, op `NOTIFY_TIMER`. With 0, only
+/// take a message (or notification) that is already waiting.
 pub fn recv_timeout(buf: &mut [u8], ticks: u64) -> Result<Message, u64> {
     recv_raw(buf, RECV_TIMEOUT, ticks)
 }
@@ -494,7 +496,7 @@ pub mod events {
         pub tasks: u64,
         /// Per task slot: id, state (0 running/ready, 1 blocked, 2 exited, 3 faulted,
         /// 4 over budget), CPU ticks.
-        pub task: [[u64; 3]; 8],
+        pub task: [[u64; 3]; 16],
     }
 
     pub fn stats() -> Result<Stats, u64> {
@@ -558,6 +560,234 @@ pub mod telemetry {
         msg[16..16 + n].copy_from_slice(&name[..n]);
         send(id, OP_STORAGE, &msg[..16 + n], &mut []).map(|_| ())
     }
+}
+
+/// Client side of the network stack task (`user/net`): TCP on the ports the caller's manifest
+/// entry declares (`listen`). Handles name listeners and connections; each carries a generation
+/// number, so a handle kept after its connection closed can't name a newer one. Calls never
+/// wait, except `OP_WAIT`, which returns when any of the caller's handles has something to do.
+pub mod net {
+    use super::send;
+
+    /// Message: the port (u16). Reply: a listener handle (u32). `CODE_NOT_ALLOWED` if the
+    /// caller's manifest entry doesn't declare the port.
+    pub const OP_LISTEN: u64 = 1;
+    /// Message: the most ticks to wait (u64; 0 = no limit). Reply: `Event`s for the caller's
+    /// handles that have something to do, or none if the time ran out.
+    pub const OP_WAIT: u64 = 2;
+    /// Message: a listener handle. Reply: `Accepted`, or `CODE_WOULD_BLOCK`.
+    pub const OP_ACCEPT: u64 = 3;
+    /// Message: a connection handle and the most bytes wanted (u32 each). Reply: received bytes,
+    /// `CODE_WOULD_BLOCK` if there are none yet, `CODE_CLOSED` once the peer has closed or reset.
+    pub const OP_RECV: u64 = 4;
+    /// Message: a connection handle (u32), then bytes. Reply: how many were taken (u32), maybe
+    /// 0; `EV_WRITE` comes when there is room again.
+    pub const OP_SEND: u64 = 5;
+    /// Message: a handle. Closes the connection (or stops listening) and frees the handle.
+    pub const OP_CLOSE: u64 = 6;
+    /// Message: a connection handle. Sends a FIN; reading goes on until the peer closes.
+    pub const OP_SHUTDOWN: u64 = 7;
+    /// The caller is ready to serve: only then can it become its service's live instance.
+    pub const OP_READY: u64 = 8;
+    /// A draining instance has finished its work (see `EV_DRAIN`).
+    pub const OP_DONE: u64 = 9;
+    /// Routing (tasks with `routes = true`): message an instance's task id (u64), which
+    /// becomes its service's live instance. `CODE_NOT_READY` if it hasn't said `OP_READY`.
+    pub const OP_ROUTE: u64 = 10;
+    /// Routing: message an instance's task id and a deadline in ticks (u64 each). The instance
+    /// gets no new connections and an `EV_DRAIN`; connections still open at the deadline are
+    /// reset. Replied when the instance is drained: connections reset at the deadline (u64).
+    pub const OP_DRAIN: u64 = 11;
+    /// Routing: message `Block`. Drop packets from that range until it expires.
+    pub const OP_BLOCK: u64 = 12;
+
+    pub const CODE_OK: u64 = 0;
+    pub const CODE_WOULD_BLOCK: u64 = 1;
+    pub const CODE_BAD_OP: u64 = 2;
+    pub const CODE_NOT_ALLOWED: u64 = 3;
+    pub const CODE_BAD_HANDLE: u64 = 4;
+    /// The socket pool is used up.
+    pub const CODE_NO_SOCKETS: u64 = 5;
+    pub const CODE_CLOSED: u64 = 6;
+    pub const CODE_NOT_READY: u64 = 7;
+
+    /// A listener has a connection to accept.
+    pub const EV_ACCEPT: u32 = 1;
+    /// A connection has bytes to read, or the peer closed it (`OP_RECV` says which).
+    pub const EV_READ: u32 = 2;
+    /// A connection has room to send again after an `OP_SEND` took less than it was given.
+    pub const EV_WRITE: u32 = 4;
+    /// The connection is closed or reset: close the handle.
+    pub const EV_CLOSED: u32 = 8;
+    /// (Handle 0.) This instance is draining: finish the requests in flight, accept nothing new,
+    /// close connections as they go idle, then say `OP_DONE`.
+    pub const EV_DRAIN: u32 = 16;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Event {
+        pub handle: u32,
+        pub flags: u32,
+    }
+
+    /// A new connection: its handle, and the client's address and port.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Accepted {
+        pub handle: u32,
+        pub addr: [u8; 4],
+        pub port: u16,
+        pub _pad: u16,
+    }
+
+    /// An `OP_BLOCK` entry: addresses matching `addr` in the top `prefix` bits, for `ticks`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Block {
+        pub addr: [u8; 4],
+        pub prefix: u32,
+        pub ticks: u64,
+    }
+
+    /// Send a request whose reply is at most `reply.len()`; fails with the code or kernel error.
+    fn call(net: u64, op: u64, msg: &[u8], reply: &mut [u8]) -> Result<usize, u64> {
+        match send(net, op, msg, reply) {
+            Ok((CODE_OK, n)) => Ok(n),
+            Ok((code, _)) => Err(code),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn listen(net: u64, port: u16) -> Result<u32, u64> {
+        let mut h = [0u8; 4];
+        call(net, OP_LISTEN, &port.to_le_bytes(), &mut h)?;
+        Ok(u32::from_le_bytes(h))
+    }
+
+    /// Wait up to `ticks` (0: no limit) for events; returns how many were written to `out`.
+    pub fn wait(net: u64, ticks: u64, out: &mut [Event]) -> Result<usize, u64> {
+        let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, core::mem::size_of_val(out)) };
+        let n = call(net, OP_WAIT, &ticks.to_le_bytes(), bytes)?;
+        Ok(n / core::mem::size_of::<Event>())
+    }
+
+    /// The next connection on `listener`, if one is waiting.
+    pub fn accept(net: u64, listener: u32) -> Result<Option<Accepted>, u64> {
+        let mut a = [0u8; core::mem::size_of::<Accepted>()];
+        match call(net, OP_ACCEPT, &listener.to_le_bytes(), &mut a) {
+            Ok(_) => Ok(Some(unsafe { core::ptr::read_unaligned(a.as_ptr() as *const Accepted) })),
+            Err(CODE_WOULD_BLOCK) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Bytes received on `conn`: Ok(0) if none yet, `Err(CODE_CLOSED)` once the peer is done.
+    pub fn recv(net: u64, conn: u32, buf: &mut [u8]) -> Result<usize, u64> {
+        let mut msg = [0u8; 8];
+        msg[..4].copy_from_slice(&conn.to_le_bytes());
+        msg[4..].copy_from_slice(&(buf.len().min(4096) as u32).to_le_bytes());
+        let max = buf.len().min(4096);
+        match call(net, OP_RECV, &msg, &mut buf[..max]) {
+            Err(CODE_WOULD_BLOCK) => Ok(0),
+            r => r,
+        }
+    }
+
+    /// Send up to 4092 bytes of `data` on `conn`; returns how many were taken.
+    pub fn send_data(net: u64, conn: u32, data: &[u8]) -> Result<usize, u64> {
+        let mut msg = [0u8; 4096];
+        let n = data.len().min(msg.len() - 4);
+        msg[..4].copy_from_slice(&conn.to_le_bytes());
+        msg[4..4 + n].copy_from_slice(&data[..n]);
+        let mut taken = [0u8; 4];
+        call(net, OP_SEND, &msg[..4 + n], &mut taken)?;
+        Ok(u32::from_le_bytes(taken) as usize)
+    }
+
+    pub fn close(net: u64, handle: u32) -> Result<(), u64> {
+        call(net, OP_CLOSE, &handle.to_le_bytes(), &mut []).map(|_| ())
+    }
+
+    pub fn shutdown(net: u64, conn: u32) -> Result<(), u64> {
+        call(net, OP_SHUTDOWN, &conn.to_le_bytes(), &mut []).map(|_| ())
+    }
+
+    pub fn ready(net: u64) -> Result<(), u64> {
+        call(net, OP_READY, &[], &mut []).map(|_| ())
+    }
+
+    pub fn done(net: u64) -> Result<(), u64> {
+        call(net, OP_DONE, &[], &mut []).map(|_| ())
+    }
+
+    pub fn route(net: u64, instance: u64) -> Result<(), u64> {
+        call(net, OP_ROUTE, &instance.to_le_bytes(), &mut []).map(|_| ())
+    }
+
+    /// Drain `instance`, resetting what is left after `ticks`; returns how many were reset.
+    pub fn drain(net: u64, instance: u64, ticks: u64) -> Result<u64, u64> {
+        let mut msg = [0u8; 16];
+        msg[..8].copy_from_slice(&instance.to_le_bytes());
+        msg[8..].copy_from_slice(&ticks.to_le_bytes());
+        let mut forced = [0u8; 8];
+        call(net, OP_DRAIN, &msg, &mut forced)?;
+        Ok(u64::from_le_bytes(forced))
+    }
+
+    pub fn block(net: u64, entry: &Block) -> Result<(), u64> {
+        let bytes = unsafe { core::slice::from_raw_parts(entry as *const Block as *const u8, core::mem::size_of::<Block>()) };
+        call(net, OP_BLOCK, bytes, &mut []).map(|_| ())
+    }
+
+    pub fn code_name(code: u64) -> &'static str {
+        match code {
+            CODE_OK => "OK",
+            CODE_WOULD_BLOCK => "WOULD_BLOCK",
+            CODE_BAD_OP => "BAD_OP",
+            CODE_NOT_ALLOWED => "NOT_ALLOWED",
+            CODE_BAD_HANDLE => "BAD_HANDLE",
+            CODE_NO_SOCKETS => "NO_SOCKETS",
+            CODE_CLOSED => "CLOSED",
+            CODE_NOT_READY => "NOT_READY",
+            _ => super::err::name(code),
+        }
+    }
+}
+
+/// A task's network declarations from the manifest (`task_listen`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ListenInfo {
+    service: [u8; 32],
+    service_len: u64,
+    /// Bit 0: may route (`routes = true`).
+    pub flags: u64,
+    pub count: u64,
+    /// (port, max_connections, max_per_source, 0)
+    pub ports: [[u16; 4]; 8],
+}
+
+impl ListenInfo {
+    pub fn service(&self) -> &[u8] {
+        &self.service[..(self.service_len as usize).min(32)]
+    }
+
+    pub fn may_route(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    /// (max_connections, max_per_source) if the task may listen on `port`.
+    pub fn port(&self, port: u16) -> Option<(u16, u16)> {
+        self.ports[..(self.count as usize).min(8)].iter().find(|p| p[0] == port).map(|p| (p[1], p[2]))
+    }
+}
+
+/// The network declarations of task `id` (any generation): its service, ports and flags.
+pub fn task_listen(id: u64) -> Result<ListenInfo, u64> {
+    let mut info = ListenInfo::default();
+    let size = core::mem::size_of::<ListenInfo>() as u64;
+    let (n, _, _) = syscall6(SYS_TASK_LISTEN, [id, &mut info as *mut ListenInfo as u64, size, 0, 0, 0]);
+    if err::is_error(n) { Err(n) } else { Ok(info) }
 }
 
 /// The id of the task called `name` in the app manifest.
