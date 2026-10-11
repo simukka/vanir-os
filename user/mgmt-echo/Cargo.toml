@@ -1,0 +1,16 @@
+[package]
+name = "mgmt-echo"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mgmt-echo"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# At start, try to talk to the data stack (`net`), which the manifest doesn't allow.
+try-data-net = []

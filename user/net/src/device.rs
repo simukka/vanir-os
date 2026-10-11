@@ -15,6 +15,8 @@ const SEND_TRIES: u32 = 64;
 pub struct Nic {
     pub rx: Batch,
     pub tx: Sender,
+    /// Frames received from the driver, cumulative.
+    pub received: u64,
 }
 
 /// Frames received from the driver, as it sends them: u16 length, then the frame.
@@ -35,7 +37,7 @@ pub struct Sender {
 
 impl Nic {
     pub fn new(driver: u64) -> Nic {
-        Nic { rx: Batch { buf: [0; 4096], len: 0, at: 0 }, tx: Sender { driver, buf: [0; MAX_FRAME], dropped: 0, dead: false } }
+        Nic { rx: Batch { buf: [0; 4096], len: 0, at: 0 }, tx: Sender { driver, buf: [0; MAX_FRAME], dropped: 0, dead: false }, received: 0 }
     }
 
     pub fn driver(&self) -> u64 {
@@ -56,6 +58,7 @@ impl Nic {
         match send(self.tx.driver, OP_RECV_FRAMES, &[], &mut self.rx.buf) {
             Ok((CODE_OK, n)) => {
                 self.rx.len = n;
+                nic::frames(&self.rx.buf[..n], |_| self.received += 1);
                 Ok(n)
             }
             Ok((code, _)) => Err(code),

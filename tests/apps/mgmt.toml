@@ -1,0 +1,40 @@
+# Data and management networks, each with its own NIC, driver and stack. The data NIC is
+# declared first, so it claims the first virtio-net device (PCI 00:10.0).
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic"]
+
+[[task]]
+name = "web"
+program = "http"
+sends = ["net"]
+listen = [{ port = 80, max_connections = 64 }]
+
+[[task]]
+name = "nic-mgmt"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["mgmt-net"]
+
+[[task]]
+name = "mgmt-net"
+program = "net"
+sends = ["nic-mgmt"]
+
+# Stands in for the node agent (RFD 2).
+[[task]]
+name = "mgmt-echo"
+sends = ["mgmt-net"]
+listen = [{ port = 7, max_connections = 8 }]

@@ -67,8 +67,8 @@ impl Driver {
     /// Fill `out` with waiting frames (u16 length, frame); returns the bytes used.
     fn take_frames(&mut self, client: u64, out: &mut [u8]) -> usize {
         self.client = Some(client);
-        if self.rx.in_flight() == 0 {
-            self.info.rx_ring_full += 1; // every buffer filled: the device is dropping frames
+        if self.rx.completed() as usize == BUFFERS {
+            self.info.rx_ring_full += 1; // every buffer filled: the device drops what comes next
         }
         let mut n = 0;
         while let Some((id, len)) = self.rx.peek_used() {

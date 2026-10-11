@@ -22,13 +22,10 @@ mod device;
 
 use device::Nic;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::tcp::{self, State};
-#[cfg(not(feature = "static-addr"))]
 use smoltcp::socket::dhcpv4;
+use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr};
-#[cfg(feature = "static-addr")]
-use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use vanir_user::net::*;
 use vanir_user::nic::{self, NOTIFY_RX};
 use vanir_user::{NOTIFY_POST, NOTIFY_TIMER, SYS_RECV, RECV_TIMEOUT, err, getpid, lookup, println, rdtsc, reply, sleep, syscall6, task_index, task_listen, task_name, uptime};
@@ -51,6 +48,47 @@ const ACCEPT_TICKS: u64 = 500;
 const IDLE: Duration = Duration::from_secs(60);
 /// Look at the driver at least this often, in case it restarted and forgot to notify us.
 const HOUSEKEEPING_TICKS: u64 = 100;
+/// Share of each tick (percent) we may spend on received frames. Past it, frames wait in the
+/// driver's ring until the next tick (the device drops what doesn't fit), so a flood can't
+/// take the whole CPU from the services and the other stack.
+const BUDGET_PERCENT: u64 = 50;
+
+/// CPU time spent on received frames, measured with the TSC.
+struct Budget {
+    cycles_per_tick: u64,
+    tick: u64,
+    used: u64,
+    /// Ticks in which the budget ran out, since the last load report.
+    exhausted: u64,
+    flagged: bool,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        sleep(1); // start on a tick boundary
+        let (t0, c0) = (uptime(), rdtsc());
+        sleep(5);
+        let cycles_per_tick = (rdtsc() - c0) / (uptime() - t0).max(1);
+        Budget { cycles_per_tick, tick: 0, used: 0, exhausted: 0, flagged: false }
+    }
+
+    fn spend(&mut self, now: u64, cycles: u64) {
+        if now != self.tick {
+            (self.tick, self.used, self.flagged) = (now, 0, false);
+        }
+        self.used += cycles;
+        if !self.left(now) && !self.flagged {
+            self.flagged = true;
+            self.exhausted += 1;
+        }
+    }
+
+    fn left(&self, now: u64) -> bool {
+        now != self.tick || self.used < self.cycles_per_tick * BUDGET_PERCENT / 100
+    }
+}
+
+static mut NAME: [u8; 32] = [0; 32];
 
 static mut RX_BUFFERS: [[u8; BUFFER]; SOCKETS] = [[0; BUFFER]; SOCKETS];
 static mut TX_BUFFERS: [[u8; BUFFER]; SOCKETS] = [[0; BUFFER]; SOCKETS];
@@ -114,10 +152,14 @@ struct Instance {
 struct Stack {
     iface: Interface,
     sockets: SocketSet<'static>,
-    #[cfg(not(feature = "static-addr"))]
-    dhcp: SocketHandle,
+    /// The DHCP client, unless the address is static.
+    dhcp: Option<SocketHandle>,
     nic: Nic,
+    name: &'static str,
     nic_name: &'static str,
+    budget: Budget,
+    /// Frames received when the load was last reported.
+    reported_frames: u64,
     slots: [Slot; SOCKETS],
     ports: [Option<Port>; MAX_PORTS],
     services: [Option<Service>; MAX_SERVICES],
@@ -254,7 +296,7 @@ impl Stack {
             service.live = None;
         }
         let mut name = [0u8; 32];
-        println!("net: instance {} is gone", task_name(instance.id, &mut name).unwrap_or("?"));
+        println!("{}: instance {} is gone", self.name, task_name(instance.id, &mut name).unwrap_or("?"));
     }
 
     fn name_of(&self, service: usize) -> &str {
@@ -444,7 +486,7 @@ impl Stack {
                 self.handed_out += 1;
                 #[cfg(feature = "crash-after-50-connections")]
                 if self.handed_out == 50 && getpid() >> 16 == 0 {
-                    println!("net: crashing after handing out 50 connections");
+                    println!("{}: crashing after handing out 50 connections", self.name);
                     unsafe { core::ptr::read_volatile(0x10 as *const u8) };
                 }
                 let remote = self.socket(i).remote_endpoint().unwrap();
@@ -510,7 +552,7 @@ impl Stack {
                 if self.services[service].unwrap().live.is_none() {
                     self.services[service].as_mut().unwrap().live = Some(k as u8);
                     let mut name = [0u8; 32];
-                    println!("net: {} is live for service {}", task_name(sender, &mut name).unwrap_or("?"), self.name_of(service));
+                    println!("{}: {} is live for service {}", self.name, task_name(sender, &mut name).unwrap_or("?"), self.name_of(service));
                 }
                 0
             }),
@@ -526,7 +568,7 @@ impl Stack {
         let mut name = [0u8; 32];
         let info = task_listen(sender).map_err(|_| CODE_NOT_ALLOWED)?;
         let Some((max_connections, _per_source)) = info.port(port) else {
-            println!("net: {} may not listen on port {}: not in its manifest entry", task_name(sender, &mut name).unwrap_or("?"), port);
+            println!("{}: {} may not listen on port {}: not in its manifest entry", self.name, task_name(sender, &mut name).unwrap_or("?"), port);
             return Err(CODE_NOT_ALLOWED);
         };
         let k = self.instance_for(sender, now)?;
@@ -534,7 +576,7 @@ impl Stack {
         let p = self.port_for(port, service, max_connections).ok_or(CODE_NOT_ALLOWED)?;
         let instance = self.instances[k].as_mut().unwrap();
         instance.listening |= 1 << p;
-        println!("net: {} listens on port {} (service {})", task_name(sender, &mut name).unwrap_or("?"), port, self.name_of(service));
+        println!("{}: {} listens on port {} (service {})", self.name, task_name(sender, &mut name).unwrap_or("?"), port, self.name_of(service));
         Ok(listener_handle(k, p, self.instances[k].unwrap().generation))
     }
 
@@ -551,22 +593,39 @@ impl Stack {
         }
     }
 
+    /// Under load, say so once per housekeeping period: how often the budget ran out, and how
+    /// often the driver found its ring full (the device drops frames then).
+    fn report_load(&mut self) {
+        let frames = self.nic.received - core::mem::replace(&mut self.reported_frames, self.nic.received);
+        // A tick or two over budget is a preemption mid-batch, not load.
+        if self.budget.exhausted < HOUSEKEEPING_TICKS / 10 {
+            self.budget.exhausted = 0;
+            return;
+        }
+        let full = nic::info(self.nic.driver()).map_or(0, |i| i.rx_ring_full);
+        println!(
+            "{}: busy: CPU budget used up in {} of the last {} ticks; {} frames in; driver ring full {} times so far",
+            self.name, self.budget.exhausted, HOUSEKEEPING_TICKS, frames, full
+        );
+        self.budget.exhausted = 0;
+    }
+
     /// After the driver died: talk to its next incarnation, once it runs.
     fn find_driver(&mut self) {
         if let Ok(id) = lookup(self.nic_name)
             && id != self.nic.driver()
         {
-            println!("net: the NIC driver was restarted");
+            println!("{}: the NIC driver was restarted", self.name);
             self.nic.set_driver(id);
         }
     }
 
     fn poll(&mut self, now: u64) {
         self.iface.poll(instant(now), &mut self.nic, &mut self.sockets);
-        #[cfg(not(feature = "static-addr"))]
-        match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
+        let Some(dhcp) = self.dhcp else { return };
+        match self.sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
             Some(dhcpv4::Event::Configured(config)) => {
-                println!("net: address {} from DHCP, gateway {:?}", config.address, config.router);
+                println!("{}: address {} from DHCP, gateway {:?}", self.name, config.address, config.router);
                 self.iface.update_ip_addrs(|addrs| {
                     addrs.clear();
                     let _ = addrs.push(IpCidr::Ipv4(config.address));
@@ -578,7 +637,7 @@ impl Stack {
             }
             Some(dhcpv4::Event::Deconfigured) => {
                 if self.iface.ipv4_addr().is_some() {
-                    println!("net: DHCP lease lost");
+                    println!("{}: DHCP lease lost", self.name);
                 }
                 self.iface.update_ip_addrs(|addrs| addrs.clear());
                 self.iface.routes_mut().remove_default_ipv4_route();
@@ -602,14 +661,14 @@ fn nic_name(name: &str) -> &'static str {
 }
 
 fn main() -> u64 {
-    let mut name_buf = [0u8; 32];
-    let name = task_name(getpid(), &mut name_buf).unwrap_or("net");
+    let name_buf = unsafe { &mut *(&raw mut NAME) };
+    let name: &'static str = task_name(getpid(), name_buf).unwrap_or("net");
     let nic_name = nic_name(name);
     let driver = loop {
         match lookup(nic_name) {
             Ok(id) => break id,
             Err(_) => {
-                println!("net: no task named {}", nic_name);
+                println!("{}: no task named {}", name, nic_name);
                 return 1;
             }
         }
@@ -623,7 +682,6 @@ fn main() -> u64 {
     let mut nic = Nic::new(driver);
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(info.mac)));
     config.random_seed = rdtsc();
-    #[cfg_attr(not(feature = "static-addr"), allow(unused_mut))]
     let mut iface = Interface::new(config, &mut nic, instant(uptime()));
 
     let storage = unsafe { &mut *(&raw mut SOCKET_STORAGE) };
@@ -642,28 +700,32 @@ fn main() -> u64 {
         })
     };
 
-    #[cfg(feature = "static-addr")]
-    {
+    // The test feature gives the data stack a fixed address (its NIC is on the dgram backend,
+    // which has no DHCP server); the management stack always uses DHCP.
+    let dhcp = if cfg!(feature = "static-addr") && name == "net" {
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 9, 2), 24)));
         });
         let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 0, 9, 1));
-        println!("net: address 10.0.9.2/24 (static)");
-    }
-    #[cfg(not(feature = "static-addr"))]
-    let dhcp = sockets.add(dhcpv4::Socket::new());
+        println!("{}: address 10.0.9.2/24 (static)", name);
+        None
+    } else {
+        Some(sockets.add(dhcpv4::Socket::new()))
+    };
 
     println!(
-        "net: {} on {} ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}), {} sockets, {} KiB of socket buffers",
+        "{}: on {} ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}), {} sockets, {} KiB of socket buffers",
         name, nic_name, info.mac[0], info.mac[1], info.mac[2], info.mac[3], info.mac[4], info.mac[5], SOCKETS, SOCKETS * 2 * BUFFER / 1024
     );
     let mut stack = Stack {
         iface,
         sockets,
-        #[cfg(not(feature = "static-addr"))]
         dhcp,
         nic,
+        name,
         nic_name,
+        budget: Budget::new(),
+        reported_frames: 0,
         slots,
         ports: [None; MAX_PORTS],
         services: [None; MAX_SERVICES],
@@ -678,15 +740,21 @@ fn main() -> u64 {
     let mut next_housekeeping = uptime() + HOUSEKEEPING_TICKS;
     loop {
         let now = uptime();
-        if want_rx {
+        let start = rdtsc();
+        let receiving = want_rx && stack.budget.left(now);
+        if receiving {
             want_rx = stack.receive();
         }
         stack.poll(now);
         stack.tend(now);
         stack.poll(now); // send what tending changed (RSTs)
         stack.serve_waiters(now);
+        if receiving {
+            stack.budget.spend(now, rdtsc() - start);
+        }
         if now >= next_housekeeping {
             next_housekeeping = now + HOUSEKEEPING_TICKS;
+            stack.report_load();
             if stack.nic.tx.dead {
                 stack.find_driver();
             }
@@ -696,10 +764,14 @@ fn main() -> u64 {
         // Wait for a request, a notification, or the next timer; only poll if frames are waiting.
         let wake = [stack.poll_delay(now).map(|d| now + d.max(1)), stack.next_deadline(), Some(next_housekeeping)];
         let wake = wake.into_iter().flatten().min().unwrap();
-        let ticks = if want_rx { 0 } else { wake.saturating_sub(uptime()).max(1) };
+        let ticks = match want_rx {
+            true if stack.budget.left(uptime()) => 0,
+            true => 1, // out of budget: frames wait for the next tick
+            false => wake.saturating_sub(uptime()).max(1),
+        };
         let (sender, op, len) = syscall6(SYS_RECV, [msg.as_mut_ptr() as u64, msg.len() as u64, RECV_TIMEOUT, ticks, 0, 0]);
         if err::is_error(sender) {
-            println!("net: recv failed: {}", err::name(sender));
+            println!("{}: recv failed: {}", name, err::name(sender));
             continue;
         }
         match (sender, op) {

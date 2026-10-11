@@ -293,9 +293,10 @@ impl Queue {
         fence(Ordering::SeqCst);
     }
 
-    /// Requests the device has not completed yet.
-    pub fn in_flight(&self) -> u16 {
-        self.size - self.free_count
+    /// Requests the device has completed that we haven't taken yet.
+    pub fn completed(&self) -> u16 {
+        fence(Ordering::SeqCst);
+        mmio_read::<u16>(self.used + 2).wrapping_sub(self.last_used)
     }
 
     /// A completed request: (id from `submit`, bytes the device wrote). Its descriptors return

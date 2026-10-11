@@ -19,6 +19,7 @@ import random
 import socket
 import struct
 import sys
+import threading
 import time
 
 GUEST_MAC = bytes.fromhex("525400000001")
@@ -52,7 +53,8 @@ def checksum(data):
 
 
 class Link:
-    """Raw Ethernet frames to and from the guest over QEMU's dgram backend."""
+    """Raw Ethernet frames to and from the guest over QEMU's dgram backend. We answer ARP for
+    10.0.9.1, the guest's gateway, so the guest can reach us and any address behind us."""
 
     def __init__(self, port=NET_DGRAM_PORT):
         self.qemu = ("127.0.0.1", port)
@@ -60,6 +62,24 @@ class Link:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
         self.sock.bind(("127.0.0.1", port + 1))
+        self.handlers = []
+
+    def poll(self, timeout):
+        """Take frames for up to `timeout` seconds (at least one look), answering ARP and handing
+        the rest to `handlers`."""
+        deadline = time.monotonic() + timeout
+        while True:
+            frame = self.recv(max(deadline - time.monotonic(), 0.001))
+            if frame is None:
+                return
+            if frame[12:14] == b"\x08\x06" and frame[20:22] == b"\x00\x01" and frame[38:42] == PEER_IP:
+                body = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + PEER_MAC + PEER_IP + frame[22:28] + frame[28:32]
+                self.send(ethernet(frame[6:12], 0x0806, body))
+                continue
+            for handler in list(self.handlers):
+                handler(frame)
+            if time.monotonic() >= deadline:
+                return
 
     def send(self, frame):
         try:
@@ -111,6 +131,134 @@ def parse_ipv4(frame):
     ihl = (ip[0] & 0xF) * 4
     total = struct.unpack("!H", ip[2:4])[0]
     return ip[12:16], ip[16:20], ip[9], ip[ihl:total]
+
+
+TCP_FIN, TCP_SYN, TCP_RST, TCP_PSH, TCP_ACK = 1, 2, 4, 8, 16
+
+
+def tcp_segment(src, dst, sport, dport, seq, ack, flags, payload=b"", window=65535):
+    header = struct.pack("!HHIIBBHHH", sport, dport, seq & 0xFFFFFFFF, ack & 0xFFFFFFFF, 5 << 4, flags, window, 0, 0)
+    pseudo = src + dst + struct.pack("!BBH", 0, 6, len(header) + len(payload))
+    csum = checksum(pseudo + header + payload)
+    header = header[:16] + struct.pack("!H", csum) + header[18:]
+    return ethernet(GUEST_MAC, 0x0800, ipv4(src, dst, 6, header + payload))
+
+
+class RawTcp:
+    """A TCP client made of raw frames, for tests that need to control every packet. Simple:
+    in-order data only, retransmits its own data until acknowledged."""
+
+    def __init__(self, link, src=PEER_IP, sport=None, dport=80):
+        self.link, self.src, self.dport = link, src, dport
+        self.sport = sport or random.randint(20000, 60000)
+        self.seq = random.randint(0, 1 << 31)
+        self.ack = 0
+        self.acked = self.seq
+        self.data = b""
+        self.state = "closed"
+        self.reset = self.fin = False
+        link.handlers.append(self.on_frame)
+
+    def drop(self):
+        if self.on_frame in self.link.handlers:
+            self.link.handlers.remove(self.on_frame)
+
+    def send_segment(self, flags, payload=b"", seq=None):
+        self.link.send(tcp_segment(self.src, GUEST_IP, self.sport, self.dport, self.seq if seq is None else seq, self.ack, flags, payload))
+
+    def on_frame(self, frame):
+        ip = parse_ipv4(frame)
+        if not ip or ip[2] != 6 or ip[1] != self.src or ip[0] != GUEST_IP:
+            return
+        tcp = ip[3]
+        sport, dport, seq, ack, off, flags = struct.unpack("!HHIIBB", tcp[:14])
+        if sport != self.dport or dport != self.sport:
+            return
+        payload = tcp[(off >> 4) * 4:]
+        if flags & TCP_RST:
+            self.reset = True
+            self.state = "closed"
+            return
+        if flags & TCP_ACK:
+            self.acked = max(self.acked, ack)  # our sequence numbers start below 2**31: no wrap
+        if self.state == "syn-sent" and flags & TCP_SYN and flags & TCP_ACK:
+            self.ack = (seq + 1) & 0xFFFFFFFF
+            self.seq += 1
+            self.state = "established"
+            self.send_segment(TCP_ACK)
+            return
+        if self.state != "established":
+            return
+        if payload and seq == self.ack:
+            self.data += payload
+            self.ack = (self.ack + len(payload)) & 0xFFFFFFFF
+        if flags & TCP_FIN and (seq + len(payload)) & 0xFFFFFFFF == self.ack:
+            self.ack = (self.ack + 1) & 0xFFFFFFFF
+            self.fin = True
+        if payload or flags & TCP_FIN:
+            self.send_segment(TCP_ACK)
+
+    def connect(self, timeout=3.0):
+        self.state = "syn-sent"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.state == "syn-sent" and not self.reset:
+            self.send_segment(TCP_SYN)
+            self.link.poll(min(0.5, deadline - time.monotonic()))
+        return self.state == "established"
+
+    def send(self, data, timeout=3.0):
+        start = self.seq
+        self.seq += len(data)
+        deadline = time.monotonic() + timeout
+        while self.acked < self.seq and time.monotonic() < deadline and not self.reset:
+            for at in range(0, len(data), 1400):
+                self.send_segment(TCP_PSH | TCP_ACK, data[at:at + 1400], seq=start + at)
+            self.link.poll(0.3)
+        return not self.reset
+
+    def wait_for(self, done, timeout):
+        deadline = time.monotonic() + timeout
+        while not done() and not self.reset and time.monotonic() < deadline:
+            self.link.poll(min(0.05, max(deadline - time.monotonic(), 0.001)))
+        return done()
+
+    def close(self):
+        if self.state == "established" and not self.reset:
+            self.send_segment(TCP_FIN | TCP_ACK)
+            self.seq += 1
+        self.drop()
+
+
+def raw_get(link, path="/", src=PEER_IP, timeout=5.0):
+    """GET over raw frames: (status, body), or None if it failed."""
+    c = RawTcp(link, src)
+    try:
+        if not c.connect(timeout):
+            return None
+        c.send(f"GET {path} HTTP/1.1\r\nHost: vanir\r\nConnection: close\r\n\r\n".encode())
+
+        def complete():
+            if b"\r\n\r\n" not in c.data:
+                return c.fin
+            head, body = c.data.split(b"\r\n\r\n", 1)
+            length = [int(l.split(b":")[1]) for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")]
+            return c.fin or (length and len(body) >= length[0])
+
+        if not c.wait_for(complete, timeout) or b"\r\n\r\n" not in c.data:
+            return None
+        head, body = c.data.split(b"\r\n\r\n", 1)
+        return int(head.split()[1]), body.decode("latin-1")
+    finally:
+        c.close()
+
+
+def raw_wait_ready(link, deadline):
+    while time.monotonic() < deadline:
+        r = raw_get(link, timeout=2)
+        if r and r[0] == 200:
+            return r[1]
+        time.sleep(0.2)
+    return None
 
 
 def resolve(link, deadline):
@@ -294,6 +442,137 @@ def http_restart(args):
     if first_failure is not None:
         say(f"first failure at request {first_failure + 1}; the last 50 all ok: {all(results[-50:])}")
     return finish(failed > 0 and len(after) > 50 and all(results[-50:]))
+
+
+class Echo:
+    """A client of mgmt-echo (port 7, through NET_MGMT_PORT): each line comes back."""
+
+    def __init__(self, timeout=3.0):
+        self.sock = socket.create_connection(("127.0.0.1", NET_MGMT_PORT), timeout=timeout)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.n = 0
+
+    def round_trip(self):
+        """Seconds for one line to come back; raises OSError on failure."""
+        self.n += 1
+        line = f"ping {self.n}\n".encode()
+        start = time.monotonic()
+        self.sock.sendall(line)
+        got = b""
+        while not got.endswith(b"\n"):
+            data = self.sock.recv(4096)
+            if not data:
+                raise OSError("connection closed")
+            got += data
+        if got != line:
+            raise OSError(f"echoed {got!r}")
+        return time.monotonic() - start
+
+
+def echo_ready(deadline):
+    while time.monotonic() < deadline:
+        try:
+            e = Echo(timeout=2)
+            e.round_trip()
+            return e
+        except OSError:
+            time.sleep(0.2)
+    return None
+
+
+@scenario
+def mgmt_separate(args):
+    """GETs on the data network and echoes on the management network, interleaved."""
+    deadline = time.monotonic() + args.timeout
+    if wait_ready(deadline) is None:
+        say("the data network never answered")
+        return finish(False)
+    echo = echo_ready(deadline)
+    if echo is None:
+        say("the management network never answered")
+        return finish(False)
+    gets = echoes = 0
+    for _ in range(20):
+        try:
+            status, body = get("/")
+            gets += status == 200 and body == "hello from web\n"
+            echo.round_trip()
+            echoes += 1
+        except (HttpError, OSError) as e:
+            say(f"failed: {e}")
+    say(f"data: {gets}/20 GETs ok; management: {echoes}/20 echoes ok")
+    return finish(gets == 20 and echoes == 20)
+
+
+def flood_frames(count=64, size=1000):
+    """Frames the data stack must look at and throw away: unknown EtherTypes and IPv4 with a
+    bad checksum, all addressed to the guest."""
+    frames = []
+    for i in range(count):
+        junk = random.randbytes(size)
+        if i % 2:
+            frames.append(ethernet(GUEST_MAC, 0x88B5, junk))
+        else:
+            packet = bytearray(ipv4(bytes([198, 51, 100, i]), GUEST_IP, 17, junk))
+            packet[10] ^= 0xFF
+            frames.append(ethernet(GUEST_MAC, 0x0800, bytes(packet)))
+    return frames
+
+
+def flood(link, seconds, frames, stats):
+    """Send `frames` round and round as fast as we can for `seconds` (in a thread)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    end = time.monotonic() + seconds
+    sent = 0
+    while time.monotonic() < end:
+        for f in frames:
+            try:
+                sock.sendto(f, link.qemu)
+            except OSError:
+                pass
+        sent += len(frames)
+    stats["sent"] = sent
+    stats["seconds"] = seconds
+
+
+@scenario
+def mgmt_under_flood(args):
+    """Flood the data NIC (dgram) while echoing on the management network every 100 ms: every
+    echo must come back within 1 s. Then the data stack must still serve."""
+    link = Link()
+    deadline = time.monotonic() + args.timeout
+    if raw_wait_ready(link, deadline) is None:
+        say("the data network never answered")
+        return 1
+    echo = echo_ready(deadline)
+    if echo is None:
+        say("the management network never answered")
+        return 1
+    stats = {}
+    t = threading.Thread(target=flood, args=(link, 6, flood_frames(), stats))
+    t.start()
+    times = []
+    failures = 0
+    while t.is_alive():
+        try:
+            times.append(echo.round_trip())
+        except OSError as e:
+            failures += 1
+            say(f"echo failed: {e}")
+            break
+        time.sleep(0.1)
+    t.join()
+    say(f"flood: {stats['sent']} frames in {stats['seconds']} s ({stats['sent'] / stats['seconds']:.0f} frames/s)")
+    worst = max(times) if times else 0
+    late = sum(x > 1.0 for x in times)
+    say(f"management echoes during the flood: {len(times)}, {late} later than 1 s, worst {worst * 1000:.0f} ms")
+    link.poll(0.5)  # let the backlog drain
+    after = raw_get(link, timeout=5)
+    say(f"data stack after the flood: {after[0] if after else 'no answer'}")
+    ok = len(times) >= 20 and late == 0 and failures == 0 and after and after[0] == 200
+    raw_get(link, "/exit", timeout=2)
+    say("PASS" if ok else "FAIL")
+    return 0 if ok else 1
 
 
 def main():

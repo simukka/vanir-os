@@ -18,3 +18,5 @@ exit-on-request = []
 crash-after-50-requests = []
 # Try to listen on port 81 first (which no manifest declares), then on 80.
 listen-81 = []
+# At start, try to talk to the management stack (`mgmt-net`), which the manifest doesn't allow.
+try-mgmt-net = []

@@ -194,6 +194,12 @@ impl Server {
                 _ => sleep(1),
             }
         }
+        #[cfg(feature = "try-mgmt-net")]
+        match lookup("mgmt-net").map(|mgmt| net::listen(mgmt, PORT)) {
+            Ok(Err(e)) => println!("{}: talking to mgmt-net: {}", self.name(), net::code_name(e)),
+            Ok(Ok(_)) => println!("{}: talking to mgmt-net: ALLOWED", self.name()),
+            Err(e) => println!("{}: no mgmt-net: {}", self.name(), err::name(e)),
+        }
         #[cfg(feature = "listen-81")]
         match net::listen(self.net, 81) {
             Ok(_) => println!("{}: listening on port 81", self.name()),
