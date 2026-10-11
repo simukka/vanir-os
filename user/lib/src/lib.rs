@@ -236,7 +236,8 @@ pub mod block {
     pub const CODE_NOT_ALLOWED: u64 = 7;
 
     /// Storage task: message is the 32-byte master key. Only the tasks named "keys" or
-    /// "attest" may send it; until then every other request gets CODE_LOCKED.
+    /// "attest" may send it; until then every other request gets CODE_LOCKED. (A storage task
+    /// that may send to "keys" also asks it for the key itself when it starts: see `keys`.)
     pub const OP_UNLOCK: u64 = 5;
 
     pub fn unlock(storage: u64, master_key: &[u8; 32]) -> Result<(), u64> {
@@ -437,16 +438,41 @@ pub mod attest {
     pub const OP_UNWRAP: u64 = 2;
 }
 
+/// The key server (the task named "keys", `user/unlocker`): a stand-in for a local key store.
+pub mod keys {
+    /// Reply: the 32-byte storage master key. Only the task named "disk" gets it.
+    pub const OP_MASTER_KEY: u64 = 1;
+}
+
 /// Client side of the telemetry task (`user/telemetry`).
 pub mod telemetry {
     use super::send;
 
     /// Forward a line of text to the host as a `log` event.
     pub const OP_LOG: u64 = 1;
+    /// A storage event: kind (u64), block (u64), then a task name (the volume, or who unlocked).
+    pub const OP_STORAGE: u64 = 2;
+
+    /// Storage event kinds. VOLUME_CREATED: block = first block of the volume on the disk;
+    /// UNLOCKED: name = the task that gave the key; INTEGRITY_ERROR: block = the volume's block.
+    pub const VOLUME_CREATED: u64 = 1;
+    pub const STORAGE_LOCKED: u64 = 2;
+    pub const STORAGE_UNLOCKED: u64 = 3;
+    pub const INTEGRITY_ERROR: u64 = 4;
 
     /// Send `text` to telemetry task `id`. Fails like `send`.
     pub fn log(id: u64, text: &[u8]) -> Result<(), u64> {
         send(id, OP_LOG, text, &mut []).map(|_| ())
+    }
+
+    /// Report a storage event to telemetry task `id`. Fails like `send`.
+    pub fn storage(id: u64, kind: u64, block: u64, name: &[u8]) -> Result<(), u64> {
+        let mut msg = [0u8; 16 + 32];
+        let n = name.len().min(32);
+        msg[..8].copy_from_slice(&kind.to_le_bytes());
+        msg[8..16].copy_from_slice(&block.to_le_bytes());
+        msg[16..16 + n].copy_from_slice(&name[..n]);
+        send(id, OP_STORAGE, &msg[..16 + n], &mut []).map(|_| ())
     }
 }
 

@@ -4,8 +4,9 @@ A minimal x86-64 kernel in Rust, booted by [Limine](https://github.com/limine-bo
 isolated ring-3 processes. It provides serial output, GDT/TSS, IDT, an ELF loader, a page-table tree
 per process, a 100 Hz local APIC timer with round-robin preemption, synchronous IPC between
 processes, a supervisor task that restarts failed ones, unprivileged device-driver tasks (virtio
-console and vsock), telemetry streamed to a host agent, signed task images, a Secure Boot chain,
-measured boot and TPM remote attestation.
+console, vsock and block), telemetry streamed to a host agent, signed task images, a Secure Boot
+chain, measured boot, TPM remote attestation, and encrypted per-task storage whose key the host
+releases only to an attested boot.
 
 ## Processes
 
@@ -76,8 +77,8 @@ Intel VT-d (`-device intel-iommu`) to close this later.
 The kernel logs events at its control points into a 128-entry ring: task start, exit, fault
 (vector, `rip`, `cr2`), CPU-budget kill, restart, refused IPC sends. The task with `events = true`
 (`user/telemetry`) forwards them as newline-delimited JSON through the uplink driver, with a
-heartbeat every second and any `log` lines other tasks send it (the supervisor reports its
-decisions):
+heartbeat every second, any `log` lines other tasks send it (the supervisor reports its
+decisions) and storage events (see Storage):
 
 ```json
 {"seq":5,"t":1,"task":"crasher","id":"2","event":"fault","vector":14,"rip":"0x400182","cr2":"0x10"}
@@ -152,6 +153,108 @@ tools/verify-quote.py --reference build/attest-reference.json                   
 - **No IOMMU.** A signed but malicious driver can still use its device's DMA to subvert the system
   after measurement. Signing narrows who can run such code; it does not make drivers safe.
 
+## Storage
+
+`DISK=1` attaches `build/disk.img` (64 MiB, kept between runs) as a virtio block device. Three
+tasks share the work, named by convention so they can find each other:
+
+| Task | Program | Role |
+|---|---|---|
+| `blockdev` | `virtio-blk` | the driver: reads and writes raw 4 KiB blocks. Only `disk` may send to it. |
+| `disk` | `storage` | the storage task: gives every client its own encrypted volume |
+| `keys` or `attest` | `unlocker`, `attest` | hands `disk` the master key |
+
+Clients send `disk` block requests (`vanir_user::block`: read, write, flush, info) with block
+numbers relative to their volume. There is no file system: a volume is 256 numbered 4 KiB blocks
+(1 MiB). The volume is chosen by the client's manifest name, which the storage task gets from the
+kernel (`task_name` of the sender), so a client can neither name nor reach another task's volume;
+blocks past the end are refused. A task's first request creates its volume.
+
+**On disk** (all 4 KiB blocks):
+
+```
+block 0     superblock: "VNRSTOR2", next free block                  plain text
+block 1     volume table: 64 entries of name[32], start, size        plain text
+then per volume (258 blocks, in creation order):
+  2 metadata blocks   per data block: write counter (u64) and tag (16 bytes)
+  256 data blocks     XChaCha20-Poly1305 ciphertext, same size as the plain text
+```
+
+A disk without the magic is formatted on first use. Block `b` of a volume is encrypted with the
+volume key, nonce = `b` ‖ counter, and associated data = volume name ‖ `b` ‖ counter; the counter
+goes up on every write, so a nonce is never reused. Ciphertext that was changed, moved to another
+block or volume, or paired with another counter fails to decrypt: the client gets `INTEGRITY` and
+telemetry an `integrity_error`. A block never written (counter 0) reads as zeros.
+
+**Keys.** One 32-byte master key; each volume's key is HKDF-SHA256(master, salt
+`"vanir-storage-v1"`, info = volume name). The master key is only ever in the storage task's
+memory: the task starts **locked**, answering `LOCKED` to everything, and stays so until it gets
+the key, from one of two places:
+
+- **The key server** (`keys`, `user/unlocker`): a test stand-in for a local key store, with the
+  key compiled in. If `disk` may send to `keys`, it asks for the key when it starts. `keys` gives
+  it only to the task named `disk`.
+- **The host, after attestation** (`tests/apps/attest-storage.toml`). The key lives on the host
+  (`keys/master.key`, made by `host-agent.py`, never in the image). The flow:
+  1. The host sends `attest <nonce>`. The `attest` task makes a fresh X25519 key pair for this
+     boot and returns a TPM quote over SHA-256(nonce ‖ X25519 public key), so the key pair is
+     bound to the attested boot and this challenge.
+  2. The host verifies the quote against its approved reference (as in Boot chain and
+     attestation). If anything differs it logs `key_refused` with the reasons and stops.
+  3. Otherwise it seals the master key to the guest's X25519 key: an ephemeral X25519 exchange,
+     HKDF-SHA256(salt = nonce, info `"vanir key release"`), ChaCha20-Poly1305 with the nonce as
+     associated data. It sends `key <host public key ‖ ciphertext ‖ tag>` and logs `key_released`.
+  4. `control` passes it to `attest`, which opens it and sends the master key to `disk`
+     (`OP_UNLOCK`, accepted only from tasks named `keys` or `attest`).
+
+  A boot that measures differently (a changed kernel, manifest or task image) gets no key, and the
+  sealed key is useless to anything but that boot's `attest` task.
+
+**Restarts.** The supervisor restarts `disk` and `blockdev` like any task. A restarted
+`blockdev` resets the device; `disk` sees `DEAD`, finds the new driver and resends, keeping its
+key (`storage-blk-restart`). A restarted `disk` starts locked and must get the key again: from
+`keys` it asks itself (`storage-restart`); clients see `DEAD` and resend to the new id.
+
+**Telemetry.** If `disk` may send to `telemetry`, it reports:
+
+```json
+{"t":6,"task":"disk","id":"3","event":"storage_locked"}
+{"t":6,"task":"disk","id":"3","event":"storage_unlocked","by":"keys"}
+{"t":7,"task":"disk","id":"3","event":"volume_created","volume":"client-a","start":2}
+{"t":9,"task":"disk","id":"3","event":"integrity_error","volume":"client-a","block":0}
+```
+
+`task` comes from the kernel, so no other task can report storage events in `disk`'s name.
+
+```sh
+make run DISK=1 DISK_RESET=1 APP=tests/apps/storage.toml   # fresh disk: two clients write and check
+make run DISK=1 APP=tests/apps/storage.toml                # same disk: they find their data
+make run DISK=1 DISK_CORRUPT=client-a:0 ...                # flip a byte of client-a's block 0 first
+```
+
+**Limitations, plainly:**
+
+- **No rollback protection.** An attacker who can write the disk can put back an older data block
+  together with its older counter and tag, and it decrypts fine. Detecting that needs a root of
+  freshness (a Merkle tree over the metadata with its root in TPM NV storage or a monotonic
+  counter), which is not built.
+- **Plain-text layout.** The superblock and volume table are not encrypted or authenticated: task
+  names, volume positions, and which blocks were ever written (non-zero counters) are visible,
+  and changing the table can make a task lose its volume (denial of service, not disclosure).
+- **Not crash-consistent.** A write puts the data block on disk, then the metadata block. A crash
+  between the two leaves that block failing its integrity check until it is rewritten. Nothing
+  is guaranteed to be on stable storage until the client flushes.
+- **Fixed-size volumes.** 256 blocks for every task; there is no `volume_blocks` manifest key,
+  and volumes are never freed or resized.
+- **Key only in memory, and only from the host once.** In the attested flow the host says `bye`
+  after releasing the key, so a `disk` restarted later stays locked until the next boot (its
+  `storage_locked` event tells the host). Re-attesting on that event is not built.
+- **No IOMMU.** `blockdev` programs its device with physical addresses; a malicious driver could
+  have it DMA anywhere, including into `disk`'s memory where the key is.
+- **The hypervisor sees everything.** The master key and plain text sit in guest memory, which the
+  host can read; protecting against the host needs confidential computing (AMD SEV-SNP, Intel TDX).
+  Encryption at rest protects the disk image, not the running VM.
+
 ## Syscalls
 
 Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
@@ -205,6 +308,12 @@ Arguments in `rdi, rsi, rdx, r10, r8, r9`; results in `rax` (then `rdx`, `rsi`).
 | Signed task images, `min_version` | unsigned, modified, swapped or rolled-back programs | `sig-*` |
 | Secure Boot chain | a modified boot loader, config or kernel | `sb-*` |
 | Measured boot + TPM quotes | a host trusting a VM that booted something else | `measured-*`, `attest-*` |
+| Only the storage task may use the block driver | tasks reading the raw disk | `storage-no-driver` |
+| A volume per task, chosen by kernel-checked name | tasks reading or writing each other's data | `storage-isolation` |
+| Encryption at rest (XChaCha20-Poly1305) | plain text on the disk image | `storage-at-rest` |
+| Authenticated blocks, bound to volume, block and counter | changed or moved ciphertext read as data | `storage-tampered`, `storage-bad-block` |
+| Key per volume from a master key; locked until it arrives | reading the disk without the key | `storage-wrong-key`, `storage-locked` |
+| Key released only to an attested boot | a modified system getting the key | `attest-unlock-refused` |
 | Frames freed on death | memory exhaustion from restart loops | `restart-no-leak` |
 
 ## System dependencies
@@ -243,8 +352,11 @@ make                                  # build build/vanir-os.iso
 make run                              # boot in QEMU, serial output on the terminal
 make test                             # boot every scenario in tests/run.sh; prints PASS/FAIL each
 make test ACCEL=kvm                   # same, under KVM (needs access to /dev/kvm)
+ONLY='^storage' make test             # just the cases whose names match
 make run APP=tests/apps/budget.toml   # choose the app manifest
 make run TRANSPORT=vsock ACCEL=kvm ... # add a vhost-vsock device (see Telemetry)
+make run DISK=1 APP=tests/apps/storage.toml   # attach build/disk.img (see Storage); DISK_RESET=1
+                                      # starts it from zeros, DISK_CORRUPT=volume:block damages it
 make run USER_FEATURES=hello/poke-kernel   # turn on a test feature (see tests/run.sh)
 make run-debug                        # also log interrupts and CPU resets to qemu.log
 make clean                            # remove build outputs (make distclean also removes limine/)
@@ -298,11 +410,15 @@ user/dmatest/             checks the DMA region across a restart
 user/virtio/              virtio 1.x PCI transport and split virtqueues for drivers
 user/virtio-console/      console driver (OP_WRITE); crash-after-50 test feature
 user/virtio-vsock/        vsock driver: one stream to host CID 2 port 5000
+user/virtio-blk/          block driver: 4 KiB block read/write/flush; crash-after-10 test feature
+user/storage/             storage task: encrypted volume per task, locked until it gets the key
+user/blktest/             block client: writes, reads back and checks a pattern
+user/unlocker/            key server ("keys"): test stand-in that gives "disk" the master key
 user/chatter/             writes 200 numbered lines through the console driver
 user/telemetry/           event log + heartbeats -> JSON lines -> uplink
 user/tpm2/                TPM 2.0 client: attestation key, quote, PCR read
-user/attest/              answers quote requests with a JSON quote
-user/control/             reads host commands from the uplink (attest <nonce>)
+user/attest/              answers quote requests with a JSON quote; opens the released key
+user/control/             reads host commands from the uplink (attest <nonce>, key <sealed>)
 apps/                     app manifests (the default image, and the format)
 tests/apps/               the manifests the tests boot
 tools/host-agent.py       receives and checks telemetry (file, stdin, Unix socket, vsock)
@@ -310,8 +426,10 @@ tools/check_lines.py      checks numbered lines arrived in order
 tools/sign-image.py       makes the image-signing key; signs task images
 tools/expected-pcrs.py    computes PCR 12 from the build output
 tools/verify-quote.py     verifies a TPM quote against a recorded reference
+tools/vanir_attest.py     quote checks and key sealing shared by verify-quote and host-agent
+tools/corrupt-disk.py     flips a byte of a volume's block in the disk image
 tools/with-swtpm.sh       runs QEMU with a software TPM
-keys/                     image-signing key (generated, not in git)
+keys/                     image-signing key and storage master key (generated, not in git)
 user/linker.ld            user programs are ELF, linked at 0x400000
 tests/run.sh              boots each scenario and checks QEMU status and output
 ```

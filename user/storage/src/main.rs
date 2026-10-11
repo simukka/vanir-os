@@ -9,7 +9,15 @@
 //! counter (so it never repeats), and the block's volume name, number and counter are bound in
 //! as associated data, so ciphertext changed, moved between blocks or volumes, or paired with
 //! the wrong counter fails to decrypt (CODE_INTEGRITY). Counters and tags live in each volume's
-//! metadata blocks. Until it gets the master key (OP_UNLOCK), the task answers CODE_LOCKED.
+//! metadata blocks.
+//!
+//! The master key is only ever in memory. The task starts locked, answering CODE_LOCKED: it asks
+//! the key server ("keys") for the key if it may send to one, and otherwise waits for OP_UNLOCK
+//! (from "attest", after the host released the key). A restarted storage task starts locked
+//! again, and has to get the key again.
+//!
+//! Storage events go to the telemetry task if it may send to one: volume_created,
+//! storage_locked, storage_unlocked and integrity_error (with the volume and block).
 //!
 //! On disk (4 KiB blocks): block 0 superblock, block 1 the volume table (both in plain text),
 //! then volumes: `META_BLOCKS` metadata blocks followed by `DATA_BLOCKS` data blocks each.
@@ -24,7 +32,9 @@ use vanir_user::block::{
     self, BLOCK_SIZE, CODE_BAD_OP, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE, OP_FLUSH,
     OP_INFO, OP_READ, OP_UNLOCK, OP_WRITE, split,
 };
-use vanir_user::{err, lookup, println, recv, reply, sleep, task_name};
+use vanir_user::keys::OP_MASTER_KEY;
+use vanir_user::telemetry::{self, INTEGRITY_ERROR, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
+use vanir_user::{err, lookup, println, recv, reply, send, sleep, task_name};
 
 vanir_user::entry!(main);
 
@@ -58,6 +68,8 @@ struct Storage {
     capacity: u64,
     next_free: u64,
     volumes: [Option<Volume>; MAX_VOLUMES],
+    /// The telemetry task, while we may send to it.
+    telemetry: Option<u64>,
 }
 
 /// Run a driver call, finding the driver again (by name) if it was restarted.
@@ -79,6 +91,16 @@ fn on_driver<T>(driver: &mut u64, mut f: impl FnMut(u64) -> Result<T, u64>) -> R
 }
 
 impl Storage {
+    /// Report a storage event (best effort: telemetry may be absent, gone or not ours to use).
+    fn event(&mut self, kind: u64, block: u64, name: &[u8]) {
+        let Some(t) = self.telemetry else { return };
+        if let Err(e) = telemetry::storage(t, kind, block, name) {
+            if e == err::NOT_ALLOWED || e == err::DEAD {
+                self.telemetry = None;
+            }
+        }
+    }
+
     fn read(&mut self, b: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), u64> {
         on_driver(&mut self.driver, |d| block::read(d, b, buf))
     }
@@ -156,6 +178,7 @@ impl Storage {
             self.write(v.start + m, &zero)?;
         }
         self.save()?;
+        self.event(VOLUME_CREATED, v.start, name);
         println!(
             "storage: new volume for {}: blocks {}..{}",
             core::str::from_utf8(name).unwrap_or("?"),
@@ -204,7 +227,11 @@ impl Storage {
         let tag = Tag::try_from(&meta[at + 8..at + 24]).unwrap();
         self.read(v.start + META_BLOCKS + b, out)?;
         let (nonce, aad) = Self::binding(v, b, counter);
-        self.cipher(v).decrypt_inout_detached(&nonce, &aad, out.as_mut_slice().into(), &tag).map_err(|_| CODE_INTEGRITY)
+        if self.cipher(v).decrypt_inout_detached(&nonce, &aad, out.as_mut_slice().into(), &tag).is_err() {
+            self.event(INTEGRITY_ERROR, b, name_of(v));
+            return Err(CODE_INTEGRITY);
+        }
+        Ok(())
     }
 
     fn write_data(&mut self, v: &Volume, b: u64, data: &mut [u8; BLOCK_SIZE]) -> Result<(), u64> {
@@ -221,9 +248,31 @@ impl Storage {
     }
 }
 
+/// A volume's name without its zero padding.
+fn name_of(v: &Volume) -> &[u8] {
+    &v.name[..v.name.iter().position(|&c| c == 0).unwrap_or(32)]
+}
+
+/// Ask the key server for the master key, if there is one we may ask.
+fn fetch_key() -> Option<[u8; 32]> {
+    let keys = lookup("keys").ok()?;
+    let mut key = [0u8; 32];
+    match send(keys, OP_MASTER_KEY, &[], &mut key) {
+        Ok((CODE_OK, 32)) => Some(key),
+        _ => None,
+    }
+}
+
 fn main() -> u64 {
     let driver = lookup("blockdev").expect("no blockdev task");
-    let mut s = Storage { driver, master: None, capacity: 0, next_free: FIRST_DATA, volumes: [None; MAX_VOLUMES] };
+    let mut s = Storage {
+        driver,
+        master: None,
+        capacity: 0,
+        next_free: FIRST_DATA,
+        volumes: [None; MAX_VOLUMES],
+        telemetry: lookup("telemetry").ok(),
+    };
     s.capacity = match on_driver(&mut s.driver, block::capacity) {
         Ok(c) => c,
         Err(e) => {
@@ -235,6 +284,14 @@ fn main() -> u64 {
         println!("storage: cannot read the volume table: {}", block::code_name(e));
         return 1;
     }
+    s.event(STORAGE_LOCKED, 0, b"");
+    if let Some(key) = fetch_key() {
+        s.master = Some(key);
+        println!("storage: unlocked by keys");
+        s.event(STORAGE_UNLOCKED, 0, b"keys");
+    }
+    #[cfg(feature = "crash-after-16")]
+    let mut writes = 0u32;
 
     let mut msg = [0u8; BLOCK_SIZE];
     loop {
@@ -254,6 +311,14 @@ fn main() -> u64 {
         name_copy[..name.len()].copy_from_slice(name);
         let name = &name_copy[..name.len()];
         let (op, b) = split(m.op);
+        #[cfg(feature = "crash-after-16")]
+        if op == block::OP_WRITE {
+            writes += 1;
+            if writes == 16 && vanir_user::getpid() >> 16 == 0 {
+                println!("storage: crashing after 15 writes");
+                unsafe { core::ptr::read_volatile(0x10 as *const u8) };
+            }
+        }
         if op == OP_UNLOCK {
             let code = if !UNLOCKERS.contains(&name) {
                 CODE_NOT_ALLOWED
@@ -262,6 +327,7 @@ fn main() -> u64 {
             } else {
                 s.master = Some(msg[..32].try_into().unwrap());
                 println!("storage: unlocked by {}", core::str::from_utf8(name).unwrap_or("?"));
+                s.event(STORAGE_UNLOCKED, 0, name);
                 CODE_OK
             };
             let _ = reply(m.sender, code, &[]);

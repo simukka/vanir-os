@@ -1,4 +1,4 @@
-# Two clients, each with its own volume, behind the storage task ("disk"), unlocked by "keys".
+# Two clients, each with its own volume, behind the storage task ("disk"), unlocked with the key from "keys".
 [[task]]
 name = "blockdev"
 program = "virtio-blk"
@@ -8,7 +8,7 @@ dma_pages = 16
 [[task]]
 name = "disk"
 program = "storage"
-sends = ["blockdev"]
+sends = ["blockdev", "keys"]
 
 [[task]]
 name = "client-a"
@@ -23,4 +23,3 @@ sends = ["disk"]
 [[task]]
 name = "keys"
 program = "unlocker"
-sends = ["disk"]

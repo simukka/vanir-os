@@ -13,3 +13,7 @@ chacha20poly1305 = { version = "0.11.0", default-features = false }
 hkdf = "0.13.0"
 sha2 = { version = "0.11.0", default-features = false }
 vanir-user = { path = "../lib" }
+
+[features]
+# First start only: fault on the 16th write request (the supervisor restarts us, locked).
+crash-after-16 = []

@@ -7,7 +7,7 @@
 #
 # Expected text is a fixed string; with an "re:" prefix, a Perl regex matched against the whole
 # output (so [\s\S]* can span lines and check ordering); with "cmd:", a shell command that gets
-# the output on stdin and must succeed.
+# the output on stdin and must succeed. ONLY=<regex> runs just the cases whose names match.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -76,6 +76,10 @@ CASES=(
   "storage-wrong-key     | storage                 | blktest/check-only unlocker/wrong-key                     |               | DISK=1                                                                                                                      | 3 | re:(?=[\s\S]*client-a read 0 failed: INTEGRITY)[\s\S]*client-b read 0 failed: INTEGRITY|(?=[\s\S]*client-b read 0 failed: INTEGRITY)[\s\S]*client-a read 0 failed: INTEGRITY"
   "storage-locked        | storage-locked          |                                                           |               | DISK=1                                                                                                                      | 3 | the disk stayed LOCKED"
   "storage-no-driver     | storage-poke            | blktest/poke-driver                                       |               | DISK=1                                                                                                                      | 1 | talking to the block driver directly: NOT_ALLOWED"
+  "storage-events        | storage-events          | telemetry/exit-after-3-heartbeats                         |               | DISK=1 DISK_RESET=1                                                                                                         | 1 | cmd:out=\$(cat); grep -q 'client-a read back 32 blocks, all correct' <<<\"\$out\" && tools/host-agent.py - --quiet --check --expect volume_created=1 --expect storage_locked=1 --expect storage_unlocked=1 <<<\"\$out\""
+  "storage-bad-block     | storage-events          | blktest/check-only telemetry/exit-after-3-heartbeats      |               | DISK=1 DISK_CORRUPT=client-a:0                                                                                              | 3 | re:client-a read 0 failed: INTEGRITY[\s\S]*integrity_error\W+volume\W+client-a\W+block\W+0\b"
+  "storage-restart       | storage-restart         | storage/crash-after-16 telemetry/exit-after-3-heartbeats  |               | DISK=1 DISK_RESET=1                                                                                                         | 1 | cmd:out=\$(cat); grep -q 'client-a read back 32 blocks, all correct' <<<\"\$out\" && tools/host-agent.py - --quiet --check --expect restart=1 --expect storage_locked=2 --expect storage_unlocked=2 <<<\"\$out\""
+  "storage-blk-restart   | storage-restart         | virtio-blk/crash-after-10 telemetry/exit-after-3-heartbeats |               | DISK=1 DISK_RESET=1                                                                                                         | 1 | cmd:out=\$(cat); grep -q 'client-a read back 32 blocks, all correct' <<<\"\$out\" && grep -q 'crashing with a write in flight' <<<\"\$out\" && [ \$(grep -c storage_locked <<<\"\$out\") -eq 1 ]"
   "attest-storage-record | attest-storage          |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock ATTEST=1 DISK=1 DISK_RESET=1                                               | 3 | cmd:tools/verify-quote.py --log build/telemetry.log --record build/attest-storage-reference.json --expected-pcr12 \$(tools/expected-pcrs.py --app tests/apps/attest-storage.toml)"
   "attest-unlock         | attest-storage          |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock ATTEST=1 DISK=1 DISK_RESET=1 RELEASE=build/attest-storage-reference.json   | 1 | re:(?=[\s\S]*storage unlocked with the released key)(?=[\s\S]*client-a read back 32 blocks, all correct)[\s\S]*key_released"
   "attest-unlock-persist | attest-storage          |                                                           |               | BOOT=uefi-secure ACCEL=kvm TPM=1 TRANSPORT=vsock ATTEST=1 DISK=1 RELEASE=build/attest-storage-reference.json                | 1 | re:(?=[\s\S]*key_released)(?=[\s\S]*client-a found data from an earlier boot)[\s\S]*client-a read back 32 blocks, all correct"
@@ -88,6 +92,7 @@ failed=0
 for case in "${CASES[@]}"; do
   IFS='|' read -r name app user kernel env want_status want_text <<<"$case"
   name=$(trim "$name"); app=$(trim "$app"); env=$(trim "$env"); user=$(trim "$user"); kernel=$(trim "$kernel")
+  [[ "$name" =~ ${ONLY:-.} ]] || continue
   want_status=$(trim "$want_status"); want_text=$(trim "$want_text")
 
   vars=(ACCEL="${ACCEL:-tcg}" $env)

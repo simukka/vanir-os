@@ -1,5 +1,6 @@
 //! Telemetry: forwards the kernel event log to the host as newline-delimited JSON through the
-//! console driver, adds a heartbeat every second, and forwards `OP_LOG` text from other tasks.
+//! console driver, adds a heartbeat every second, and forwards `OP_LOG` text and `OP_STORAGE`
+//! events (volume created, locked, unlocked, integrity error) from other tasks.
 //!
 //! Every kernel event keeps its sequence number, so the host can tell when events were lost;
 //! if the kernel's ring wrapped before we read it, a `dropped` record says how many.
@@ -9,7 +10,7 @@
 
 use core::fmt::{self, Write};
 use vanir_user::events::{self, Event};
-use vanir_user::telemetry::OP_LOG;
+use vanir_user::telemetry::{self, OP_LOG};
 use vanir_user::{NOTIFY_TIMER, console, err, lookup, println, recv_timeout, reply, sleep, task_index, task_name, uptime};
 
 vanir_user::entry!(main);
@@ -137,6 +138,24 @@ fn event_line(out: &mut Out, e: &Event) {
     out.end_line();
 }
 
+/// A storage task's event (`telemetry::OP_STORAGE`). The sender's name comes from the kernel, so
+/// a task can report events only as itself.
+fn storage_line(out: &mut Out, sender: u64, msg: &[u8]) {
+    let kind = u64::from_le_bytes(msg[..8].try_into().unwrap());
+    let block = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+    let name = Text(&msg[16..]);
+    let _ = write!(out, "{{\"t\":{},\"task\":{},\"id\":{},", uptime(), Name(sender), Id(sender));
+    let _ = match kind {
+        telemetry::VOLUME_CREATED => write!(out, "\"event\":\"volume_created\",\"volume\":{},\"start\":{}", name, block),
+        telemetry::STORAGE_LOCKED => write!(out, "\"event\":\"storage_locked\""),
+        telemetry::STORAGE_UNLOCKED => write!(out, "\"event\":\"storage_unlocked\",\"by\":{}", name),
+        telemetry::INTEGRITY_ERROR => write!(out, "\"event\":\"integrity_error\",\"volume\":{},\"block\":{}", name, block),
+        kind => write!(out, "\"event\":\"unknown\",\"storage_kind\":{}", kind),
+    };
+    let _ = out.write_str("}");
+    out.end_line();
+}
+
 /// Forward every event the kernel has logged since the last call.
 fn drain_events(out: &mut Out) {
     let mut batch = [Event::default(); 32];
@@ -204,6 +223,11 @@ fn main() -> u64 {
                 drain_events(&mut out); // keep the stream in order: kernel events first
                 let _ = write!(out, "{{\"t\":{},\"event\":\"log\",\"from\":{},\"msg\":{}}}", uptime(), Name(m.sender), Text(&msg[..m.len]));
                 out.end_line();
+            }
+            Ok(m) if m.op == telemetry::OP_STORAGE && m.len >= 16 => {
+                let _ = reply(m.sender, 0, &[]);
+                drain_events(&mut out);
+                storage_line(&mut out, m.sender, &msg[..m.len]);
             }
             Ok(m) => {
                 let _ = reply(m.sender, 1, &[]);
