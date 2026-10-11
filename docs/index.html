@@ -171,21 +171,31 @@ td code { white-space: nowrap; }
       <li><a href="#storage-restarts">13.4 Restarts and events</a></li>
     </ol>
   </li>
-  <li><a href="#syscalls">14. Syscalls</a></li>
-  <li><a href="#protections">15. Protections</a></li>
-  <li><a href="#limitations">16. Limitations</a></li>
+  <li><a href="#networking">14. Networking</a>
+    <ol>
+      <li><a href="#net-tasks">14.1 Drivers and stacks</a></li>
+      <li><a href="#net-sockets">14.2 Sockets</a></li>
+      <li><a href="#net-routing">14.3 Routing and draining</a></li>
+      <li><a href="#net-limits">14.4 Limits</a></li>
+      <li><a href="#net-telemetry">14.5 Counters and events</a></li>
+      <li><a href="#net-running">14.6 Running it</a></li>
+    </ol>
+  </li>
+  <li><a href="#syscalls">15. Syscalls</a></li>
+  <li><a href="#protections">16. Protections</a></li>
+  <li><a href="#limitations">17. Limitations</a></li>
 </ol>
 <p class="part">Working on vanir-os</p>
 <ol>
-  <li><a href="#agents">17. Agent quick reference</a></li>
-  <li><a href="#build">18. Build, run, test</a></li>
-  <li><a href="#tests">19. Test catalogue</a></li>
-  <li><a href="#repo-map">20. Repository map</a></li>
-  <li><a href="#recipes">21. Recipes</a></li>
-  <li><a href="#invariants">22. Invariants</a></li>
-  <li><a href="#troubleshooting">23. Troubleshooting</a></li>
-  <li><a href="#dependencies">24. System dependencies</a></li>
-  <li><a href="#glossary">25. Glossary</a></li>
+  <li><a href="#agents">18. Agent quick reference</a></li>
+  <li><a href="#build">19. Build, run, test</a></li>
+  <li><a href="#tests">20. Test catalogue</a></li>
+  <li><a href="#repo-map">21. Repository map</a></li>
+  <li><a href="#recipes">22. Recipes</a></li>
+  <li><a href="#invariants">23. Invariants</a></li>
+  <li><a href="#troubleshooting">24. Troubleshooting</a></li>
+  <li><a href="#dependencies">25. System dependencies</a></li>
+  <li><a href="#glossary">26. Glossary</a></li>
 </ol>
 </nav>
 
@@ -203,7 +213,7 @@ time.</p>
 an operating system before. <strong>Part two</strong> is the reference: what each subsystem
 does, its interfaces, and the tests that prove it. <strong>Part three</strong> is for working on
 the code, by people or by coding agents: commands, file locations, recipes, rules and fixes.
-Agents should start at <a href="#agents">17. Agent quick reference</a> or fetch
+Agents should start at <a href="#agents">18. Agent quick reference</a> or fetch
 <a href="llms.txt"><code>llms.txt</code></a>.</p>
 </div>
 
@@ -228,11 +238,13 @@ restarting failed programs, storage and talking to a host, are separate tasks he
   <li>supervisor notifications and task restarts with generation-checked ids</li>
   <li>PCI device grants, MSI-X interrupts and DMA regions for driver tasks</li>
   <li>a kernel event log, signature checks on task images, and boot measurements into a TPM</li>
+  <li>notifications a task posts to another without waiting, and a supervisor-only halt</li>
 </ul>
 
-<p>On top of that, as tasks: virtio console, vsock and block drivers; telemetry streamed to a
-host agent; TPM remote attestation; and encrypted per-task storage whose key the host releases
-only to a boot it has attested.</p>
+<p>On top of that, as tasks: virtio console, vsock, block and network drivers; telemetry
+streamed to a host agent; TPM remote attestation; encrypted per-task storage whose key the host
+releases only to a boot it has attested; and TCP services behind separate data and management
+network stacks, with routing and draining between instances.</p>
 
 <div class="cards">
   <div class="card"><h4>Static</h4><p>No <code>fork</code> or <code>exec</code>. The manifest fixes every task, its budget and who it may talk to.</p></div>
@@ -243,9 +255,9 @@ only to a boot it has attested.</p>
 
 <h2 id="quick-start"><span class="num">2</span>Quick start<a class="anchor" href="#quick-start">#</a></h2>
 
-<p>Install the dependencies (<a href="#dependencies">24</a>), then:</p>
+<p>Install the dependencies (<a href="#dependencies">25</a>), then:</p>
 <pre><code>make run                                   # build the ISO and boot it in QEMU
-make test                                  # boot all 70 scenarios and check each one
+make test                                  # boot all 85 scenarios and check each one
 make test ACCEL=kvm                        # the same under KVM
 make run APP=tests/apps/two-spinners.toml  # boot a different set of tasks</code></pre>
 
@@ -473,7 +485,7 @@ kernel.</p>
     <code>budget</code> is killed after that many ticks of CPU.</li>
   <li><strong>Outcomes.</strong> A task ends by <code>exit</code>, by faulting, or by using up
     its budget; the others keep running. When nothing can run, the kernel prints a summary and
-    halts with a status (<a href="#build">18</a>). Tasks waiting in <code>recv</code> count as
+    halts with a status (<a href="#build">19</a>). Tasks waiting in <code>recv</code> count as
     idle servers; tasks stuck in <code>send</code> mean a deadlock.</li>
 </ul>
 
@@ -508,10 +520,16 @@ devices = ["virtio-console"]  # optional: PCI devices to drive (kernel/src/pci_k
 dma_pages = 16         # optional: contiguous DMA region in 4 KiB pages (max 256)
 events = true          # optional: may read the kernel event log and stats (at most one)
 min_version = 2        # optional: refuse images signed with an older version
-tpm = true             # optional: gets the TPM mapped, for attestation (at most one)</code></pre>
+tpm = true             # optional: gets the TPM mapped, for attestation (at most one)
+listen = [{ port = 80, max_connections = 64, max_per_source = 16 }]
+                       # optional: TCP ports it may listen on (max_connections default 64,
+                       # max_per_source default max_connections; at most 8 entries)
+service = "web"        # optional: the network service it is an instance of (default: its name)
+routes = true          # optional: may route, drain and blocklist in the network stacks</code></pre>
 
 <p>The build fails on unknown keys, duplicate names, unknown <code>sends</code> targets or
-device names, or more than one supervisor, event reader or TPM task. Each <code>devices</code>
+device names, more than one supervisor, event reader or TPM task, or a port declared by two
+different services (instances of one service may share it). Each <code>devices</code>
 entry claims the next unclaimed device of that kind; a missing device is logged and the task
 runs without it.</p>
 
@@ -524,6 +542,9 @@ runs without it.</p>
 <tr><td><code>disk</code></td><td>clients, keys, attest</td><td>the storage task (or, in <code>blk*</code> tests, the driver itself)</td></tr>
 <tr><td><code>keys</code></td><td>storage</td><td>key server that gives <code>disk</code> the master key</td></tr>
 <tr><td><code>attest</code></td><td>control, storage</td><td>TPM quotes; opens the host's released key</td></tr>
+<tr><td><code>net</code>, <code>nic</code></td><td>services, <code>net</code></td><td>the data network's stack and its NIC driver (<a href="#networking">14</a>)</td></tr>
+<tr><td><code>mgmt-net</code>, <code>nic-mgmt</code></td><td>the agent, <code>mgmt-net</code></td><td>the management network's stack and its NIC driver</td></tr>
+<tr><td><code>control</code></td><td>telemetry</td><td>the only task that may set the counter snapshot interval</td></tr>
 </table>
 
 <div class="agent"><span class="label">For agents</span><dl>
@@ -633,10 +654,15 @@ grants one to a task (<code>devices = ["virtio-console"]</code>). The driver get
 </figure>
 
 <p>Drivers: <code>virtio-console</code>, <code>virtio-vsock</code> (one stream to host CID 2,
-port 5000) and <code>virtio-blk</code>, all on the shared <code>user/virtio</code> crate
+port 5000), <code>virtio-blk</code> and <code>virtio-net</code> (<a href="#networking">14</a>), all on the shared <code>user/virtio</code> crate
 (virtio 1.x modern PCI, split virtqueues). A crashing driver is restarted by the supervisor; it
 resets the device and carries on, and its clients see <code>DEAD</code> and retry against the
-new id (<code>console-restart</code>, <code>blk-restart</code>).</p>
+new id (<code>console-restart</code>, <code>blk-restart</code>, <code>nic-restart</code>).</p>
+
+<p>A driver that must tell its client something without being asked (frames arrived) posts a
+notification with <code>notify(client, bits)</code> rather than sending: only the client sends,
+so the two can't deadlock. The client gets the bits in <code>recv</code> as sender 0,
+<code>NOTIFY_POST</code>.</p>
 
 <div class="admonition warning"><span class="label">Limit</span>
 <p>There is no IOMMU yet. A driver programs its device with physical addresses, so a malicious
@@ -647,7 +673,7 @@ VT-d DMA remapping (<code>plans/step-7-iommu.md</code>).</p></div>
 <div class="agent"><span class="label">For agents</span><dl>
 <dt>files</dt><dd><code>kernel/src/pci.rs</code>, <code>kernel/src/pci_kinds.rs</code>, <code>kernel/src/irq.rs</code>, <code>user/virtio/</code>, <code>user/virtio-*/</code></dd>
 <dt>syscalls</dt><dd><code>device_bar</code>, <code>pci_config_read</code>, <code>dma_info</code>; <code>recv_flags(.., RECV_EXPECT_IRQ)</code></dd>
-<dt>tests</dt><dd><code>device-*</code>, <code>dma-*</code>, <code>console-*</code>, <code>blk-*</code></dd>
+<dt>tests</dt><dd><code>device-*</code>, <code>dma-*</code>, <code>console-*</code>, <code>blk-*</code>, <code>nic-*</code></dd>
 </dl></div>
 
 <h2 id="telemetry"><span class="num">11</span>Telemetry<a class="anchor" href="#telemetry">#</a></h2>
@@ -656,7 +682,8 @@ VT-d DMA remapping (<code>plans/step-7-iommu.md</code>).</p></div>
 (vector, <code>rip</code>, <code>cr2</code>), CPU-budget kill, restart, refused IPC sends and
 rejected images. The task with <code>events = true</code> (<code>user/telemetry</code>)
 forwards them as newline-delimited JSON through the uplink driver, with a heartbeat every
-second, <code>log</code> lines from other tasks, and storage events.</p>
+second, <code>log</code> lines from other tasks, storage events, and network events and
+counter snapshots (<a href="#net-telemetry">14.5</a>).</p>
 
 <figure>
 <pre class="diagram">
@@ -690,11 +717,13 @@ make run TRANSPORT=vsock ACCEL=kvm APP=tests/apps/telemetry-vsock.toml</code></p
 <p><code>host-agent.py</code> checks that every line is JSON with an <code>event</code>, that
 sequence gaps are covered by <code>dropped</code>, and heartbeat spacing;
 <code>--check</code> turns problems into the exit status and <code>--expect EVENT=N</code>
-requires counts.</p>
+requires counts. <code>--set-interval MS</code> sets the counter snapshot interval once the
+guest connects (vsock), and <code>--expect-interval TICKS</code> checks that snapshots then
+arrive that far apart.</p>
 
 <div class="agent"><span class="label">For agents</span><dl>
 <dt>files</dt><dd><code>kernel/src/events.rs</code>, <code>user/telemetry/src/main.rs</code> (<code>event_line</code>, <code>storage_line</code>), <code>tools/host-agent.py</code></dd>
-<dt>gotcha</dt><dd>telemetry never exits on its own; tests build it with <code>telemetry/exit-after-3-heartbeats</code> so the run can end</dd>
+<dt>gotcha</dt><dd>telemetry never exits on its own; tests build it with <code>telemetry/exit-after-3-heartbeats</code> so the run can end, or the supervisor with <code>halt-on-exit</code></dd>
 <dt>gotcha</dt><dd>vsock needs <code>/dev/vhost-vsock</code> (the <code>kvm</code> group) and KVM</dd>
 </dl></div>
 
@@ -902,7 +931,201 @@ make run DISK=1 DISK_CORRUPT=client-a:0 APP=...            # flip a byte of clie
 <dt>gotcha</dt><dd><code>storage-*</code> cases depend on the disk image the previous case left; <code>DISK_RESET=1</code> starts clean</dd>
 </dl></div>
 
-<h2 id="syscalls"><span class="num">14</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
+<h2 id="networking"><span class="num">14</span>Networking<a class="anchor" href="#networking">#</a></h2>
+
+<p>Services serve TCP from tasks of their own, as RFD 1 (<code>rfd/0001-network-services.md</code>)
+proposes. Each network has a NIC driver task and a network stack task, and the management and
+data networks are separate: a flood or a compromise of the data stack can't reach the stack the
+control plane uses. Everything is declared in the manifest; nothing here loads at run time.</p>
+
+<figure>
+<pre class="diagram">
+  host / clients
+      | data network                      | management network
+      v                                   v
+  nic (virtio-net) --frames-- net     nic-mgmt (virtio-net) --frames-- mgmt-net
+      DMA ring             smoltcp        DMA ring                  smoltcp
+                    sockets, routing,                                  |
+                    limits, counters                              mgmt-echo (stands in
+                     |         |    \                              for the node agent)
+                  web-1      web-2   '--counters, events--&gt; telemetry
+              (live)   (draining)
+                     ^
+               switcher (routes = true): route, drain, blocklist
+</pre>
+<figcaption>Network tasks</figcaption>
+</figure>
+
+<h3 id="net-tasks"><span class="num">14.1</span>Drivers and stacks<a class="anchor" href="#net-tasks">#</a></h3>
+
+<p><code>user/virtio-net</code> moves Ethernet frames between a virtio-net device and one
+client, and knows nothing about IP (<code>vanir_user::nic</code>): <code>OP_SEND_FRAME</code>
+takes one frame, <code>OP_RECV_FRAMES</code> returns as many waiting frames as fit in 4 KiB and
+never waits, <code>OP_INFO</code> gives the MAC and the interface counters. It negotiates only
+<code>VERSION_1</code> and <code>MAC</code>: no checksum offload, so smoltcp computes checksums.
+Sixteen 2 KiB receive buffers stay posted. The receive interrupt is on only after the client
+has emptied the ring; the driver then posts <code>NOTIFY_RX</code> to it with
+<code>notify</code>, turns the interrupt off, and the client polls until the ring is empty
+again (as Linux's NAPI does).</p>
+
+<p><code>user/net</code> runs <a href="https://github.com/smoltcp-rs/smoltcp">smoltcp</a> 0.12
+(ARP, IPv4, TCP, DHCP) with no heap: 96 sockets with 4 KiB buffers each, in fixed arrays. Only
+<code>net</code> sends to the driver, and the driver only posts notifications back, so the two
+can't deadlock. The same program runs both stacks: the task named <code>net</code> drives
+<code>nic</code>, and <code>mgmt-net</code> drives <code>nic-mgmt</code>. Both use DHCP; the
+<code>net/static-addr</code> test feature gives the data stack 10.0.9.2/24 instead, for the
+<code>dgram</code> backend, which has no DHCP server.</p>
+
+<p><code>net</code> spends at most half of each tick on received frames. Past that, frames wait
+in the driver's ring until the next tick and the device drops what doesn't fit, so a flood
+can't take the CPU from the services or the management stack (<code>mgmt-under-flood</code>).
+The budget is measured with the TSC, so time <code>net</code> spends preempted counts too.</p>
+
+<h3 id="net-sockets"><span class="num">14.2</span>Sockets<a class="anchor" href="#net-sockets">#</a></h3>
+
+<p>A service declares its ports in the manifest (<code>listen</code>, <a href="#manifests">7</a>).
+<code>net</code> asks the kernel which ports a client may use (<code>task_listen</code>), so a
+task can't claim ports it wasn't given (<code>http-undeclared-port</code>), and the build refuses
+two services declaring one port (<code>build-http-port-clash</code>). Instances of one service
+(<code>service = "web"</code>) may share a port.</p>
+
+<table>
+<tr><th>Op</th><th>Message &rarr; reply</th></tr>
+<tr><td><code>OP_LISTEN</code> 1</td><td>port &rarr; listener handle; <code>NOT_ALLOWED</code> if undeclared</td></tr>
+<tr><td><code>OP_WAIT</code> 2</td><td>ticks (0: no limit) &rarr; <code>Event</code>s (handle, flags), held until there are some or the time runs out</td></tr>
+<tr><td><code>OP_ACCEPT</code> 3</td><td>listener &rarr; connection handle, client address and port; or <code>WOULD_BLOCK</code></td></tr>
+<tr><td><code>OP_RECV</code> 4</td><td>handle, most bytes &rarr; bytes; <code>WOULD_BLOCK</code>, or <code>CLOSED</code> once the peer is done</td></tr>
+<tr><td><code>OP_SEND</code> 5</td><td>handle, bytes &rarr; how many were taken (an <code>EV_WRITE</code> follows when there is room)</td></tr>
+<tr><td><code>OP_CLOSE</code> 6, <code>OP_SHUTDOWN</code> 7</td><td>handle: close and free it; or send a FIN and keep reading</td></tr>
+<tr><td><code>OP_READY</code> 8, <code>OP_DONE</code> 9</td><td>the instance can serve; a draining instance has finished</td></tr>
+<tr><td><code>OP_ROUTE</code> 10, <code>OP_DRAIN</code> 11, <code>OP_BLOCK</code> 12</td><td>routing, for tasks with <code>routes = true</code> (<a href="#net-routing">14.3</a>, <a href="#net-limits">14.4</a>)</td></tr>
+</table>
+
+<p>Events: <code>EV_ACCEPT</code>, <code>EV_READ</code> (data, or the peer closed),
+<code>EV_WRITE</code>, <code>EV_CLOSED</code> (reset), <code>EV_DRAIN</code> (handle 0). Only
+<code>OP_WAIT</code> waits, so a single-threaded service runs one event loop. Handles carry a
+generation, as task ids do, so a handle kept after its connection closed can't name a newer
+one. smoltcp has no accept queue (one socket holds one connection), so <code>net</code> keeps a
+few sockets listening on each port in use and hands each connected one to the live instance of
+the port's service.</p>
+
+<p><code>user/http</code> is a small HTTP/1.1 server on this interface: <code>GET</code> and
+<code>HEAD</code>, keep-alive, fixed buffers. <code>/</code> answers <code>hello from
+&lt;task&gt;</code> and <code>/count</code> the number of requests. When either side restarts,
+the other recovers: HTTP finds <code>net</code> again and listens anew (<code>net-restart</code>),
+and <code>net</code> forgets a restarted instance's connections (<code>http-restart</code>).</p>
+
+<h3 id="net-routing"><span class="num">14.3</span>Routing and draining<a class="anchor" href="#net-routing">#</a></h3>
+
+<p>Each service has one <strong>live</strong> instance, which gets its new connections; existing
+connections stay where they are. An instance becomes live only after it has said
+<code>OP_READY</code>. The first ready instance of a service becomes live by itself; after that,
+a task with <code>routes = true</code> changes it with <code>OP_ROUTE</code>
+(<code>route-not-ready</code>, <code>route-not-allowed</code>). In tests that task is
+<code>switcher</code>, standing in for RFD 2's node agent.</p>
+
+<figure>
+<pre class="diagram">
+  switcher: OP_ROUTE web-2      new connections now go to web-2
+  switcher: OP_DRAIN web-1, deadline 10 s   (reply held)
+     net --EV_DRAIN--&gt; web-1    web-1 stops accepting; answers each connection's next
+                                request with "Connection: close"; clients reconnect to web-2
+     ...                        connections left at the deadline: reset, counted as drain_forced
+     web-1 --OP_DONE--&gt; net     no connections left: the OP_DRAIN reply (drain_forced) goes out
+</pre>
+<figcaption>Switching the live instance and draining the old one</figcaption>
+</figure>
+
+<p>Connections the draining instance never accepted go to the live instance. HTTP leaves idle
+connections alone while draining: closing one just as its client sends a request would fail
+that request. With eight clients requesting without pause, no request fails and every client
+ends up on <code>web-2</code> (<code>swap-under-load</code>); a connection held open without a
+request is reset at the deadline and counted (<code>drain-deadline</code>).</p>
+
+<h3 id="net-limits"><span class="num">14.4</span>Limits<a class="anchor" href="#net-limits">#</a></h3>
+
+<p>Before smoltcp sees a frame, <code>net</code> checks it:</p>
+<ul>
+  <li>sources on the <strong>blocklist</strong> are dropped first (16 ranges with expiry, set by
+    <code>OP_BLOCK</code> from a task with <code>routes = true</code>);</li>
+  <li>IPv4 packets with a bad header checksum are dropped and counted;</li>
+  <li>each new connection (a SYN for one of our ports) is held to the port's
+    <code>max_per_source</code> and <code>max_connections</code>, and to 16 handshakes in
+    progress per port. smoltcp has no SYN cookies, so at that cap a new SYN takes the place of
+    the oldest handshake; handshakes also time out after 2 s.</li>
+</ul>
+<p>HTTP limits each request: the header must fit in 4 KiB (else 431) and arrive within 5 s of its
+first byte (else 408), and bodies over 16 KiB are refused (413). Connections idle for 15 s
+between requests are closed by HTTP, and for 60 s by <code>net</code>. A 32-entry Space-Saving
+sketch tracks the heaviest sources; each snapshot interval <code>net</code> compares SYN and
+limit-drop rates and CPU budget use with fixed thresholds and reports
+<code>attack_suspected</code> with the top talkers.</p>
+
+<div class="admonition warning"><span class="label">Not yet tested</span>
+<p>The attack tests planned in <code>plans/step-9-net.md</code> (<code>dos-*</code>: SYN flood,
+connection exhaustion, slowloris, large requests, packet flood, blocklist) are not in the suite
+yet. The packet flood is covered by <code>mgmt-under-flood</code>; the other limits are
+implemented but not exercised by a test.</p></div>
+
+<h3 id="net-telemetry"><span class="num">14.5</span>Counters and events<a class="anchor" href="#net-telemetry">#</a></h3>
+
+<p>Counters are cumulative and go to telemetry as snapshots (<code>OP_COUNTERS</code>), one per
+scope; rates are the host's to compute. Telemetry answers each snapshot with the interval for
+the next: 1 s by default, and the host may set 100 ms to 60 s
+(<code>host-agent.py --set-interval MS</code>, through the control task; <code>net-interval</code>).</p>
+
+<table>
+<tr><th>Scope (from)</th><th>Counters</th></tr>
+<tr><td><code>interface</code> (net)</td><td>rx/tx packets and bytes, <code>rx_ring_full</code>, errors, multicast, broadcast, <code>tx_dropped</code></td></tr>
+<tr><td><code>net</code> (net)</td><td>sockets in use, listening, connections, frames in, IPv4 checksum failures, segments for ports nobody listens on, connections refused for want of a live instance, ticks over budget, <code>cpu_permille</code></td></tr>
+<tr><td><code>instance</code> (net)</td><td>per instance: live, accepted, refused, reset, open, bytes in and out, <code>drain_forced</code></td></tr>
+<tr><td><code>protection</code> (net)</td><td>SYNs, half-open now, handshakes dropped and timed out, drops by limit, blocklist hits and entries</td></tr>
+<tr><td><code>http</code> (each HTTP task)</td><td>requests, by status class, and a latency histogram (1 ms to 1 s buckets)</td></tr>
+</table>
+
+<pre><code>{"t":210,"task":"net","id":"3","scope":"instance","event":"counters","instance":"web","service":"web","live":1,"accepted":1,"bytes_in":3533,"bytes_out":5806,...}
+{"t":13,"task":"net","id":"3","event":"route_changed","service":"web","live":"web","previous":"none"}</code></pre>
+
+<p>Events (<code>OP_NET</code>): <code>route_changed</code>, <code>drain_started</code>,
+<code>drained</code>, <code>listen_refused</code>, <code>limit_tripped</code>,
+<code>attack_suspected</code>, <code>blocklist_added</code>. Records travel as
+<code>name key=value ...</code> text and telemetry turns them into JSON, adding the sender's
+name from the kernel. <code>net-counters</code> checks the counters against a known transfer,
+byte for byte (<code>tools/check-net-counters.py</code>). smoltcp doesn't count retransmits, so
+neither do we.</p>
+
+<h3 id="net-running"><span class="num">14.6</span>Running it<a class="anchor" href="#net-running">#</a></h3>
+
+<pre><code>make run APP=tests/apps/http.toml NET=user          # then: curl http://127.0.0.1:8080/
+make run APP=tests/apps/mgmt.toml NET=user NET_MGMT=user   # plus: nc 127.0.0.1 8081 (echo)
+make run APP=tests/apps/http.toml NET=dgram USER_FEATURES=net/static-addr   # raw frames</code></pre>
+
+<p><code>NET</code> adds the data NIC and <code>NET_MGMT</code> the management NIC, at PCI
+00:10.0 and 00:11.0 (declare the data driver first in the manifest: each
+<code>devices</code> entry claims the next device of its kind). <code>user</code> is QEMU's NAT
+with DHCP, and forwards <code>127.0.0.1:NET_PORT</code> (8080) to the guest's port 80 and
+<code>NET_MGMT_PORT</code> (8081) to port 7. <code>dgram</code> carries raw Ethernet frames in UDP
+datagrams between QEMU (<code>NET_DGRAM_PORT</code>, 18090) and <code>tools/net-peer.py</code>
+(the next port), which can send any frame it likes. Tests run <code>net-peer.py</code> next to
+QEMU (<code>PEER=&lt;scenario&gt;</code>); since servers never go idle, they build the
+supervisor with <code>halt-on-exit</code> and end the run by asking HTTP for
+<code>/exit</code> (<code>http/exit-on-request</code>).</p>
+
+<div class="admonition warning"><span class="label">Limit</span>
+<p>Nothing here should face a real network before the IOMMU (step 7): the NIC driver handles
+bytes from the network and can make its device DMA anywhere. Every byte is also copied twice
+through IPC (driver to <code>net</code>, <code>net</code> to the service), at most 4 KiB a
+message; under TCG that serves about 1,400 keep-alive requests a second.</p></div>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>user/virtio-net</code>, <code>user/net</code> (<code>main.rs</code>: tables, requests, routing, snapshots; <code>device.rs</code>: smoltcp device over IPC; <code>filter.rs</code>, <code>guard.rs</code>: frame checks, blocklist, top talkers), <code>user/http</code>, <code>user/mgmt-echo</code>, <code>user/switcher</code>, <code>nic</code>/<code>net</code>/<code>telemetry</code> modules in <code>user/lib</code>, <code>tools/net-peer.py</code>, <code>tools/check-net-counters.py</code></dd>
+<dt>names</dt><dd><code>net</code>/<code>nic</code> and <code>mgmt-net</code>/<code>nic-mgmt</code> pair by name; services find their stack with <code>lookup("net")</code></dd>
+<dt>gotcha</dt><dd>services and <code>net</code> keep big tables: put them in statics, not on the 64 KiB stack</dd>
+<dt>gotcha</dt><dd>host ports are fixed per run; to run network cases while another suite runs, set <code>NET_PORT</code>, <code>NET_MGMT_PORT</code>, <code>NET_DGRAM_PORT</code>, <code>NET_MGMT_DGRAM_PORT</code> in the environment</dd>
+<dt>tests</dt><dd><code>nic-*</code>, <code>http-*</code>, <code>net-*</code>, <code>mgmt-*</code>, <code>swap-under-load</code>, <code>drain-deadline</code>, <code>route-*</code></dd>
+</dl></div>
+
+<h2 id="syscalls"><span class="num">15</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
 <p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
 r8, r9</code>; results in <code>rax</code> (then <code>rdx</code>, <code>rsi</code>). Simple
@@ -929,15 +1152,19 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
 <tr><td><code>read_events(buf, cap)</code></td><td>113</td><td>event reader only &rarr; <code>(count, dropped)</code></td></tr>
 <tr><td><code>stats(buf, cap)</code></td><td>114</td><td>event reader only: uptime, memory, interrupts, per-task state</td></tr>
 <tr><td><code>measurements(buf, cap)</code></td><td>115</td><td>TPM task only &rarr; <code>(count, TPM address)</code>; the boot measurement log</td></tr>
+<tr><td><code>notify(target, bits)</code></td><td>116</td><td>post bits to a task in <code>sends</code> without waiting; it gets them in <code>recv</code> as <code>NOTIFY_POST</code></td></tr>
+<tr><td><code>halt(code)</code></td><td>117</td><td>supervisor only: stop the system, reporting every task's state</td></tr>
+<tr><td><code>task_listen(id, buf, cap)</code></td><td>118</td><td>a task's service, <code>routes</code> flag and declared ports (<code>ListenInfo</code>)</td></tr>
 </table>
 
 <p><code>recv</code> flags (in <code>rdx</code>): <code>RECV_EXPECT_IRQ</code> (1),
 <code>RECV_TIMEOUT</code> (2, ticks in <code>r10</code>; then sender 0,
-<code>NOTIFY_TIMER</code>). Kernel notifications come as sender 0 with op
-<code>NOTIFY_DEATH</code> (1, supervisor), <code>NOTIFY_IRQ</code> (2, drivers) or
-<code>NOTIFY_TIMER</code> (3).</p>
+<code>NOTIFY_TIMER</code>; 0 ticks only takes what is already waiting). Kernel notifications
+come as sender 0 with op <code>NOTIFY_DEATH</code> (1, supervisor), <code>NOTIFY_IRQ</code> (2,
+drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits from
+<code>notify</code>).</p>
 
-<h2 id="protections"><span class="num">15</span>Protections<a class="anchor" href="#protections">#</a></h2>
+<h2 id="protections"><span class="num">16</span>Protections<a class="anchor" href="#protections">#</a></h2>
 
 <table>
 <tr><th>Protection</th><th>What it stops</th><th>Test</th></tr>
@@ -967,9 +1194,14 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
 <tr><td>Key released only to an attested boot</td><td>a modified system getting the key</td><td><code>attest-unlock-refused</code></td></tr>
 <tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
+<tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
+<tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
+<tr><td>CPU budget for received frames in <code>net</code></td><td>a packet flood starving every other task</td><td><code>mgmt-under-flood</code></td></tr>
+<tr><td>Routing only by tasks with <code>routes = true</code>, only to ready instances</td><td>a service hijacking traffic; traffic to an instance that can't serve</td><td><code>route-not-allowed</code>, <code>route-not-ready</code></td></tr>
+<tr><td>Drain deadline</td><td>a connection that never ends keeping an old instance alive</td><td><code>drain-deadline</code></td></tr>
 </table>
 
-<h2 id="limitations"><span class="num">16</span>Limitations<a class="anchor" href="#limitations">#</a></h2>
+<h2 id="limitations"><span class="num">17</span>Limitations<a class="anchor" href="#limitations">#</a></h2>
 
 <p>Stated plainly, in one place:</p>
 <ul>
@@ -995,13 +1227,21 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
   <li><strong>One key release per boot.</strong> In the attested flow the host says
     <code>bye</code> after releasing the key, so a <code>disk</code> restarted later stays
     locked until the next boot.</li>
-  <li><strong>One CPU</strong>, no IPC priorities, messages copied (no memory lending).</li>
+  <li><strong>One CPU</strong>, no IPC priorities, messages copied (no memory lending). Network
+    bytes are copied twice through IPC.</li>
+  <li><strong>Network limits without attack tests.</strong> The connection caps, half-open cap
+    and blocklist in <code>net</code> are implemented but the planned <code>dos-*</code> tests
+    aren't written yet (<a href="#net-limits">14.4</a>).</li>
+  <li><strong>TCP over IPv4 only</strong>, no TLS, no SYN cookies (smoltcp has none), 10 ms TCP
+    timer resolution, and no retransmit counter.</li>
+  <li><strong>Restarts are capped.</strong> The supervisor gives up after three restarts, so a
+    request that crashes a service can take it down for good (RFD 2 and 7).</li>
 </ul>
 
 <!-- ============================================================ WORKING ON IT -->
 <p class="part-title">Part three: working on vanir-os</p>
 
-<h2 id="agents"><span class="num">17</span>Agent quick reference<a class="anchor" href="#agents">#</a></h2>
+<h2 id="agents"><span class="num">18</span>Agent quick reference<a class="anchor" href="#agents">#</a></h2>
 
 <p>Dense facts for coding agents (and people in a hurry). Every command runs from the
 repository root.</p>
@@ -1014,7 +1254,7 @@ repository root.</p>
 <dt>all tests</dt><dd><code>make test ACCEL=tcg &amp;&amp; make test ACCEL=kvm</code> &mdash; both must pass before committing</dd>
 <dt>pass/fail</dt><dd>a case passes when QEMU's exit status and the expected output both match; output is serial log + <code>build/telemetry.log</code> after a <code>--- build/telemetry.log ---</code> marker</dd>
 <dt>exit status</dt><dd>1 clean, 3 a task exited non-zero, 5 a task was killed, 7 kernel panic or supervisor died, 9 deadlock, 124 timeout</dd>
-<dt>new program</dt><dd>see <a href="#recipe-program">21.1</a>; must be in workspace <code>Cargo.toml</code> and Makefile <code>USER_PROGS</code></dd>
+<dt>new program</dt><dd>see <a href="#recipe-program">22.1</a>; must be in workspace <code>Cargo.toml</code> and Makefile <code>USER_PROGS</code></dd>
 <dt>secrets</dt><dd><code>keys/</code> (signing key, storage master key) and <code>build/</code> are git-ignored; never commit them</dd>
 <dt>serial log</dt><dd>kernel lines start <code>[kernel]</code>; tasks print <code>&lt;program&gt;: ...</code>; tests match these strings, so changing a message can break a test</dd>
 </dl></div>
@@ -1022,7 +1262,7 @@ repository root.</p>
 <h4>Where to change what</h4>
 <table>
 <tr><th>To change&hellip;</th><th>Edit</th><th>Then check</th></tr>
-<tr><td>a syscall</td><td><code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td>docs table <a href="#syscalls">14</a></td></tr>
+<tr><td>a syscall</td><td><code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td>docs table <a href="#syscalls">15</a></td></tr>
 <tr><td>scheduling, budgets, IPC, restarts</td><td><code>kernel/src/process.rs</code></td><td><code>ONLY='^(ipc|supervisor|restart|stale|sleep|cpu|preemption)'</code></td></tr>
 <tr><td>page tables, frames</td><td><code>kernel/src/memory.rs</code></td><td><code>no-leak</code>, <code>restart-no-leak</code>, <code>address-spaces</code></td></tr>
 <tr><td>a manifest key</td><td><code>kernel/build.rs</code>, <code>Task</code> in <code>kernel/src/process.rs</code></td><td><code>apps/README.md</code>, docs <a href="#manifests">7</a></td></tr>
@@ -1033,9 +1273,10 @@ repository root.</p>
 <tr><td>measurements</td><td><code>kernel/src/measure.rs</code>, <code>tools/expected-pcrs.py</code> (keep in sync)</td><td><code>measured-*</code>, <code>attest-*</code></td></tr>
 <tr><td>storage format or crypto</td><td><code>user/storage</code>, <code>tools/corrupt-disk.py</code></td><td><code>ONLY='^(storage|blk|attest-)'</code></td></tr>
 <tr><td>host tooling</td><td><code>tools/*.py</code> (Python 3.11+, <code>cryptography</code>)</td><td>vsock/attest cases need KVM + kvm group</td></tr>
+<tr><td>networking</td><td><code>user/net</code>, <code>user/virtio-net</code>, <code>user/http</code>, <code>tools/net-peer.py</code></td><td><code>ONLY='^(nic|http|net|mgmt|swap|drain|route|build)'</code></td></tr>
 </table>
 
-<h2 id="build"><span class="num">18</span>Build, run, test<a class="anchor" href="#build">#</a></h2>
+<h2 id="build"><span class="num">19</span>Build, run, test<a class="anchor" href="#build">#</a></h2>
 
 <pre><code>make                                  # build build/vanir-os.iso
 make run                              # boot in QEMU, serial output on the terminal
@@ -1064,11 +1305,18 @@ make clean                            # remove build outputs (distclean also rem
 <tr><td><code>SIGNING_KEY</code>, <code>TRUSTED_PUB</code></td><td><code>keys/dev-signing.*</code></td><td>key images are signed with / key compiled into the kernel</td></tr>
 <tr><td><code>TAMPER</code>, <code>UNSIGNED</code>, <code>SWAP_SIGS</code></td><td></td><td>signature tests: modify after signing, ship unsigned, swap <code>a:b</code></td></tr>
 <tr><td><code>SB_TAMPER_KERNEL</code>, <code>SB_EDIT_CONFIG</code>, <code>SB_UNSIGNED_LOADER</code></td><td></td><td>boot-chain tests</td></tr>
+<tr><td><code>NET</code>, <code>NET_MGMT</code></td><td></td><td><code>user</code> (NAT, DHCP, port forwarding) or <code>dgram</code> (raw frames to <code>net-peer.py</code>): data and management NICs</td></tr>
+<tr><td><code>NET_PORT</code>, <code>NET_MGMT_PORT</code></td><td>8080, 8081</td><td>host ports forwarded to guest ports 80 and 7 (environment overrides)</td></tr>
+<tr><td><code>NET_DGRAM_PORT</code>, <code>NET_MGMT_DGRAM_PORT</code></td><td>18090, 18092</td><td>QEMU's end of the <code>dgram</code> backend; the peer uses the next port</td></tr>
 </table>
 
 <p>Test-only settings in a case's variables column: <code>TIMEOUT=&lt;s&gt;</code> (default 60),
 <code>ATTEST=1</code> (host agent challenges the guest), <code>RELEASE=&lt;reference&gt;</code>
-(host agent releases <code>keys/master.key</code> if the quote matches).</p>
+(host agent releases <code>keys/master.key</code> if the quote matches), <code>INTERVAL=&lt;ms&gt;</code>
+(host agent sets the snapshot interval), <code>PEER=&lt;scenario&gt;</code> (run
+<code>tools/net-peer.py</code> next to QEMU; its output follows a <code>--- peer ---</code> line),
+<code>SLOW=1</code> (skipped with <code>SLOW=0 make test</code>). A <code>BUILD_FAILS</code> list
+before the cases names manifests that must not build, with the error they must give.</p>
 
 <h4>Exit status</h4>
 <p>QEMU exits with <code>(code &lt;&lt; 1) | 1</code> through the <code>isa-debug-exit</code>
@@ -1091,9 +1339,9 @@ device:</p>
 matches; avoid quotes); with <code>cmd:</code>, a shell command that reads the output on stdin
 and must succeed.</p>
 
-<h2 id="tests"><span class="num">19</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
+<h2 id="tests"><span class="num">20</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>70 cases, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>85 cases and one build check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -1109,11 +1357,16 @@ attestation references earlier ones leave behind.</p>
 <tr><td>block</td><td><code>blk-rw</code> <code>blk-persist</code> <code>blk-persist-negative</code> <code>blk-restart</code></td><td></td></tr>
 <tr><td>storage</td><td><code>storage-isolation</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
 <tr><td>key release</td><td><code>attest-storage-record</code> <code>attest-unlock</code> <code>attest-unlock-persist</code> <code>attest-unlock-refused</code></td><td>KVM, swtpm, vsock</td></tr>
+<tr><td>NIC</td><td><code>nic-arp-ping</code> <code>nic-restart</code> <code>nic-no-grant</code></td><td>free UDP ports 18090-18091</td></tr>
+<tr><td>sockets, HTTP</td><td><code>build-http-port-clash</code> <code>http-get</code> <code>http-undeclared-port</code> <code>net-restart</code> <code>http-restart</code></td><td>free TCP port 8080</td></tr>
+<tr><td>management network</td><td><code>mgmt-separate</code> <code>mgmt-under-flood</code></td><td>port 8081 too</td></tr>
+<tr><td>network telemetry</td><td><code>net-counters</code> <code>net-interval</code></td><td>vsock for <code>net-interval</code></td></tr>
+<tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>
 isn't writable even through <code>sg kvm</code>.</p>
 
-<h2 id="repo-map"><span class="num">20</span>Repository map<a class="anchor" href="#repo-map">#</a></h2>
+<h2 id="repo-map"><span class="num">21</span>Repository map<a class="anchor" href="#repo-map">#</a></h2>
 
 <pre><code>kernel/build.rs           generates the task table from the app manifest
 kernel/linker.ld          higher half at 0xffffffff80000000, Limine request sections
@@ -1153,6 +1406,12 @@ user/control/             host commands from the uplink (attest, key, bye)
 user/storage/             encrypted volume per task; crash-after-16 test feature
 user/blktest/             block client: writes, reads back and checks a pattern
 user/unlocker/            key server "keys" (test stand-in)
+user/virtio-net/          NIC driver: frames in and out; crash-after-10-frames test feature
+user/nictest/             answers ARP and ping by hand (driver test, no stack)
+user/net/                 network stack (smoltcp): sockets, routing, limits, counters
+user/http/                HTTP/1.1 service; exit-on-request, crash and listen-81 test features
+user/mgmt-echo/           TCP echo on the management stack (stands in for the agent)
+user/switcher/            routing scripts for tests (stands in for the agent)
 apps/                     app manifests and their format (apps/README.md)
 tests/apps/               manifests the tests boot
 tests/run.sh              the test harness
@@ -1164,13 +1423,16 @@ tools/sign-image.py       makes the signing key; signs task images
 tools/with-swtpm.sh       runs QEMU with a software TPM
 tools/corrupt-disk.py     flips a byte of a volume's block in the disk image
 tools/check_lines.py      checks numbered lines arrived in order
-plans/                    plans for future steps: step-7-iommu.md, step-8-bench.md (not built)
+tools/net-peer.py         host side of the network tests: HTTP, echo, raw frames, floods
+tools/check-net-counters.py  compares network counters with a known transfer
+plans/                    step plans: step-7-iommu.md, step-8-bench.md (not built), step-9-net.md
+rfd/                      requests for discussion: network services, deployment, volumes, ...
 keys/                     signing key and storage master key (generated, git-ignored)
 docs/                     this manual (GitHub Pages) and llms.txt</code></pre>
 
-<h2 id="recipes"><span class="num">21</span>Recipes<a class="anchor" href="#recipes">#</a></h2>
+<h2 id="recipes"><span class="num">22</span>Recipes<a class="anchor" href="#recipes">#</a></h2>
 
-<h3 id="recipe-program"><span class="num">21.1</span>Add a user program<a class="anchor" href="#recipe-program">#</a></h3>
+<h3 id="recipe-program"><span class="num">22.1</span>Add a user program<a class="anchor" href="#recipe-program">#</a></h3>
 <ol>
   <li>Copy <code>user/hello/</code> to <code>user/&lt;name&gt;/</code> (keep <code>build.rs</code>: it
     applies <code>user/linker.ld</code>). Rename the package and <code>[[bin]]</code>.</li>
@@ -1192,7 +1454,7 @@ fn main() -&gt; u64 {
   <li>Reference it from a manifest: <code>program = "&lt;name&gt;"</code>.</li>
 </ol>
 
-<h3 id="recipe-test"><span class="num">21.2</span>Add a test case<a class="anchor" href="#recipe-test">#</a></h3>
+<h3 id="recipe-test"><span class="num">22.2</span>Add a test case<a class="anchor" href="#recipe-test">#</a></h3>
 <ol>
   <li>Add a manifest in <code>tests/apps/</code> if no existing one fits.</li>
   <li>Put test-only behaviour behind a cargo feature in the program's <code>Cargo.toml</code>,
@@ -1201,10 +1463,10 @@ fn main() -&gt; u64 {
     it depends on.</li>
   <li>Run it alone (<code>ONLY='^name$' make test</code>), then break the protection on purpose
     and confirm the case fails, then restore and run both full suites.</li>
-  <li>Add it to <a href="#tests">19</a> and, for a protection, <a href="#protections">15</a>.</li>
+  <li>Add it to <a href="#tests">20</a> and, for a protection, <a href="#protections">16</a>.</li>
 </ol>
 
-<h3 id="recipe-syscall"><span class="num">21.3</span>Add a syscall<a class="anchor" href="#recipe-syscall">#</a></h3>
+<h3 id="recipe-syscall"><span class="num">22.3</span>Add a syscall<a class="anchor" href="#recipe-syscall">#</a></h3>
 <ol>
   <li>Pick an unused number; add <code>SYS_&lt;NAME&gt;</code> to <code>kernel/src/syscall.rs</code>
     and a <code>dispatch</code> arm.</li>
@@ -1215,10 +1477,10 @@ fn main() -&gt; u64 {
   <li>Add the same constant and a wrapper to <code>user/lib/src/lib.rs</code>.</li>
   <li>Restrict privileged calls to the right task (as <code>restart</code> is supervisor-only)
     and return <code>NOT_ALLOWED</code> otherwise.</li>
-  <li>Document it in <a href="#syscalls">14</a>.</li>
+  <li>Document it in <a href="#syscalls">15</a>.</li>
 </ol>
 
-<h3 id="recipe-event"><span class="num">21.4</span>Add a kernel or storage event<a class="anchor" href="#recipe-event">#</a></h3>
+<h3 id="recipe-event"><span class="num">22.4</span>Add a kernel or storage event<a class="anchor" href="#recipe-event">#</a></h3>
 <ol>
   <li>Kernel event: a constant in <code>kernel/src/events.rs</code> (document what
     <code>a</code>, <code>b</code>, <code>c</code> hold), <code>events::log(...)</code> at the
@@ -1231,7 +1493,7 @@ fn main() -&gt; u64 {
     in a <code>cmd:</code> test.</li>
 </ol>
 
-<h3 id="recipe-device"><span class="num">21.5</span>Add a device kind or driver<a class="anchor" href="#recipe-device">#</a></h3>
+<h3 id="recipe-device"><span class="num">22.5</span>Add a device kind or driver<a class="anchor" href="#recipe-device">#</a></h3>
 <ol>
   <li>Add <code>(name, vendor, &amp;[device ids])</code> to <code>KINDS</code> in
     <code>kernel/src/pci_kinds.rs</code> (shared with <code>build.rs</code>, which validates
@@ -1243,7 +1505,7 @@ fn main() -&gt; u64 {
   <li>Add a crash feature and a restart test, as <code>virtio-blk/crash-after-10</code>.</li>
 </ol>
 
-<h3 id="recipe-manifest"><span class="num">21.6</span>Add a manifest key<a class="anchor" href="#recipe-manifest">#</a></h3>
+<h3 id="recipe-manifest"><span class="num">22.6</span>Add a manifest key<a class="anchor" href="#recipe-manifest">#</a></h3>
 <ol>
   <li>Add it to <code>known</code> in <code>kernel/build.rs</code>, parse and validate it, and
     emit it in the generated <code>Task</code> literal.</li>
@@ -1251,7 +1513,7 @@ fn main() -&gt; u64 {
   <li>Document it in <code>apps/README.md</code> and <a href="#manifests">7</a>.</li>
 </ol>
 
-<h2 id="invariants"><span class="num">22</span>Invariants<a class="anchor" href="#invariants">#</a></h2>
+<h2 id="invariants"><span class="num">23</span>Invariants<a class="anchor" href="#invariants">#</a></h2>
 
 <p>Rules the code relies on. Breaking one is a bug even when the tests pass.</p>
 <ol>
@@ -1277,7 +1539,7 @@ fn main() -&gt; u64 {
     statements go into PCR 12; <code>tools/expected-pcrs.py</code> must compute the same value.</li>
 </ol>
 
-<h2 id="troubleshooting"><span class="num">23</span>Troubleshooting<a class="anchor" href="#troubleshooting">#</a></h2>
+<h2 id="troubleshooting"><span class="num">24</span>Troubleshooting<a class="anchor" href="#troubleshooting">#</a></h2>
 
 <table>
 <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
@@ -1291,10 +1553,12 @@ fn main() -&gt; u64 {
 <tr><td><code>storage-*</code> fail with INTEGRITY or wrong contents</td><td>disk state from another case or manual run</td><td>start from <code>DISK_RESET=1</code> or run the cases in order</td></tr>
 <tr><td>Cases fail at random during a suite run</td><td>sources edited while the suite builds them</td><td>don't edit the tree during <code>make test</code></td></tr>
 <tr><td>Run never ends (timeout)</td><td>a task sleeps or waits forever (e.g. telemetry without <code>exit-after-3-heartbeats</code>)</td><td>make long-running tasks exit in tests or wait only in <code>recv</code></td></tr>
+<tr><td>Network cases fail at once, or QEMU says it can't bind</td><td>a host port in use (another suite, an old QEMU)</td><td>set <code>NET_PORT</code> and friends in the environment, or stop the other user</td></tr>
+<tr><td>Network case times out with the peer saying "never answered"</td><td>no DHCP lease, or the service never listened</td><td>read the <code>net:</code> lines in the serial log; <code>dgram</code> needs <code>net/static-addr</code></td></tr>
 <tr><td>"Limine base revision 3 not supported"</td><td>wrong Limine binaries</td><td><code>make distclean</code>; the Makefile fetches branch <code>v11.x-binary</code></td></tr>
 </table>
 
-<h2 id="dependencies"><span class="num">24</span>System dependencies<a class="anchor" href="#dependencies">#</a></h2>
+<h2 id="dependencies"><span class="num">25</span>System dependencies<a class="anchor" href="#dependencies">#</a></h2>
 
 <table>
 <tr><th>Dependency</th><th>Used for</th><th>Debian/Ubuntu package</th></tr>
@@ -1317,7 +1581,7 @@ rustup target add x86_64-unknown-none</code></pre>
 <p>Nightly Rust isn't required. Limine (branch <code>v11.x-binary</code>) is cloned into
 <code>limine/</code> on the first build.</p>
 
-<h2 id="glossary"><span class="num">25</span>Glossary<a class="anchor" href="#glossary">#</a></h2>
+<h2 id="glossary"><span class="num">26</span>Glossary<a class="anchor" href="#glossary">#</a></h2>
 
 <table>
 <tr><th>Term</th><th>Meaning</th></tr>
@@ -1325,15 +1589,19 @@ rustup target add x86_64-unknown-none</code></pre>
 <tr><td>BAR</td><td>base address register: where a PCI device's registers appear in memory</td></tr>
 <tr><td>CR3</td><td>the register holding the current page-table root</td></tr>
 <tr><td>DMA</td><td>a device reading or writing main memory by itself</td></tr>
+<tr><td>Drain</td><td>stop giving an instance new connections and let it finish its current ones, up to a deadline</td></tr>
 <tr><td>Generation</td><td>restart counter in a task id's upper bits; stale ids get <code>DEAD</code></td></tr>
 <tr><td>HHDM</td><td>Limine's higher-half direct map of physical memory</td></tr>
 <tr><td>HKDF</td><td>key derivation: turns one key into many independent keys</td></tr>
+<tr><td>Instance</td><td>a task running a network service; the <strong>live</strong> instance gets the service's new connections</td></tr>
 <tr><td>IOMMU</td><td>hardware that restricts which memory each device can DMA to (Intel VT-d)</td></tr>
 <tr><td>Manifest</td><td>the TOML file that fixes the task set at build time</td></tr>
 <tr><td>MSI-X</td><td>interrupts delivered as memory writes, routed by the kernel</td></tr>
 <tr><td>PCR</td><td>TPM platform configuration register: a hash chain of measurements</td></tr>
 <tr><td>Quote</td><td>TPM-signed statement of PCR values over a caller's nonce</td></tr>
 <tr><td>Ring 0 / ring 3</td><td>x86 privilege levels: kernel / user</td></tr>
+<tr><td>slirp</td><td>QEMU's user-mode NAT (<code>-netdev user</code>): DHCP and port forwarding, TCP ended on the host</td></tr>
+<tr><td>smoltcp</td><td>the TCP/IP stack in <code>net</code>: no heap, sockets in fixed buffers</td></tr>
 <tr><td>SMAP / SMEP</td><td>CPU features stopping the kernel accessing / executing user pages</td></tr>
 <tr><td>TCG</td><td>QEMU's software CPU emulator (no KVM)</td></tr>
 <tr><td>TrapFrame</td><td>the saved registers of a task, pushed on every trap</td></tr>
