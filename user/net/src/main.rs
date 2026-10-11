@@ -10,6 +10,10 @@
 //!   port's service, which accepts it, and set another socket listening.
 //! - Services wait in `OP_WAIT`, whose reply we hold until one of their handles has something
 //!   to do. Everything else is answered at once.
+//! - Before smoltcp sees a received frame we check it (`Gate`): blocked sources, bad
+//!   checksums, and for each new connection the per-source cap, the port's connection cap and
+//!   its cap on half-open connections, which drops the oldest handshake first (smoltcp has no
+//!   SYN cookies).
 //! - Every table is fixed at build time: no heap.
 //!
 //! The same program runs the data stack (`net`, driver `nic`) and the management stack
@@ -20,17 +24,20 @@
 
 mod device;
 mod filter;
+mod guard;
 
+use core::fmt::Write;
 use device::Nic;
+use guard::{Blocklist, Talkers};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::dhcpv4;
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use vanir_user::net::*;
 use vanir_user::nic::{self, NOTIFY_RX};
 use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
-use vanir_user::{NOTIFY_POST, NOTIFY_TIMER, SYS_RECV, RECV_TIMEOUT, err, getpid, lookup, println, rdtsc, reply, sleep, syscall6, task_index, task_listen, task_name, uptime};
+use vanir_user::{NOTIFY_POST, NOTIFY_TIMER, SYS_RECV, RECV_TIMEOUT, TICK_HZ, err, getpid, lookup, println, rdtsc, reply, sleep, syscall6, task_index, task_listen, task_name, uptime};
 
 vanir_user::entry!(main);
 
@@ -42,8 +49,14 @@ const MAX_SERVICES: usize = 8;
 const MAX_INSTANCES: usize = 8;
 /// Sockets kept listening on each port in use.
 const LISTENING: usize = 4;
+/// Most half-open connections (handshakes in progress) per port; past it, a new SYN takes the
+/// place of the oldest.
+const HALF_OPEN: usize = 16;
 /// A handshake not finished in this many ticks is dropped.
-const HANDSHAKE_TICKS: u64 = 300;
+const HANDSHAKE_TICKS: u64 = 200;
+/// Above these rates (per second, over a snapshot interval) we report an attack.
+const SYN_FLOOD_PER_S: u64 = 300;
+const LIMIT_DROPS_PER_S: u64 = 20;
 /// A connection its instance doesn't accept in this many ticks is reset.
 const ACCEPT_TICKS: u64 = 500;
 /// A connection with nothing from the peer for this long is reset.
@@ -128,6 +141,7 @@ struct Port {
     number: u16,
     service: u8,
     max_connections: u16,
+    max_per_source: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +190,17 @@ struct Counters {
     refused_no_instance: u64,
     /// TSC cycles spent on received frames.
     cycles: u64,
+    /// New connection attempts (SYNs) for our ports.
+    syn: u64,
+    /// Half-open connections dropped to make room for newer ones.
+    half_open_dropped: u64,
+    handshake_timeouts: u64,
+    /// SYNs dropped because their source had `max_per_source` connections to the port.
+    dropped_per_source: u64,
+    /// SYNs dropped because the port had `max_connections`.
+    dropped_max_connections: u64,
+    /// Packets dropped because their source is on the blocklist.
+    blocklist_hits: u64,
 }
 
 struct Stack {
@@ -196,6 +221,11 @@ struct Stack {
     next_snapshot: u64,
     /// `counters.cycles` at the last snapshot.
     snapshot_cycles: u64,
+    /// Counters at the last snapshot, for rates.
+    last: Counters,
+    last_exhausted: u64,
+    blocklist: Blocklist,
+    talkers: Talkers,
     slots: [Slot; SOCKETS],
     ports: [Option<Port>; MAX_PORTS],
     services: [Option<Service>; MAX_SERVICES],
@@ -317,13 +347,13 @@ impl Stack {
         Some(s)
     }
 
-    fn port_for(&mut self, number: u16, service: usize, max_connections: u16) -> Option<usize> {
+    fn port_for(&mut self, number: u16, service: usize, max_connections: u16, max_per_source: u16) -> Option<usize> {
         if let Some(p) = self.ports.iter().position(|p| p.is_some_and(|p| p.number == number)) {
             // The kernel lets only instances of one service declare a port.
             return (self.ports[p].unwrap().service as usize == service).then_some(p);
         }
         let p = self.ports.iter().position(Option::is_none)?;
-        self.ports[p] = Some(Port { number, service: service as u8, max_connections });
+        self.ports[p] = Some(Port { number, service: service as u8, max_connections, max_per_source });
         Some(p)
     }
 
@@ -361,6 +391,7 @@ impl Stack {
                     State::SynReceived => {
                         let since = *self.slots[i].syn_since.get_or_insert(now);
                         if now - since > HANDSHAKE_TICKS {
+                            self.counters.handshake_timeouts += 1;
                             self.reset(i, now);
                         }
                     }
@@ -384,25 +415,27 @@ impl Stack {
         for p in 0..MAX_PORTS {
             let Some(port) = self.ports[p] else { continue };
             let in_use = self.instances.iter().flatten().any(|i| i.listening & 1 << p != 0);
-            let mut listening = 0;
-            let mut connections = 0;
+            let (mut listening, mut half_open, mut connections) = (0, 0, 0);
             for i in 0..SOCKETS {
                 match self.slots[i].use_ {
                     Use::Listening { port } if port as usize == p => {
                         if !in_use {
                             self.reset(i, now);
-                        } else if self.socket(i).state() == State::Listen {
-                            listening += 1;
                         } else {
-                            connections += 1;
+                            match self.socket(i).state() {
+                                State::Listen => listening += 1,
+                                State::SynReceived => half_open += 1,
+                                _ => connections += 1,
+                            }
                         }
                     }
                     Use::Pending { port, .. } | Use::Owned { port, .. } if port as usize == p => connections += 1,
                     _ => {}
                 }
             }
-            let room = (port.max_connections as usize).saturating_sub(connections);
-            while in_use && listening < LISTENING.min(room) && self.listen_on(p, now) {
+            let room = (port.max_connections as usize).saturating_sub(connections + half_open);
+            let target = LISTENING.min(HALF_OPEN.saturating_sub(half_open)).min(room);
+            while in_use && listening < target && self.listen_on(p, now) {
                 listening += 1;
             }
         }
@@ -609,6 +642,26 @@ impl Stack {
                     })
                 }
             }
+            OP_BLOCK => {
+                let routes = task_listen(sender).is_ok_and(|i| i.may_route());
+                match msg.get(..16) {
+                    _ if !routes => Err(CODE_NOT_ALLOWED),
+                    None => Err(CODE_BAD_OP),
+                    Some(m) => {
+                        let addr: [u8; 4] = m[..4].try_into().unwrap();
+                        let prefix = u32::from_le_bytes(m[4..8].try_into().unwrap()).min(32);
+                        let ticks = u64::from_le_bytes(m[8..16].try_into().unwrap());
+                        self.blocklist.add(addr, prefix, now + ticks, now);
+                        println!("{}: blocking {}.{}.{}.{}/{} for {} ticks", self.name, addr[0], addr[1], addr[2], addr[3], prefix, ticks);
+                        let mut range = Text::new();
+                        let _ = write!(range, "{}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
+                        let mut r = Record::new("blocklist_added");
+                        r.text("range", range.as_str()).num("ticks", ticks);
+                        self.event(&r);
+                        Ok(0)
+                    }
+                }
+            }
             OP_READY => self.instance_for(sender, now).map(|k| {
                 let instance = self.instances[k].as_mut().unwrap();
                 instance.ready = true;
@@ -635,7 +688,7 @@ impl Stack {
     fn listen(&mut self, sender: u64, port: u16, now: u64) -> Result<u32, u64> {
         let mut name = [0u8; 32];
         let info = task_listen(sender).map_err(|_| CODE_NOT_ALLOWED)?;
-        let Some((max_connections, _per_source)) = info.port(port) else {
+        let Some((max_connections, per_source)) = info.port(port) else {
             let task = task_name(sender, &mut name).unwrap_or("?");
             println!("{}: {} may not listen on port {}: not in its manifest entry", self.name, task, port);
             let mut r = Record::new("listen_refused");
@@ -645,7 +698,7 @@ impl Stack {
         };
         let k = self.instance_for(sender, now)?;
         let service = self.instances[k].unwrap().service as usize;
-        let p = self.port_for(port, service, max_connections).ok_or(CODE_NOT_ALLOWED)?;
+        let p = self.port_for(port, service, max_connections, per_source).ok_or(CODE_NOT_ALLOWED)?;
         let instance = self.instances[k].as_mut().unwrap();
         instance.listening |= 1 << p;
         println!("{}: {} listens on port {} (service {})", self.name, task_name(sender, &mut name).unwrap_or("?"), port, self.name_of(service));
@@ -659,8 +712,17 @@ impl Stack {
         match self.nic.fetch() {
             Ok(0) => false,
             Ok(_) => {
-                let (ports, counters) = (&self.ports, &mut self.counters);
-                self.nic.rx.retain(|frame| inspect(frame, ports, counters));
+                let mut gate = Gate {
+                    slots: &mut self.slots,
+                    sockets: &mut self.sockets,
+                    ports: &self.ports,
+                    counters: &mut self.counters,
+                    blocklist: &self.blocklist,
+                    talkers: &mut self.talkers,
+                    now: uptime(),
+                    promised: [0; MAX_PORTS],
+                };
+                self.nic.rx.retain(|frame| gate.admit(frame));
                 true
             }
             Err(_) => {
@@ -694,6 +756,45 @@ impl Stack {
         {
             self.telemetry = None;
         }
+    }
+
+    /// Once per snapshot interval: compare rates with the thresholds, report an attack (with
+    /// the top talkers) or tripped limits, and start counting afresh.
+    fn detect(&mut self, now: u64) {
+        let (c, l) = (self.counters, self.last);
+        let per_s = |n: u64| n * TICK_HZ / self.interval.max(1);
+        let syn = per_s(c.syn - l.syn);
+        let drops = per_s(c.dropped_per_source + c.dropped_max_connections - l.dropped_per_source - l.dropped_max_connections);
+        let exhausted = self.budget.exhausted_total - self.last_exhausted;
+        let reason = if syn > SYN_FLOOD_PER_S {
+            Some("syn_flood")
+        } else if drops > LIMIT_DROPS_PER_S {
+            Some("connection_limits")
+        } else if exhausted * 2 > self.interval {
+            Some("packet_flood")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let mut top = Text::new();
+            for (addr, n) in self.talkers.top::<5>().into_iter().flatten() {
+                let _ = write!(top, "{}{}.{}.{}.{}:{}", if top.len == 0 { "" } else { "," }, addr[0], addr[1], addr[2], addr[3], n);
+            }
+            println!("{}: attack suspected ({}): {} SYN/s, {} drops/s; top talkers {}", self.name, reason, syn, drops, top.as_str());
+            let mut r = Record::new("attack_suspected");
+            r.num("t", now).text("reason", reason).num("syn_per_s", syn).num("drops_per_s", drops).text("top", top.as_str());
+            self.event(&r);
+        }
+        for (limit, n) in [("per_source", c.dropped_per_source - l.dropped_per_source), ("max_connections", c.dropped_max_connections - l.dropped_max_connections)] {
+            if n > 0 {
+                let mut r = Record::new("limit_tripped");
+                r.num("t", now).text("limit", limit).num("dropped", n);
+                self.event(&r);
+            }
+        }
+        self.talkers.reset();
+        self.last = c;
+        self.last_exhausted = self.budget.exhausted_total;
     }
 
     /// Send one counter snapshot per scope: the interface, the stack, each instance.
@@ -748,6 +849,22 @@ impl Stack {
             .num("refused_no_instance", c.refused_no_instance)
             .num("budget_exhausted_ticks", self.budget.exhausted_total)
             .num("cpu_permille", cpu.min(1000));
+        let _ = telemetry::counters(t, &r);
+
+        let half_open = (0..SOCKETS)
+            .filter(|&i| matches!(self.slots[i].use_, Use::Listening { .. }) && self.socket(i).state() == State::SynReceived)
+            .count();
+        let mut r = Record::new("protection");
+        r.num("t", now)
+            .num("syn", c.syn)
+            .num("half_open", half_open as u64)
+            .num("half_open_dropped", c.half_open_dropped)
+            .num("handshake_timeouts", c.handshake_timeouts)
+            .num("dropped_by_limits", c.dropped_per_source + c.dropped_max_connections)
+            .num("dropped_per_source", c.dropped_per_source)
+            .num("dropped_max_connections", c.dropped_max_connections)
+            .num("blocklist_hits", c.blocklist_hits)
+            .num("blocklist_entries", self.blocklist.len(now) as u64);
         let _ = telemetry::counters(t, &r);
 
         for k in 0..MAX_INSTANCES {
@@ -813,20 +930,121 @@ impl Stack {
     }
 }
 
-/// Count what smoltcp would drop without telling us. Returns whether the frame goes on to it.
-fn inspect(frame: &[u8], ports: &[Option<Port>; MAX_PORTS], counters: &mut Counters) -> bool {
-    let Some(ip) = filter::ipv4(frame) else { return true };
-    if !ip.checksum_ok {
-        counters.ipv4_bad_checksum += 1;
-        return false;
+/// A little text, for event fields.
+struct Text {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl Text {
+    fn new() -> Text {
+        Text { buf: [0; 160], len: 0 }
     }
-    if ip.proto == 6
-        && let Some(tcp) = filter::tcp(ip.payload)
-        && !ports.iter().flatten().any(|p| p.number == tcp.dst_port)
-    {
-        counters.tcp_no_listener += 1;
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
-    true
+}
+
+impl Write for Text {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// What the check on received frames may touch: everything but the NIC, whose batch it filters.
+struct Gate<'a> {
+    slots: &'a mut [Slot; SOCKETS],
+    sockets: &'a mut SocketSet<'static>,
+    ports: &'a [Option<Port>; MAX_PORTS],
+    counters: &'a mut Counters,
+    blocklist: &'a Blocklist,
+    talkers: &'a mut Talkers,
+    now: u64,
+    /// Listening sockets promised to SYNs earlier in this batch, per port.
+    promised: [usize; MAX_PORTS],
+}
+
+impl Gate<'_> {
+    /// Whether a received frame goes on to smoltcp. Counts what smoltcp would drop without
+    /// telling us, drops blocked sources, and applies the connection limits to each new
+    /// connection before a socket takes it.
+    fn admit(&mut self, frame: &[u8]) -> bool {
+        let Some(ip) = filter::ipv4(frame) else { return true };
+        if self.blocklist.blocks(ip.src, self.now) {
+            self.counters.blocklist_hits += 1;
+            return false;
+        }
+        self.talkers.observe(ip.src);
+        if !ip.checksum_ok {
+            self.counters.ipv4_bad_checksum += 1;
+            return false;
+        }
+        let Some(tcp) = filter::tcp(ip.payload).filter(|_| ip.proto == 6) else { return true };
+        let Some(p) = self.ports.iter().position(|q| q.is_some_and(|q| q.number == tcp.dst_port)) else {
+            self.counters.tcp_no_listener += 1;
+            return true;
+        };
+        if tcp.flags & (filter::TCP_SYN | filter::TCP_ACK | filter::TCP_RST) != filter::TCP_SYN {
+            return true;
+        }
+        self.counters.syn += 1;
+        let port = self.ports[p].unwrap();
+        let source = IpAddress::Ipv4(Ipv4Address::from(ip.src));
+        let (mut listening, mut half_open, mut connections, mut from_source) = (0, 0, 0, 0);
+        let mut oldest: Option<(u64, usize)> = None;
+        for i in 0..SOCKETS {
+            let use_ = self.slots[i].use_;
+            match use_ {
+                Use::Listening { port } | Use::Pending { port, .. } | Use::Owned { port, .. } if port as usize == p => {}
+                _ => continue,
+            }
+            let s = self.sockets.get::<tcp::Socket>(self.slots[i].handle);
+            let state = s.state();
+            if let Some(remote) = s.remote_endpoint() {
+                if remote.addr == source && remote.port == tcp.src_port && state == State::SynReceived {
+                    return true; // a retransmitted SYN: smoltcp answers it again
+                }
+                from_source += (remote.addr == source && state != State::Closed) as u16;
+            }
+            match (use_, state) {
+                (Use::Listening { .. }, State::Listen) => listening += 1,
+                (Use::Listening { .. }, State::SynReceived) => {
+                    half_open += 1;
+                    let since = self.slots[i].syn_since.unwrap_or(self.now);
+                    if oldest.is_none_or(|(t, _)| since < t) {
+                        oldest = Some((since, i));
+                    }
+                }
+                _ => connections += 1,
+            }
+        }
+        if from_source >= port.max_per_source {
+            self.counters.dropped_per_source += 1;
+            return false;
+        }
+        if half_open + connections + self.promised[p] >= port.max_connections as usize {
+            self.counters.dropped_max_connections += 1;
+            return false;
+        }
+        if listening <= self.promised[p] {
+            // No listening socket left for it: the oldest handshake makes room.
+            let Some((_, i)) = oldest else {
+                self.counters.dropped_max_connections += 1;
+                return false;
+            };
+            let s = self.sockets.get_mut::<tcp::Socket>(self.slots[i].handle);
+            s.abort();
+            let _ = s.listen(port.number);
+            self.slots[i].syn_since = None;
+            self.counters.half_open_dropped += 1;
+        }
+        self.promised[p] += 1;
+        true
+    }
 }
 
 /// `net` drives `nic`; `<x>-net` drives `nic-<x>` (e.g. `mgmt-net` and `nic-mgmt`).
@@ -908,6 +1126,10 @@ fn main() -> u64 {
         interval: DEFAULT_INTERVAL_TICKS,
         next_snapshot: 0,
         snapshot_cycles: 0,
+        last: Counters::default(),
+        last_exhausted: 0,
+        blocklist: Blocklist::new(),
+        talkers: Talkers::new(),
         slots,
         ports: [None; MAX_PORTS],
         services: [None; MAX_SERVICES],
@@ -938,6 +1160,7 @@ fn main() -> u64 {
         }
         if now >= stack.next_snapshot {
             stack.snapshot(now);
+            stack.detect(now);
             stack.next_snapshot = now + stack.interval;
         }
         if now >= next_housekeeping {

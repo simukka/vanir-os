@@ -4,6 +4,7 @@
 
 /// The parts of an IPv4 packet we look at.
 pub struct Ipv4<'a> {
+    pub src: [u8; 4],
     pub proto: u8,
     pub checksum_ok: bool,
     pub payload: &'a [u8],
@@ -11,8 +12,14 @@ pub struct Ipv4<'a> {
 
 /// The parts of a TCP header we look at.
 pub struct Tcp {
+    pub src_port: u16,
     pub dst_port: u16,
+    pub flags: u8,
 }
+
+pub const TCP_SYN: u8 = 2;
+pub const TCP_RST: u8 = 4;
+pub const TCP_ACK: u8 = 16;
 
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
@@ -37,6 +44,7 @@ pub fn ipv4(frame: &[u8]) -> Option<Ipv4<'_>> {
         return None;
     }
     Some(Ipv4 {
+        src: ip[12..16].try_into().unwrap(),
         proto: ip[9],
         checksum_ok: checksum(&ip[..header]) == 0,
         payload: &ip[header..total],
@@ -45,5 +53,9 @@ pub fn ipv4(frame: &[u8]) -> Option<Ipv4<'_>> {
 
 /// The TCP header at the start of an IPv4 payload.
 pub fn tcp(payload: &[u8]) -> Option<Tcp> {
-    (payload.len() >= 20).then(|| Tcp { dst_port: u16::from_be_bytes([payload[2], payload[3]]) })
+    (payload.len() >= 20).then(|| Tcp {
+        src_port: u16::from_be_bytes([payload[0], payload[1]]),
+        dst_port: u16::from_be_bytes([payload[2], payload[3]]),
+        flags: payload[13],
+    })
 }
