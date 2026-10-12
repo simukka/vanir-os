@@ -74,8 +74,9 @@ pub struct Slot {
     pub image: Option<Image>,
     /// The writer epoch and lease `storage` accepted for this slot (RFD 3), while it holds them.
     pub epoch: Option<(u64, u64)>,
-    /// The last epoch assigned to this slot was refused (reported to the control plane).
-    pub epoch_refused: bool,
+    /// An epoch `storage` refused for this slot, until one is accepted (reported to the control
+    /// plane).
+    pub epoch_refused: Option<u64>,
 }
 
 impl Slot {
@@ -182,7 +183,7 @@ impl Agent {
         let len = name.len().min(16);
         names[k][..len].copy_from_slice(&name.as_bytes()[..len]);
         let name = core::str::from_utf8(&names[k][..len]).unwrap_or("?");
-        self.slots[k] = Some(Slot { name, id, state: State::Empty, image: None, epoch: None, epoch_refused: false });
+        self.slots[k] = Some(Slot { name, id, state: State::Empty, image: None, epoch: None, epoch_refused: None });
         Some(k)
     }
 
@@ -285,14 +286,14 @@ impl Agent {
                 }
                 let slot = self.slots[k].as_mut().unwrap();
                 slot.epoch = Some(epoch);
-                slot.epoch_refused = false;
+                slot.epoch_refused = None;
                 self.changed = true;
                 Ok(true)
             }
             Err(e) if e == err::DEAD || e == CODE_LOCKED => Ok(false),
             Err(e) => {
                 println!("agent: epoch {} for {}: {}", epoch.0, s.name, block::code_name(e));
-                self.slots[k].as_mut().unwrap().epoch_refused = true;
+                self.slots[k].as_mut().unwrap().epoch_refused = Some(epoch.0);
                 self.changed = true;
                 Err(e)
             }

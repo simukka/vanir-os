@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1 planned. V2–V4 will be added here once V1 is built.
+Status: V1 implemented (V1a–V1c). V2–V4 will be added here.
 
 ## Goal
 
@@ -180,3 +180,11 @@ Where it departs from the plan so far:
   The probe writes once before `OP_READY` as well, so a candidate's refused write is always
   printed before its epoch can arrive. All the volume tests need `NET=user` (the app has a NIC).
 - **`http` finds `disk` again** after `DEAD`, as the agent does each tick.
+- **V1c: `live` offers the epoch to a live instance too.** If the right image is already live
+  and only the epoch changed, the agent offers it once (a refused epoch isn't retried until the
+  control plane asks for another). `agent-epoch-stale` checks the refusal and then that a higher
+  epoch is accepted. The mock control plane raises a service's epoch whenever its live instance
+  (slot or image) changes. `agent-volume`'s peer is a new `net-peer.py` scenario,
+  `count-under-deploy`: every count answered 200 must be new (833 counts, none repeated, 5
+  FENCED during the handoff in the run that was checked). `words()` in the agent's
+  desired-state parser takes ten words, since `live` with `drain` and `epoch` has nine.

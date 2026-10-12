@@ -1385,16 +1385,23 @@ deployments go on meanwhile (<code>user/agent/src/control.rs</code>).</p>
   <li><strong>What it wants.</strong> Desired state is a text document signed with a second pinned
     key (<code>keys/cp-sign.pub</code>), with a generation the agent only lets rise, so a
     replayed or reordered command does nothing (<code>agent-signed-state</code>). Lines:
-    <code>live &lt;service&gt; &lt;slot&gt; &lt;image hash&gt; [drain &lt;s&gt;]</code>,
+    <code>live &lt;service&gt; &lt;slot&gt; &lt;image hash&gt; [drain &lt;s&gt;] [epoch &lt;n&gt; &lt;lease ms&gt;]</code>,
     <code>stop &lt;service&gt; [drain &lt;s&gt;]</code>, <code>commit &lt;service&gt;</code>
     (and <code>end</code>, for tests). Images are named by the SHA-256 of their signed
-    statement.</li>
+    statement. For a service with a volume, <code>epoch</code> names its writer
+    (<a href="#storage-services">13.5</a>): the agent gives it to the new instance in a
+    deployment, or to the live instance if only the epoch changed. The mock control plane raises
+    it whenever the live instance changes.</li>
   <li><strong>Reconciliation.</strong> The agent keeps moving towards the last state it applied:
     fetching an image it lacks straight into the named slot, deploying it, rolling back to a
     stopped slot that already holds the wanted image, draining, committing. It reports what it
     has after the handshake, on every change and every 5 s, so a dropped connection costs
     nothing but time (<code>agent-reconnect</code>, <code>agent-deploy</code>,
-    <code>agent-drain</code>).</li>
+    <code>agent-drain</code>). A slot whose instance holds its volume's epoch reports
+    <code>epoch &lt;n&gt;</code>, and <code>epoch-refused &lt;n&gt;</code> while
+    <code>disk</code> refuses the one asked for (<code>agent-epoch-stale</code>). In
+    <code>agent-volume</code>, four clients keep counting through a deployment of
+    <code>counter</code>, and no count is answered twice.</li>
   <li><strong>Telemetry</strong> goes to the control plane through the agent. With no uplink
     driver, the telemetry task keeps its lines in a 16 KiB ring and the agent pulls them
     (<code>telemetry::OP_PULL</code>): if telemetry pushed to the agent while the agent sends to
@@ -1717,7 +1724,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
 <tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
-<tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code></td><td>port 7000; KVM, swtpm for the last two</td></tr>
+<tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-volume</code> <code>agent-epoch-stale</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code></td><td>port 7000; KVM, swtpm for the last two</td></tr>
 <tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>

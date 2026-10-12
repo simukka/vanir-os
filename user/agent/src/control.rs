@@ -27,7 +27,9 @@
 //!   ```text
 //!   vanir-desired 1
 //!   generation 7
-//!   live web small-1 <statement hash, hex> [drain <secs>]   # web's live instance
+//!   live web small-1 <statement hash, hex> [drain <secs>] [epoch <n> <lease ms>]
+//!                                                           # web's live instance; with a
+//!                                                           # volume, its writer epoch (RFD 3)
 //!   stop web [drain <secs>]                                 # drain and stop every instance
 //!   commit web                                              # unload web's stopped slots
 //!   update                                  # reboot into the image installed now, if empty
@@ -35,9 +37,11 @@
 //!
 //!   The agent keeps reconciling towards the last one it applied: it fetches the images it
 //!   lacks into the named slot, deploys, rolls back to a stopped slot that holds the wanted
-//!   image, drains, and commits.
+//!   image, drains, and commits. A live instance whose epoch differs from the one asked for is
+//!   offered it; `storage` refuses one lower than it has recorded.
 //! - **Reports** (`R`) say what it has: the generation applied, the node's name and its own
-//!   signed version (the node image), each slot's service, version, image hash and state. Sent
+//!   signed version (the node image), each slot's service, version, image hash and state, and
+//!   for a volume's writer `epoch <n>`, and `epoch-refused <n>` while `storage` refuses one. Sent
 //!   after the handshake, on every change, and every 5 s.
 //! - **Update** (RFD 2, P3, determination 1): a node with instances refuses, and says how many in
 //!   its report; an empty one asks the supervisor to reboot it into the image installed now.
@@ -406,7 +410,7 @@ impl Control {
                 }
                 println!("agent: fetched {} v{} into {}", core::str::from_utf8(image.service()).unwrap_or("?"), image.version(), agent.get(f.slot).name);
                 self.fetch = None;
-                agent.deploy(f.slot, Some(image), self.drain_for(image.service()), None);
+                agent.deploy(f.slot, Some(image), self.drain_for(image.service()), self.epoch_for(image.service()));
             }
             kind => println!("agent: unknown frame type {}", kind),
         }
@@ -452,10 +456,23 @@ impl Control {
     fn drain_for(&self, service: &[u8]) -> Option<u64> {
         let doc = &self.desired[..self.desired_len];
         for line in doc.split(|&b| b == b'\n') {
-            let words: [&[u8]; 8] = words(line);
+            let words = words(line);
             if (words[0] == b"live" || words[0] == b"stop") && words[1] == service {
                 let at = words.iter().position(|&w| w == b"drain")?;
                 return number(words[at + 1]);
+            }
+        }
+        None
+    }
+
+    /// The `epoch <n> <lease ms>` asked for `service`'s live instance, if any (RFD 3).
+    fn epoch_for(&self, service: &[u8]) -> Option<(u64, u64)> {
+        let doc = &self.desired[..self.desired_len];
+        for line in doc.split(|&b| b == b'\n') {
+            let words = words(line);
+            if words[0] == b"live" && words[1] == service {
+                let at = words.iter().position(|&w| w == b"epoch")?;
+                return Some((number(words[at + 1])?, number(words[at + 2])?));
             }
         }
         None
@@ -474,7 +491,15 @@ impl Control {
                         continue;
                     }
                     let live = agent.live(service);
-                    if live.is_some_and(|k| agent.get(k).image.is_some_and(|i| i.hash() == hash)) {
+                    if let Some(k) = live.filter(|&k| agent.get(k).image.is_some_and(|i| i.hash() == hash)) {
+                        // The right instance is live: offer it the epoch asked for, once.
+                        let s = agent.get(k);
+                        if let Some(epoch) = self.epoch_for(service)
+                            && s.epoch.map(|e| e.0) != Some(epoch.0)
+                            && s.epoch_refused != Some(epoch.0)
+                        {
+                            let _ = agent.assign_epoch(k, epoch);
+                        }
                         continue;
                     }
                     // Roll back to a stopped slot that still holds the wanted image.
@@ -482,7 +507,7 @@ impl Control {
                         agent.slots[k].is_some_and(|s| s.state == State::Stopped && s.image.is_some_and(|i| i.hash() == hash))
                     });
                     if let Some(k) = kept {
-                        agent.deploy(k, None, self.drain_for(service), None);
+                        agent.deploy(k, None, self.drain_for(service), self.epoch_for(service));
                         continue;
                     }
                     let Some(k) = core::str::from_utf8(slot_name).ok().and_then(|n| agent.find_slot(n)) else { continue };
@@ -575,6 +600,12 @@ impl Control {
                 }
             }
             let _ = write!(line, " {}", s.state.name());
+            if let Some((epoch, _)) = s.epoch {
+                let _ = write!(line, " epoch {}", epoch);
+            }
+            if let Some(epoch) = s.epoch_refused {
+                let _ = write!(line, " epoch-refused {}", epoch);
+            }
             put(&line);
         }
         self.send_frame(b'R', &text[..len]);
@@ -592,9 +623,9 @@ impl Control {
     }
 }
 
-/// The first eight space-separated words of `line` (missing ones empty).
-fn words(line: &[u8]) -> [&[u8]; 8] {
-    let mut out: [&[u8]; 8] = [&[]; 8];
+/// The first ten space-separated words of `line` (missing ones empty).
+fn words(line: &[u8]) -> [&[u8]; 10] {
+    let mut out: [&[u8]; 10] = [&[]; 10];
     for (o, w) in out.iter_mut().zip(line.split(|&b| b == b' ').filter(|w| !w.is_empty())) {
         *o = w;
     }

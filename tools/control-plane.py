@@ -151,6 +151,7 @@ class ControlPlane:
         self.latest = {}  # name -> its last report
         self.reports = 0
         self.generations = {}  # name -> last generation sent
+        self.epochs = {}  # service -> (epoch, slot, image) last asked for (RFD 3)
         self.backends = {}  # name -> data port, for the load balancer
         self.lb = []  # names new client connections go to (the first one)
         self.handshake_failures = 0
@@ -341,13 +342,30 @@ class ControlPlane:
         self.wait(ok, what)
         say(f"reached: {what}")
 
-    def live(self, service, slot, image, drain=None):
+    def live(self, service, slot, image, drain=None, epoch=None):
+        """A `live` line. For an image with a volume, the writer epoch goes up by one whenever
+        the live instance changes (another slot or image); `epoch` overrides it."""
         line = f"live {service} {slot} {self.images[image][0].hex()}"
-        return line + (f" drain {drain}" if drain is not None else "")
+        line += f" drain {drain}" if drain is not None else ""
+        if volume_blocks(self.images[image][3]):
+            last, last_slot, last_image = self.epochs.get(service, (0, None, None))
+            if epoch is None:
+                epoch = last if (slot, image) == (last_slot, last_image) else last + 1
+            self.epochs[service] = (epoch, slot, image)
+            lease = int(time.time() * 1000) + 30_000  # recorded by the node, not yet enforced
+            line += f" epoch {epoch} {lease}"
+        return line
+
+
+def volume_blocks(desc):
+    """The volume a descriptor declares (RFD 3), in blocks; 0 for none."""
+    return struct.unpack_from("<Q", desc, 152)[0]
 
 
 def parse_report(text):
-    """report <generation> node <name> image <version> [update-refused <n>] [refused <why>]"""
+    """report <generation> node <name> image <version> [update-refused <n>] [refused <why>],
+    then a line per slot: slot <name> <service> <version> <hash> <state> [epoch <n>]
+    [epoch-refused <n>]"""
     lines = text.strip().split("\n")
     head = lines[0].split()
     report = {"generation": int(head[1]), "node": head[3], "image": int(head[5]), "update_refused": None, "refused": None, "slots": {}}
@@ -358,8 +376,11 @@ def parse_report(text):
     if rest[:1] == ["refused"]:
         report["refused"] = " ".join(rest[1:])
     for line in lines[1:]:
-        _, name, service, version, digest, state = line.split()
-        report["slots"][name] = {"service": service, "version": int(version), "hash": digest, "state": state}
+        _, name, service, version, digest, state, *extra = line.split()
+        slot = {"service": service, "version": int(version), "hash": digest, "state": state, "epoch": None, "epoch_refused": None}
+        for key, value in zip(extra[::2], extra[1::2]):
+            slot[key.replace("-", "_")] = int(value)
+        report["slots"][name] = slot
     return report
 
 
@@ -466,6 +487,47 @@ def update_refused(cp):
     say("node a refused the update: it runs 1 instance")
     cp.tell("a", [cp.live("web", "small-0", "web-v1"), "end"])
     cp.wait(lambda: cp.report["generation"] == 3, "report of generation 3")
+    return True
+
+
+def slot_epoch(cp, slot, node="a"):
+    """(epoch, epoch refused) in `slot` in the latest report."""
+    s = cp.latest.get(node, {}).get("slots", {}).get(slot, {})
+    return s.get("epoch"), s.get("epoch_refused")
+
+
+@scenario
+def volume(cp):
+    """counter v1 live in small-0 with epoch 1, then v2 deployed into small-1 with epoch 2 while
+    the peer keeps counting (RFD 3, V1)."""
+    cp.wait(lambda: cp.report is not None, "report")
+    cp.send_desired(1, [cp.live("counter", "small-0", "counter-v1")])
+    cp.wait_slots("counter v1 live in small-0", small_0=("counter", 1, "LIVE"))
+    cp.wait(lambda: slot_epoch(cp, "small-0") == (1, None), "epoch 1 in small-0")
+    say("reached: small-0 holds epoch 1")
+    time.sleep(3)
+    cp.send_desired(2, [cp.live("counter", "small-1", "counter-v2")])
+    cp.wait_slots("counter v2 live in small-1, v1 stopped", small_1=("counter", 2, "LIVE"), small_0="STOPPED")
+    cp.wait(lambda: slot_epoch(cp, "small-1") == (2, None) and slot_epoch(cp, "small-0") == (None, None), "epoch 2 in small-1 only")
+    say("reached: small-1 holds epoch 2")
+    return True
+
+
+@scenario
+def epoch_stale(cp):
+    """After epoch 2, desired state with a newer generation but epoch 1 for the same instance:
+    the node applies it, storage refuses the epoch, and the report says so (RFD 3, V1)."""
+    cp.wait(lambda: cp.report is not None, "report")
+    cp.send_desired(1, [cp.live("counter", "small-0", "counter-v1", epoch=2)])
+    cp.wait_slots("counter v1 live in small-0", small_0=("counter", 1, "LIVE"))
+    cp.wait(lambda: slot_epoch(cp, "small-0") == (2, None), "epoch 2 in small-0")
+    say("reached: small-0 holds epoch 2")
+    cp.send_desired(2, [cp.live("counter", "small-0", "counter-v1", epoch=1)])
+    cp.wait(lambda: cp.report["generation"] == 2 and slot_epoch(cp, "small-0") == (2, 1), "epoch 1 refused")
+    say("reached: epoch 1 refused, small-0 still holds epoch 2")
+    cp.send_desired(3, [cp.live("counter", "small-0", "counter-v1", epoch=3), "end"])
+    cp.wait(lambda: cp.report["generation"] == 3 and slot_epoch(cp, "small-0") == (3, None), "epoch 3 in small-0")
+    say("reached: small-0 holds epoch 3")
     return True
 
 
