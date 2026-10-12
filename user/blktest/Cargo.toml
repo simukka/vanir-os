@@ -16,3 +16,5 @@ vanir-user = { path = "../lib" }
 check-only = []
 # Try the block driver directly (only the storage task may): must get NOT_ALLOWED.
 poke-driver = []
+# Wait 2 s before starting (volume-kinds: a service of the same name makes its volume first).
+start-after-2s = []

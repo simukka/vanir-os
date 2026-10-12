@@ -25,6 +25,12 @@ const HELLO: Image = image!("hello");
 const CRASHER: Image = image!("crasher");
 #[allow(dead_code)]
 const WEB_V2: Image = image!("web-v2");
+#[allow(dead_code)]
+const COUNTER_V1: Image = image!("counter-v1");
+#[allow(dead_code)]
+const COUNTER_V2: Image = image!("counter-v2");
+#[allow(dead_code)]
+const COUNTER_V3: Image = image!("counter-v3");
 
 /// Wait for messages forever (scripts that leave a service running).
 #[allow(dead_code)]
@@ -38,6 +44,9 @@ fn wait() -> ! {
 /// Run the script the features pick; returns the exit code, or None if there is none.
 pub fn script() -> Option<u64> {
     if let Some(code) = deployment_script() {
+        return Some(code);
+    }
+    if let Some(code) = volume_script() {
         return Some(code);
     }
     #[cfg(feature = "script-load")]
@@ -214,13 +223,13 @@ fn deployment_script() -> Option<u64> {
     let mut agent = Agent::new();
     let (s0, s1) = (agent.slot("small-0"), agent.slot("small-1"));
     // Every script starts with web v1 live in small-0.
-    agent.deploy(s0, Some(WEB_V1), None);
+    agent.deploy(s0, Some(WEB_V1), None, None);
     settle(&mut agent);
 
     #[cfg(feature = "script-deploy")]
     {
         sleep(300);
-        agent.deploy(s1, Some(WEB_V2), None);
+        agent.deploy(s1, Some(WEB_V2), None, None);
         settle(&mut agent);
         println!("agent: deployed web v2");
         wait();
@@ -228,38 +237,117 @@ fn deployment_script() -> Option<u64> {
     #[cfg(feature = "script-rollback")]
     {
         sleep(200);
-        agent.deploy(s1, Some(WEB_V2), None);
+        agent.deploy(s1, Some(WEB_V2), None, None);
         settle(&mut agent);
         sleep(200);
         println!("agent: rolling back to web v1");
         let old = agent.stopped(b"web").expect("v1 is kept until commit");
-        agent.deploy(old, None, None);
+        agent.deploy(old, None, None, None);
         settle(&mut agent);
         println!("agent: rolled back to web v1");
         wait();
     }
     #[cfg(feature = "script-not-ready")]
     {
-        agent.deploy(s1, Some(WEB_V2), None);
+        agent.deploy(s1, Some(WEB_V2), None, None);
         settle(&mut agent);
         println!("agent: after the failed deployment, {} is {}", agent.get(s0).name, agent.get(s0).state.name());
         return Some(0);
     }
     #[cfg(feature = "script-drain-cap")]
     {
-        agent.deploy(s1, Some(WEB_V2), Some(100_000));
+        agent.deploy(s1, Some(WEB_V2), Some(100_000), None);
         settle(&mut agent);
         return Some(0);
     }
     #[cfg(feature = "script-commit")]
     {
-        agent.deploy(s1, Some(WEB_V2), None);
+        agent.deploy(s1, Some(WEB_V2), None, None);
         settle(&mut agent);
         agent.commit(b"web");
         println!("agent: committed web v2; small-0 is {}", agent.get(s0).state.name());
-        agent.deploy(s0, Some(WEB_V1), None);
+        agent.deploy(s0, Some(WEB_V1), None, None);
         settle(&mut agent);
         println!("agent: web v1 is live again in {}", agent.get(s0).name);
+        return Some(0);
+    }
+    None
+}
+
+/// Keep the agent's loop turning for `ticks` (it notices a restarted storage task there).
+#[allow(dead_code)]
+fn run_for(agent: &mut Agent, ticks: u64) {
+    let until = vanir_user::uptime() + ticks;
+    while vanir_user::uptime() < until {
+        agent.advance();
+        sleep(1);
+    }
+}
+
+/// Volume scripts (RFD 3, V1): `counter`, http with a 16-block volume, run with
+/// `http/volume-probe` so each instance prints whether it may write. Returns the exit code, or
+/// None if no volume script was picked.
+#[allow(unreachable_code, unused_mut, unused_variables)]
+fn volume_script() -> Option<u64> {
+    if !cfg!(any(
+        feature = "script-volume-one",
+        feature = "script-volume-fence",
+        feature = "script-volume-persist",
+        feature = "script-volume-resize",
+        feature = "script-volume-none"
+    )) {
+        return None;
+    }
+    let mut agent = Agent::new();
+    let (s0, s1) = (agent.slot("small-0"), agent.slot("small-1"));
+
+    #[cfg(feature = "script-volume-none")]
+    {
+        agent.deploy(s0, Some(WEB_V1), None, None);
+        settle(&mut agent);
+        sleep(20);
+        return Some(0);
+    }
+    #[cfg(feature = "script-volume-persist")]
+    {
+        // A second boot on the same disk: epoch 2 is recorded, so it is accepted again, and 1 is
+        // refused.
+        agent.deploy(s1, Some(COUNTER_V2), None, Some((2, 0)));
+        settle(&mut agent);
+        sleep(30);
+        let _ = agent.assign_epoch(s1, (1, 0));
+        return Some(0);
+    }
+    // Every other script starts with counter v1 in small-0, holding epoch 1.
+    agent.deploy(s0, Some(COUNTER_V1), None, Some((1, 0)));
+    settle(&mut agent);
+
+    #[cfg(feature = "script-volume-one")]
+    {
+        run_for(&mut agent, 400);
+        return Some(0);
+    }
+    #[cfg(feature = "script-volume-fence")]
+    {
+        sleep(30);
+        agent.deploy(s1, Some(COUNTER_V2), None, Some((2, 0)));
+        settle(&mut agent);
+        sleep(30);
+        println!("agent: starting counter v1 in small-0 again, outside any deployment");
+        if let Err(e) = vanir_user::supervisor::start(agent.supervisor(), agent.get(s0).id) {
+            println!("agent: starting small-0 failed: {}", err::name(e));
+        }
+        sleep(30);
+        let _ = agent.assign_epoch(s0, (1, 0));
+        sleep(10);
+        return Some(0);
+    }
+    #[cfg(feature = "script-volume-resize")]
+    {
+        sleep(30);
+        agent.deploy(s1, Some(COUNTER_V3), None, Some((2, 0)));
+        settle(&mut agent);
+        println!("agent: after the resize, {} is {} and {} is {}", agent.get(s0).name, agent.get(s0).state.name(), agent.get(s1).name, agent.get(s1).state.name());
         return Some(0);
     }
     None

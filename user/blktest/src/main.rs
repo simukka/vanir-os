@@ -59,6 +59,10 @@ fn main() -> u64 {
         return if result == Err(err::NOT_ALLOWED) { 0 } else { 1 };
     }
 
+    // Let a service of the same name make its volume first (volume-kinds).
+    #[cfg(feature = "start-after-2s")]
+    sleep(200);
+
     #[allow(unreachable_code)]
     let mut disk = lookup("disk").expect("no disk task");
     // The storage task may still be waiting for its key (the host releases it after attesting

@@ -154,3 +154,29 @@ KVM-only, as today).
   `agent-volume` may be slow. If it is, it keeps a short load and runs with `SLOW=1`.
 - **The format change** reformats any disk left from before; `storage-persist` and
   `attest-unlock-persist` use disks made earlier in the same run, so they are unaffected.
+
+## As built
+
+Where it departs from the plan so far:
+
+- **V1a: the header holds its own counter and tag.** They sit in plain text at the front of the
+  header block, before the sealed fields; the 64-byte table entry had no room for them, and this
+  way the header is whole when the volume moves (V4). The header is checked on a volume's first
+  read or write after each unlock, not on `OP_INFO`, so a wrong key still shows as a failed read.
+  `DISK_OLD=1` stamps a `VNRSTOR2` superblock for `storage-old-format`.
+- **A refused epoch after the drain** leaves the new instance live without it (the plan said
+  FAILED): it is already routed, and the old one has drained. The agent marks the slot
+  (`epoch_refused`, for V1c's report) and the control plane can send a higher epoch. With no
+  old instance, a refusal does fail the deployment, before any traffic.
+- **Fewer, broader tests.** `volume-epoch-stale` and `volume-epoch-not-allowed` are part of
+  `volume-fence`: after the swap it starts v1 again outside any deployment (its writes are
+  FENCED), and offers epoch 1 again (refused). Each `counter` instance with `volume-probe` also
+  tries `OP_EPOCH` itself (NOT_ALLOWED). `volume-none` uses `web` with `volume-probe`, which in a
+  slot without a volume asks `disk` once.
+- **Test helpers.** `volume-kinds` has its own app (`volumes-kinds.toml`): the fixed task
+  `counter` (blktest, `start-after-2s`) would otherwise end every volume test when it exits under
+  `halt-on-exit`. `volume-writer-restart` uses a new `http` feature, `crash-after-probes`. A
+  slot's id is at generation 1 once loaded, so "first start only" there means generation ≤ 1.
+  The probe writes once before `OP_READY` as well, so a candidate's refused write is always
+  printed before its epoch can arrive. All the volume tests need `NET=user` (the app has a NIC).
+- **`http` finds `disk` again** after `DEAD`, as the agent does each tick.

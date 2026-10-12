@@ -973,6 +973,47 @@ asks for it itself (<code>storage-restart</code>); clients see <code>DEAD</code>
 make run DISK=1 APP=tests/apps/storage.toml                # same disk: they find their data
 make run DISK=1 DISK_CORRUPT=client-a:0 APP=...            # flip a byte of client-a's block 0 first</code></pre>
 
+<h3 id="storage-services"><span class="num">13.5</span>Service volumes and writers<a class="anchor" href="#storage-services">#</a></h3>
+
+<p>A service image loaded into a slot (<a href="#deployment">15</a>) can declare a volume in its
+signed descriptor (<code>volume = { blocks = 16 }</code>, at most 65536). The kernel returns the
+size with the rest of the descriptor (<code>task_listen</code>), and <code>disk</code> gives an
+instance in a slot its <em>service's</em> volume, named after the service, whichever slot it
+runs in. An instance whose descriptor declares no volume gets <code>NOT_ALLOWED</code>. The
+version that makes the volume fixes its size; an instance that declares another size gets
+<code>OUT_OF_RANGE</code> and can't open it (RFD 3 leaves resizing to RFD 4).</p>
+
+<p>A service volume has <strong>one writer</strong> (RFD 3, P1). Any instance of the service may
+read it; writes and flushes from any other get <code>FENCED</code>. The writer is named by an
+<strong>epoch</strong>, which the control plane assigns with each deployment and the agent
+hands to <code>disk</code> (<code>block::OP_EPOCH</code>: epoch, lease, writer). Only the task
+with <code>loads = true</code> may send it. <code>disk</code> records a higher epoch in the
+volume's header and flushes it before replying. The same epoch again is accepted only while
+there is no writer, or the writer is unchanged. Anything lower is refused, across reboots too,
+since the header is on the disk. The writer is a <em>slot</em>, kept in memory: a writer that
+crashes and is restarted in its slot stays the writer, and a restarted <code>disk</code> knows
+no writer until the agent names it again. The lease is recorded, not enforced (RFD 3,
+determination 8).</p>
+
+<pre class="diagram">
+ agent: deploy counter v2 into small-1, epoch 2         counter v1 (small-0)   counter v2 (small-1)
+   load, start ......................................... writes OK             reads OK, writes FENCED
+   ready, route to small-1; drain small-0 .............. drains                writes FENCED (V1)
+   small-0 drained: OP_EPOCH(2, lease, small-1) ........                       writes OK
+   stop small-0
+</pre>
+
+<p>Until RFD 3's phase V3, the new instance's writes are <em>refused</em> between the routing
+change and the old instance draining (the diagram's "V1" line); V3 makes them wait instead.
+<code>http</code> uses a volume when its descriptor declares one (<code>counter</code>,
+<code>tests/slots/counter-v*.toml</code>): <code>/count</code> reads a count from block 0, adds
+one and writes it back. It reads block 0 before it says it is ready, and never says so if that
+fails. A task named like a service still gets a volume of its own: the table records each
+volume's kind, and their keys use different salts (<code>volume-kinds</code>).</p>
+
+<p>Events: <code>epoch_changed</code> (volume, epoch, writer slot) and <code>write_fenced</code>
+(volume, slot, epoch; the first refusal per slot and epoch).</p>
+
 <div class="agent"><span class="label">For agents</span><dl>
 <dt>files</dt><dd><code>user/storage/src/main.rs</code>, <code>user/virtio-blk/</code>, <code>user/unlocker/</code>, <code>user/blktest/</code>, <code>block</code>/<code>keys</code>/<code>telemetry</code> modules in <code>user/lib/src/lib.rs</code>, <code>tools/corrupt-disk.py</code></dd>
 <dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7</dd>
@@ -1209,7 +1250,8 @@ version = 2
 min_version = 1          # oldest version that may still run
 slot_class = "small"
 listen = [{ port = 80, max_connections = 64 }]
-drain = { default_secs = 30, max_secs = 300 }</code></pre>
+drain = { default_secs = 30, max_secs = 300 }
+volume = { blocks = 256 }  # optional: the service's volume (RFD 3, <a href="#storage-services">13.5</a>)</code></pre>
 
 <p><code>tools/sign-image.py sign-slot KEY ELF DESC.toml OUT</code> compiles it to the fixed
 256-byte layout the kernel reads (<code>OUT.desc</code>) and writes a <code>VNRSIG02</code>
@@ -1296,9 +1338,11 @@ task. Its slot keeps the image, so a <strong>rollback</strong> is the same flow 
 reversed: the supervisor starts the stopped slot again (<code>OP_START</code>, backoff reset)
 and the newer version drains. <strong>Commit</strong> unloads the stopped slots of a service. A
 service that exits 0 by itself is done and isn't restarted. Nothing in the lifecycle blocks:
-each deployment advances a step at a time from the agent's loop. Two places are marked for RFD 3:
-a service with a volume isn't ready until it has opened it, and isn't finished until its handoff
-is.</p>
+each deployment advances a step at a time from the agent's loop. For a service with a volume, a
+deployment carries a writer epoch, which the agent hands to <code>disk</code> before routing to
+the new instance if there is no old one, and otherwise once the old one has drained and before
+it is stopped (<a href="#storage-services">13.5</a>). If <code>disk</code> refuses it, the new
+instance stays live without it, and the agent reports the refusal.</p>
 
 <p>Tests: <code>deploy-under-load</code> and <code>rollback-under-load</code> keep eight clients
 requesting through the swap (and back) with no failed request; <code>deploy-not-ready</code>
@@ -1460,6 +1504,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Measured boot + TPM quotes</td><td>a host trusting a VM that booted something else</td><td><code>measured-*</code>, <code>attest-*</code></td></tr>
 <tr><td>Only the storage task may use the block driver</td><td>tasks reading the raw disk</td><td><code>storage-no-driver</code></td></tr>
 <tr><td>A volume per task, chosen by kernel-checked name</td><td>tasks reading or writing each other's data</td><td><code>storage-isolation</code></td></tr>
+<tr><td>A service's volume, from its signed descriptor; one writer, named by an epoch only the agent can assign</td><td>two instances writing one volume; an old writer writing after a handoff</td><td><code>volume-fence</code>, <code>volume-persist</code>, <code>volume-none</code>, <code>volume-kinds</code></td></tr>
 <tr><td>Encryption at rest (XChaCha20-Poly1305)</td><td>plain text on the disk image</td><td><code>storage-at-rest</code></td></tr>
 <tr><td>Authenticated blocks, bound to volume, block and counter</td><td>changed or moved ciphertext read as data</td><td><code>storage-tampered</code>, <code>storage-bad-block</code>, <code>storage-header-tampered</code></td></tr>
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
@@ -1500,8 +1545,12 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
   <li><strong>Storage isn't crash-consistent.</strong> Data is written before its metadata; a
     crash in between leaves that block failing its integrity check until rewritten. Nothing is
     guaranteed durable before a flush.</li>
-  <li><strong>Fixed-size volumes.</strong> 256 blocks each; no <code>volume_blocks</code>
-    manifest key; volumes are never freed.</li>
+  <li><strong>Volumes are never freed</strong>, and a fixed task's volume is always 256 blocks.
+    A service's volume is sized by its descriptor, and that size can't change.</li>
+  <li><strong>Writes are refused during a handoff</strong> of a service with a volume, from the
+    routing change until the old instance has drained (RFD 3, V3 makes them wait). Writer leases
+    are recorded, not enforced, and volume keys still come from the node's master key (V2 makes
+    them per service).</li>
   <li><strong>One key release per boot.</strong> In the attested flow the host says
     <code>bye</code> after releasing the key, so a <code>disk</code> restarted later stays
     locked until the next boot.</li>
@@ -1528,8 +1577,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
     a name built into the agent (<code>NODE</code>), not by their TPM's key, and the two-node
     tests boot an updated node from a new ISO rather than writing it to an A/B boot disk.</li>
   <li><strong>Fixed slot classes, stateless services.</strong> Slots come in classes fixed by the
-    manifest (sizing them per service is RFD 4), and services have no volumes yet, so the hooks
-    where deployments will wait for storage (RFD 3) do nothing.</li>
+    manifest (sizing them per service is RFD 4).</li>
 </ul>
 
 <!-- ============================================================ WORKING ON IT -->
@@ -1660,6 +1708,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>measured boot, attestation</td><td><code>measured-boot</code> <code>measured-rejected</code> <code>no-tpm</code> <code>attest-record</code> <code>attest-verify</code> <code>attest-replay</code> <code>attest-tampered</code> <code>attest-other-version</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>block</td><td><code>blk-rw</code> <code>blk-persist</code> <code>blk-persist-negative</code> <code>blk-restart</code></td><td></td></tr>
 <tr><td>storage</td><td><code>storage-isolation</code> <code>storage-old-format</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-header-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
+<tr><td>service volumes</td><td><code>volume-fence</code> <code>volume-persist</code> <code>volume-size-fixed</code> <code>volume-none</code> <code>volume-kinds</code> <code>volume-storage-restart</code> <code>volume-writer-restart</code></td><td><code>volume-persist</code> uses the disk <code>volume-fence</code> leaves</td></tr>
 <tr><td>key release</td><td><code>attest-storage-record</code> <code>attest-unlock</code> <code>attest-unlock-persist</code> <code>attest-unlock-refused</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>NIC</td><td><code>nic-arp-ping</code> <code>nic-restart</code> <code>nic-no-grant</code></td><td>free UDP ports 18090-18091</td></tr>
 <tr><td>sockets, HTTP</td><td><code>build-http-port-clash</code> <code>http-get</code> <code>http-undeclared-port</code> <code>net-restart</code> <code>http-restart</code></td><td>free TCP port 8080</td></tr>

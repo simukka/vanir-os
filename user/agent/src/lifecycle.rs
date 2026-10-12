@@ -10,6 +10,13 @@
 //!    └── unload ◀── STOPPED ◀── stop ◀── DRAINED ◀─────────┘
 //! ```
 //!
+//! A service with a volume (RFD 3) has one writer, named by an epoch the control plane assigns
+//! with the deployment. The agent hands it to `storage` (`block::epoch`) at the moment the RFD
+//! fixes: with no old instance, before routing to the new one; with one, once it has drained and
+//! before it is stopped. Until V3, the new instance's writes are refused in between. When
+//! `storage` restarts, it has forgotten the writer, so the agent sends each live writer's epoch
+//! again.
+//!
 //! Nothing here blocks: operations (`Op`) advance a step at a time in `advance`, called from
 //! the agent's loop, so the agent keeps serving its other work (the control plane) while a
 //! drain runs for minutes.
@@ -17,6 +24,7 @@
 use crate::Image;
 use vanir_user::net::{self, STATUS_DRAINED, STATUS_GONE, STATUS_LIVE, STATUS_READY};
 use vanir_user::telemetry::{self, Record};
+use vanir_user::block::{self, CODE_LOCKED};
 use vanir_user::{err, events, lookup, println, slot, supervisor, uptime};
 
 /// Most slots the agent tracks.
@@ -64,6 +72,10 @@ pub struct Slot {
     pub state: State,
     /// The image it holds, while it holds one.
     pub image: Option<Image>,
+    /// The writer epoch and lease `storage` accepted for this slot (RFD 3), while it holds them.
+    pub epoch: Option<(u64, u64)>,
+    /// The last epoch assigned to this slot was refused (reported to the control plane).
+    pub epoch_refused: bool,
 }
 
 impl Slot {
@@ -87,6 +99,8 @@ pub struct Deploy {
     pub step: Step,
     /// The drain deadline for `old`, in ticks (already capped by its descriptor).
     pub drain_ticks: u64,
+    /// The writer epoch and lease for `new`, if its service has a volume (RFD 3).
+    pub epoch: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -109,6 +123,10 @@ pub struct Agent {
     net: u64,
     supervisor: u64,
     telemetry: Option<u64>,
+    /// The storage task (RFD 3), as last looked up, and whether it restarted since the live
+    /// writers' epochs were last sent to it.
+    disk: Option<u64>,
+    resend_epochs: bool,
     /// A slot changed state since this was last cleared (the control plane wants a report).
     pub changed: bool,
 }
@@ -141,6 +159,8 @@ impl Agent {
             net: id("net"),
             supervisor: id("supervisor"),
             telemetry: lookup("telemetry").ok(),
+            disk: lookup("disk").ok(),
+            resend_epochs: false,
             changed: false,
         }
     }
@@ -162,8 +182,12 @@ impl Agent {
         let len = name.len().min(16);
         names[k][..len].copy_from_slice(&name.as_bytes()[..len]);
         let name = core::str::from_utf8(&names[k][..len]).unwrap_or("?");
-        self.slots[k] = Some(Slot { name, id, state: State::Empty, image: None });
+        self.slots[k] = Some(Slot { name, id, state: State::Empty, image: None, epoch: None, epoch_refused: false });
         Some(k)
+    }
+
+    pub fn supervisor(&self) -> u64 {
+        self.supervisor
     }
 
     pub fn get(&self, k: usize) -> Slot {
@@ -192,8 +216,9 @@ impl Agent {
     }
 
     /// Start deploying `image` into empty slot `new` (or, with no image, starting the stopped
-    /// slot `new` again: a rollback). `drain_secs` overrides the old instance's drain deadline.
-    pub fn deploy(&mut self, new: usize, image: Option<Image>, drain_secs: Option<u64>) -> bool {
+    /// slot `new` again: a rollback). `drain_secs` overrides the old instance's drain deadline;
+    /// `epoch` (epoch, lease) makes the new instance its volume's writer (RFD 3).
+    pub fn deploy(&mut self, new: usize, image: Option<Image>, drain_secs: Option<u64>, epoch: Option<(u64, u64)>) -> bool {
         if let Some(image) = image {
             if self.get(new).state != State::Empty {
                 println!("agent: {} isn't empty", self.get(new).name);
@@ -210,7 +235,7 @@ impl Agent {
         let Some(d) = self.deploys.iter().position(|d| d.is_none_or(|d| matches!(d.step, Step::Done | Step::Failed))) else {
             return false;
         };
-        self.deploys[d] = Some(Deploy { new, old, step: Step::Start, drain_ticks: drain });
+        self.deploys[d] = Some(Deploy { new, old, step: Step::Start, drain_ticks: drain, epoch });
         true
     }
 
@@ -223,7 +248,7 @@ impl Agent {
         let Some(d) = self.deploys.iter().position(|d| d.is_none_or(|d| matches!(d.step, Step::Done | Step::Failed))) else {
             return false;
         };
-        self.deploys[d] = Some(Deploy { new: k, old: Some(k), step: Step::Drain, drain_ticks });
+        self.deploys[d] = Some(Deploy { new: k, old: Some(k), step: Step::Drain, drain_ticks, epoch: None });
         true
     }
 
@@ -242,8 +267,64 @@ impl Agent {
         self.deploys.iter().flatten().all(|d| matches!(d.step, Step::Done | Step::Failed))
     }
 
+    /// Hand slot `k`'s instance epoch `epoch` (RFD 3). Ok(true) once `storage` has it; Ok(false)
+    /// to try again later (storage restarting or still locked); Err(code) if it refused.
+    pub fn assign_epoch(&mut self, k: usize, epoch: (u64, u64)) -> Result<bool, u64> {
+        let Some(disk) = self.disk else {
+            println!("agent: no storage task for {}'s volume", self.get(k).name);
+            return Err(block::CODE_BAD_OP);
+        };
+        let s = self.get(k);
+        match block::epoch(disk, epoch.0, epoch.1, s.id) {
+            Ok(()) => {
+                println!("agent: {} holds epoch {}", s.name, epoch.0);
+                for other in self.slots.iter_mut().flatten() {
+                    if other.service() == s.service() {
+                        other.epoch = None;
+                    }
+                }
+                let slot = self.slots[k].as_mut().unwrap();
+                slot.epoch = Some(epoch);
+                slot.epoch_refused = false;
+                self.changed = true;
+                Ok(true)
+            }
+            Err(e) if e == err::DEAD || e == CODE_LOCKED => Ok(false),
+            Err(e) => {
+                println!("agent: epoch {} for {}: {}", epoch.0, s.name, block::code_name(e));
+                self.slots[k].as_mut().unwrap().epoch_refused = true;
+                self.changed = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Notice a restarted `storage`, and send it each live writer's epoch again.
+    fn keep_epochs(&mut self) {
+        if let Ok(id) = lookup("disk")
+            && Some(id) != self.disk
+        {
+            self.resend_epochs |= self.disk.is_some();
+            self.disk = Some(id);
+        }
+        if !self.resend_epochs {
+            return;
+        }
+        let mut done = true;
+        for k in 0..MAX_SLOTS {
+            if let Some(s) = self.slots[k]
+                && let Some(epoch) = s.epoch
+                && s.state == State::Live
+            {
+                done &= self.assign_epoch(k, epoch).unwrap_or(true);
+            }
+        }
+        self.resend_epochs = !done;
+    }
+
     /// Move every deployment along as far as it can go now.
     pub fn advance(&mut self) {
+        self.keep_epochs();
         for d in 0..self.deploys.len() {
             while let Some(deploy) = self.deploys[d] {
                 let step = self.step(deploy);
@@ -269,7 +350,7 @@ impl Agent {
                     return Step::Failed;
                 }
                 self.set(d.new, State::Starting);
-                // RFD 3: a service with a volume isn't ready until it has opened it.
+                // A service with a volume doesn't say it's ready until it has opened it (RFD 3).
                 Step::WaitReady { until: now + READY_TIMEOUT }
             }
             Step::Drain => {
@@ -294,6 +375,20 @@ impl Agent {
                 _ => d.step,
             },
             Step::Promote => {
+                // With no old instance, the new one becomes the writer before it gets traffic.
+                if d.old.is_none()
+                    && let Some(epoch) = d.epoch
+                {
+                    match self.assign_epoch(d.new, epoch) {
+                        Ok(true) => {}
+                        Ok(false) => return d.step,
+                        Err(_) => {
+                            let _ = supervisor::stop(self.supervisor, new.id);
+                            self.set(d.new, State::Failed);
+                            return Step::Failed;
+                        }
+                    }
+                }
                 if let Err(e) = net::route(self.net, new.id) {
                     println!("agent: routing to {} failed: {}", new.name, net::code_name(e));
                     return d.step;
@@ -310,9 +405,18 @@ impl Agent {
                 let old = d.old.unwrap();
                 match net::status(self.net, self.get(old).id) {
                     Ok((STATUS_DRAINED | STATUS_GONE, forced)) => {
-                        println!("agent: {} drained ({} connections reset at the deadline)", self.get(old).name, forced);
-                        self.set(old, State::Drained);
-                        // RFD 3: a service with a volume isn't finished until its handoff is.
+                        if self.get(old).state != State::Drained {
+                            println!("agent: {} drained ({} connections reset at the deadline)", self.get(old).name, forced);
+                            self.set(old, State::Drained);
+                        }
+                        // The epoch moves once the old instance has drained, before it stops
+                        // (RFD 3, P3). A refusal leaves the new instance live without it.
+                        if d.new != old
+                            && let Some(epoch) = d.epoch
+                            && self.assign_epoch(d.new, epoch) == Ok(false)
+                        {
+                            return d.step;
+                        }
                         match supervisor::stop(self.supervisor, self.get(old).id) {
                             Ok(()) => self.set(old, State::Stopped),
                             Err(e) => println!("agent: stopping {} failed: {}", self.get(old).name, err::name(e)),

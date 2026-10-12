@@ -18,6 +18,15 @@
 //! table and by the key's HKDF salt: a fixed task's, found by its task name, and (RFD 3) a
 //! service's.
 //!
+//! **Service volumes (RFD 3, P1).** An instance in a generic slot reaches the volume its signed
+//! descriptor declares (`task_listen`'s `volume_blocks`), named after its service, whichever slot
+//! it runs in; without one it gets CODE_NOT_ALLOWED. The size is fixed by the version that made
+//! the volume: an instance declaring another size gets CODE_OUT_OF_RANGE. Any instance of the
+//! service may read; only the writer may write or flush, others get CODE_FENCED. The agent
+//! (`loads = true`) names the writer with OP_EPOCH. The writer is a slot, kept in memory only:
+//! a restarted writer stays the writer, and after this task restarts nobody is until the agent
+//! says again. Epochs only go up, across reboots (they are in the header).
+//!
 //! The master key is only ever in memory. The task starts locked, answering CODE_LOCKED: it asks
 //! the key server ("keys") for the key if it may send to one, and otherwise waits for OP_UNLOCK
 //! (from "attest", after the host released the key). A restarted storage task starts locked
@@ -37,12 +46,12 @@ use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use vanir_user::block::{
-    self, BLOCK_SIZE, CODE_BAD_OP, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE, OP_FLUSH,
-    OP_INFO, OP_READ, OP_UNLOCK, OP_WRITE, split,
+    self, BLOCK_SIZE, CODE_BAD_OP, CODE_FENCED, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE,
+    OP_EPOCH, OP_FLUSH, OP_INFO, OP_READ, OP_UNLOCK, OP_WRITE, split,
 };
 use vanir_user::keys::OP_MASTER_KEY;
-use vanir_user::telemetry::{self, INTEGRITY_ERROR, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
-use vanir_user::{err, lookup, println, recv, reply, send, sleep, task_name};
+use vanir_user::telemetry::{self, INTEGRITY_ERROR, Record, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
+use vanir_user::{err, lookup, println, recv, reply, send, sleep, task_index, task_listen, task_name, uptime};
 
 vanir_user::entry!(main);
 
@@ -64,7 +73,6 @@ const HEADER_MAGIC: &[u8; 8] = b"VNRVOL01";
 const HEADER_FIELDS: usize = 72;
 /// Volume kinds, in the table and the header.
 const KIND_TASK: u8 = 1;
-#[allow(dead_code)] // RFD 3, V1b
 const KIND_SERVICE: u8 = 2;
 /// Tasks that may hand over the master key.
 const UNLOCKERS: [&[u8]; 2] = [b"keys", b"attest"];
@@ -81,9 +89,13 @@ struct Volume {
     blocks: u64,
     /// The header has been checked since the last unlock.
     checked: bool,
-    /// Writer epoch and lease from the header (RFD 3, P1); read, not yet used.
+    /// Writer epoch and lease from the header (RFD 3, P1). The lease is recorded, not enforced.
     epoch: u64,
     lease_until: u64,
+    /// The writer's slot (task index), once the agent has named it since this task started.
+    writer: Option<u64>,
+    /// Slots (bit index - 1) already reported for a fenced write at this epoch.
+    fenced_seen: u64,
 }
 
 /// Metadata blocks for `blocks` data blocks.
@@ -179,6 +191,8 @@ impl Storage {
                     checked: false,
                     epoch: 0,
                     lease_until: 0,
+                    writer: None,
+                    fenced_seen: 0,
                 });
             }
         }
@@ -213,10 +227,30 @@ impl Storage {
         let mut key = [0u8; 32];
         key[..name.len().min(32)].copy_from_slice(&name[..name.len().min(32)]);
         if let Some(i) = self.volumes.iter().position(|v| v.is_some_and(|v| v.kind == kind && v.name == key)) {
+            let had = self.volumes[i].unwrap().blocks;
+            if had != blocks {
+                println!(
+                    "storage: {}: the volume has {} blocks, the instance's descriptor declares {}",
+                    core::str::from_utf8(name).unwrap_or("?"),
+                    had,
+                    blocks
+                );
+                return Err(CODE_OUT_OF_RANGE);
+            }
             return Ok(i);
         }
         let Some(slot) = self.volumes.iter().position(Option::is_none) else { return Err(CODE_OUT_OF_RANGE) };
-        let mut v = Volume { name: key, kind, start: self.next_free, blocks, checked: true, epoch: 0, lease_until: 0 };
+        let mut v = Volume {
+            name: key,
+            kind,
+            start: self.next_free,
+            blocks,
+            checked: true,
+            epoch: 0,
+            lease_until: 0,
+            writer: None,
+            fenced_seen: 0,
+        };
         if self.next_free + v.footprint() > self.capacity {
             return Err(CODE_OUT_OF_RANGE);
         }
@@ -268,6 +302,63 @@ impl Storage {
         v.checked = true;
         self.volumes[i] = Some(v);
         Ok(())
+    }
+
+    /// OP_EPOCH (RFD 3, P1): make `writer` the writer of its service's volume at `epoch`.
+    fn assign_epoch(&mut self, epoch: u64, lease_until: u64, writer: u64) -> Result<(), u64> {
+        let info = task_listen(writer).map_err(|_| CODE_BAD_OP)?;
+        if !info.is_slot() || info.volume_blocks == 0 {
+            return Err(CODE_BAD_OP);
+        }
+        let i = self.volume(KIND_SERVICE, info.service(), info.volume_blocks)?;
+        self.check_header(i)?;
+        let mut v = self.volumes[i].unwrap();
+        let slot = task_index(writer);
+        let service = core::str::from_utf8(info.service()).unwrap_or("?");
+        if epoch > v.epoch {
+            let started = uptime();
+            v.epoch = epoch;
+            v.lease_until = lease_until;
+            v.writer = Some(slot);
+            v.fenced_seen = 0;
+            self.write_header(&mut v)?;
+            self.flush()?;
+            self.volumes[i] = Some(v);
+            println!("storage: {}: epoch {}, writer task {} (recorded in {} ticks)", service, epoch, slot, uptime() - started);
+        } else if epoch == v.epoch && epoch != 0 && v.writer.is_none_or(|w| w == slot) {
+            v.writer = Some(slot);
+            self.volumes[i] = Some(v);
+            println!("storage: {}: epoch {} again, writer task {}", service, epoch, slot);
+        } else {
+            println!("storage: {}: epoch {} refused (recorded: {})", service, epoch, v.epoch);
+            return Err(CODE_FENCED);
+        }
+        if let Some(t) = self.telemetry {
+            let mut r = Record::new("epoch_changed");
+            r.text("volume", service).num("epoch", epoch).num("writer", slot);
+            let _ = telemetry::event(t, &r);
+        }
+        Ok(())
+    }
+
+    /// Whether slot `slot` may write volume `i` (a service volume's writer; anyone for a task's).
+    /// Reports the first refusal per slot and epoch.
+    fn may_write(&mut self, i: usize, slot: u64) -> bool {
+        let mut v = self.volumes[i].unwrap();
+        if v.kind == KIND_TASK || v.writer == Some(slot) {
+            return true;
+        }
+        let bit = 1u64 << ((slot - 1) % 64);
+        if v.fenced_seen & bit == 0 {
+            v.fenced_seen |= bit;
+            self.volumes[i] = Some(v);
+            if let Some(t) = self.telemetry {
+                let mut r = Record::new("write_fenced");
+                r.text("volume", core::str::from_utf8(name_of(&v)).unwrap_or("?")).num("slot", slot).num("epoch", v.epoch);
+                let _ = telemetry::event(t, &r);
+            }
+        }
+        false
     }
 
     /// Seal `v`'s header with the next counter and write it (not flushed).
@@ -443,17 +534,44 @@ fn main() -> u64 {
             let _ = reply(m.sender, CODE_LOCKED, &[]);
             continue;
         }
-        let i = match s.volume(KIND_TASK, name, TASK_BLOCKS) {
+        let code_of = |e: u64| if err::is_error(e) { CODE_IO_ERROR } else { e };
+        if op == OP_EPOCH {
+            let code = if !task_listen(m.sender).is_ok_and(|i| i.may_load()) {
+                CODE_NOT_ALLOWED
+            } else if m.len != 24 {
+                CODE_BAD_OP
+            } else {
+                let at = |k: usize| u64::from_le_bytes(msg[k..k + 8].try_into().unwrap());
+                match s.assign_epoch(at(0), at(8), at(16)) {
+                    Ok(()) => CODE_OK,
+                    Err(e) => code_of(e),
+                }
+            };
+            let _ = reply(m.sender, code, &[]);
+            continue;
+        }
+        // A slot's instance reaches its service's volume (RFD 3), anything else its task's.
+        let info = task_listen(m.sender).ok().filter(|i| i.is_slot());
+        let found = match &info {
+            Some(i) if i.volume_blocks == 0 => Err(CODE_NOT_ALLOWED),
+            Some(i) => s.volume(KIND_SERVICE, i.service(), i.volume_blocks),
+            None => s.volume(KIND_TASK, name, TASK_BLOCKS),
+        };
+        let i = match found {
             Ok(i) => i,
             Err(code) => {
-                let _ = reply(m.sender, code, &[]);
+                let _ = reply(m.sender, code_of(code), &[]);
                 continue;
             }
         };
         if matches!(op, OP_READ | OP_WRITE)
             && let Err(e) = s.check_header(i)
         {
-            let _ = reply(m.sender, if err::is_error(e) { CODE_IO_ERROR } else { e }, &[]);
+            let _ = reply(m.sender, code_of(e), &[]);
+            continue;
+        }
+        if matches!(op, OP_WRITE | OP_FLUSH) && !s.may_write(i, task_index(m.sender)) {
+            let _ = reply(m.sender, CODE_FENCED, &[]);
             continue;
         }
         let v = s.volumes[i].unwrap();

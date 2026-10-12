@@ -1,0 +1,8 @@
+# A stateful service (RFD 3): http with a volume, counting requests in block 0.
+# Declares a different volume size from v1 and v2, so it cannot open their volume.
+name = "counter"
+version = 3
+min_version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+volume = { blocks = 32 }

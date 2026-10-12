@@ -16,7 +16,9 @@ USER_PROGS     := hello spinner isolation runaway echo client deadlock superviso
 # The agent is built after them, since its test scripts carry them.
 SLOT_IMAGES    := web-v1:http:tests/slots/web-v1.toml web-v2:http:tests/slots/web-v2.toml \
                   web-floor:http:tests/slots/web-floor.toml web-large:http:tests/slots/web-large.toml \
-                  hello:hello:tests/slots/hello.toml crasher:crasher:tests/slots/crasher.toml
+                  hello:hello:tests/slots/hello.toml crasher:crasher:tests/slots/crasher.toml \
+                  counter-v1:http:tests/slots/counter-v1.toml counter-v2:http:tests/slots/counter-v2.toml \
+                  counter-v3:http:tests/slots/counter-v3.toml
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso

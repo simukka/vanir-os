@@ -22,3 +22,7 @@ listen-81 = []
 try-mgmt-net = []
 # Version 2 and later (signed as a slot image) never say they are ready (deploy-not-ready).
 never-ready-v2 = []
+# With a volume (RFD 3): write scratch block 1 every 100 ms and print each change in the result.
+volume-probe = []
+# With volume-probe, first start only: fault after 20 probes (the writer is restarted in its slot).
+crash-after-probes = ["volume-probe"]

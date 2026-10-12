@@ -32,6 +32,7 @@ covers both:
   slot_class = "small"
   listen = [{ port = 80, max_connections = 64, max_per_source = 16 }]
   drain = { default_secs = 30, max_secs = 300 }   # (defaults)
+  volume = { blocks = 256 }    # the service's volume (RFD 3), 1..65536 blocks; none if absent
 """
 import argparse
 import hashlib
@@ -74,7 +75,7 @@ def descriptor(path):
     import tomllib
     with open(path, "rb") as f:
         d = tomllib.load(f)
-    known = {"name", "version", "min_version", "slot_class", "listen", "drain"}
+    known = {"name", "version", "min_version", "slot_class", "listen", "drain", "volume"}
     if set(d) - known:
         sys.exit(f"{path}: unknown keys {sorted(set(d) - known)}")
     name, cls = d["name"].encode(), d["slot_class"].encode()
@@ -92,6 +93,12 @@ def descriptor(path):
     for entry in listen:
         mc = entry.get("max_connections", 64)
         out += struct.pack("<HHHH", entry["port"], mc, entry.get("max_per_source", mc), 0)
+    out = out.ljust(152, b"\0")
+    volume = d.get("volume")
+    if volume is not None:
+        if set(volume) != {"blocks"} or not 1 <= volume["blocks"] <= 65536:
+            sys.exit(f"{path}: volume must be {{ blocks = N }}, 1 <= N <= 65536")
+    out += struct.pack("<Q", volume["blocks"] if volume else 0)
     out = out.ljust(256, b"\0")
     assert len(out) == 256
     return out, name, version

@@ -98,6 +98,8 @@ const DESC_MAGIC: &[u8; 8] = b"VNRDSC01";
 /// A descriptor is exactly this long (tools/sign-image.py writes it).
 pub const DESCRIPTOR_LEN: usize = 256;
 const MAX_LISTEN: usize = 8;
+/// The largest volume a descriptor may declare: 256 MiB.
+const MAX_VOLUME_BLOCKS: u64 = 65536;
 
 /// What a service may do (RFD 2, P1), from its signed descriptor. Layout (little endian):
 ///
@@ -112,7 +114,8 @@ const MAX_LISTEN: usize = 8;
 ///  80   4  listen entries in use (at most 8)
 ///  84   4  zero
 ///  88  64  8 listen entries: port, max_connections, max_per_source, 0 (u16 each)
-/// 152 104  zero (reserved: RFD 3's storage fields)
+/// 152   8  volume_blocks: data blocks of the service's volume (RFD 3), 0 = none, at most 65536
+/// 160  96  zero (reserved)
 /// ```
 #[derive(Clone, Copy)]
 pub struct Descriptor {
@@ -122,6 +125,8 @@ pub struct Descriptor {
     /// (port, max_connections, max_per_source); the first `listen_count` are in use.
     pub listen: [(u16, u16, u16); MAX_LISTEN],
     pub listen_count: usize,
+    /// Data blocks of the service's volume (RFD 3, P1); 0 if it has none.
+    pub volume_blocks: u64,
     /// SHA-256 of the signed statement: what the run-time log records.
     pub statement_hash: [u8; 32],
 }
@@ -153,7 +158,7 @@ fn padded_name(field: &[u8]) -> Option<&[u8]> {
 }
 
 fn parse_descriptor(d: &[u8]) -> Option<Descriptor> {
-    if d.len() != DESCRIPTOR_LEN || &d[..8] != DESC_MAGIC || u32_at(d, 84) != 0 || d[152..].iter().any(|&b| b != 0) {
+    if d.len() != DESCRIPTOR_LEN || &d[..8] != DESC_MAGIC || u32_at(d, 84) != 0 || d[160..].iter().any(|&b| b != 0) {
         return None;
     }
     padded_name(&d[8..40])?;
@@ -177,12 +182,17 @@ fn parse_descriptor(d: &[u8]) -> Option<Descriptor> {
     if u32_at(d, 72) > u32_at(d, 76) {
         return None; // the drain deadline's default is above its maximum
     }
+    let volume_blocks = u64_at(d, 152);
+    if volume_blocks > MAX_VOLUME_BLOCKS {
+        return None;
+    }
     Some(Descriptor {
         name: d[8..40].try_into().unwrap(),
         version: u64_at(d, 40),
         min_version: u64_at(d, 48),
         listen,
         listen_count,
+        volume_blocks,
         statement_hash: [0; 32],
     })
 }

@@ -322,6 +322,9 @@ pub mod block {
     pub const CODE_INTEGRITY: u64 = 6;
     /// Storage task: refused (e.g. OP_UNLOCK from a task that may not unlock).
     pub const CODE_NOT_ALLOWED: u64 = 7;
+    /// Storage task (RFD 3): a write to a service's volume from an instance that doesn't hold
+    /// its writer epoch, or an epoch below the one recorded.
+    pub const CODE_FENCED: u64 = 8;
 
     /// Storage task: message is the 32-byte master key. Only the tasks named "keys" or
     /// "attest" may send it; until then every other request gets CODE_LOCKED. (A storage task
@@ -330,6 +333,22 @@ pub mod block {
 
     pub fn unlock(storage: u64, master_key: &[u8; 32]) -> Result<(), u64> {
         call(storage, OP_UNLOCK, master_key, &mut []).map(|_| ())
+    }
+
+    /// Storage task (RFD 3, P1): message is epoch, lease_until and the writer's task id (u64s,
+    /// little endian). Makes that instance the writer of its service's volume at that epoch,
+    /// creating the volume if needed. Only the task with `loads = true` may send it. An epoch
+    /// above the recorded one is recorded and flushed before the reply; the recorded epoch again
+    /// is accepted while there is no writer or the writer's slot is unchanged; anything else
+    /// gets CODE_FENCED.
+    pub const OP_EPOCH: u64 = 6;
+
+    pub fn epoch(storage: u64, epoch: u64, lease_until: u64, writer: u64) -> Result<(), u64> {
+        let mut msg = [0u8; 24];
+        msg[..8].copy_from_slice(&epoch.to_le_bytes());
+        msg[8..16].copy_from_slice(&lease_until.to_le_bytes());
+        msg[16..].copy_from_slice(&writer.to_le_bytes());
+        call(storage, OP_EPOCH, &msg, &mut []).map(|_| ())
     }
 
     pub fn op(code: u64, block: u64) -> u64 {
@@ -383,6 +402,7 @@ pub mod block {
             CODE_LOCKED => "LOCKED",
             CODE_INTEGRITY => "INTEGRITY",
             CODE_NOT_ALLOWED => "NOT_ALLOWED",
+            CODE_FENCED => "FENCED",
             _ => super::err::name(code),
         }
     }
@@ -1009,6 +1029,8 @@ pub struct ListenInfo {
     pub ports: [[u16; 4]; 8],
     /// The signed version running (0 for an empty slot).
     pub version: u64,
+    /// Data blocks of its service's volume, from the signed descriptor (RFD 3); 0 for none.
+    pub volume_blocks: u64,
 }
 
 impl ListenInfo {
@@ -1026,6 +1048,11 @@ impl ListenInfo {
 
     pub fn is_slot(&self) -> bool {
         self.flags & 4 != 0
+    }
+
+    /// The task with `loads = true`: the agent.
+    pub fn may_load(&self) -> bool {
+        self.flags & 8 != 0
     }
 
     /// (max_connections, max_per_source) if the task may listen on `port`.

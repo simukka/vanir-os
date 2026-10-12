@@ -1245,7 +1245,8 @@ pub fn task_name(frame: &mut TrapFrame) {
 }
 
 /// What `task_listen` writes: a task's service, flags (bit 0: may route; bit 1: may connect
-/// out; bit 2: is a generic slot) and ports, each as (port, max_connections, max_per_source, 0), and its signed version.
+/// out; bit 2: is a generic slot; bit 3: may load slots) and ports, each as (port,
+/// max_connections, max_per_source, 0), its signed version, and its volume's size (RFD 3).
 #[repr(C)]
 struct ListenInfo {
     service: [u8; 32],
@@ -1254,6 +1255,7 @@ struct ListenInfo {
     count: u64,
     ports: [[u16; 4]; 8],
     version: u64,
+    volume_blocks: u64,
 }
 
 /// `task_listen(id, buf, cap) -> bytes`: the network declarations of task `id` (any generation)
@@ -1268,8 +1270,10 @@ pub fn task_listen(frame: &mut TrapFrame) {
     };
     let p = table.get(slot);
     let task = p.task;
-    let flags = task.routes as u64 | (task.connects as u64) << 1 | (task.class.is_some() as u64) << 2;
-    let mut info = ListenInfo { service: [0; 32], service_len: 0, flags, count: 0, ports: [[0; 4]; 8], version: p.version };
+    let flags = task.routes as u64 | (task.connects as u64) << 1 | (task.class.is_some() as u64) << 2 | (task.loads as u64) << 3;
+    let volume_blocks = p.loaded.map_or(0, |d| d.volume_blocks);
+    let mut info =
+        ListenInfo { service: [0; 32], service_len: 0, flags, count: 0, ports: [[0; 4]; 8], version: p.version, volume_blocks };
     let service = match &p.loaded {
         Some(d) => d.name(),
         None => task.service.as_bytes(),

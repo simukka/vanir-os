@@ -406,7 +406,7 @@ impl Control {
                 }
                 println!("agent: fetched {} v{} into {}", core::str::from_utf8(image.service()).unwrap_or("?"), image.version(), agent.get(f.slot).name);
                 self.fetch = None;
-                agent.deploy(f.slot, Some(image), self.drain_for(image.service()));
+                agent.deploy(f.slot, Some(image), self.drain_for(image.service()), None);
             }
             kind => println!("agent: unknown frame type {}", kind),
         }
@@ -482,7 +482,7 @@ impl Control {
                         agent.slots[k].is_some_and(|s| s.state == State::Stopped && s.image.is_some_and(|i| i.hash() == hash))
                     });
                     if let Some(k) = kept {
-                        agent.deploy(k, None, self.drain_for(service));
+                        agent.deploy(k, None, self.drain_for(service), None);
                         continue;
                     }
                     let Some(k) = core::str::from_utf8(slot_name).ok().and_then(|n| agent.find_slot(n)) else { continue };

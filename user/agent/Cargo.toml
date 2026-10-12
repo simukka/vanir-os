@@ -51,3 +51,9 @@ script-rollback = ["test-images"]    # deploy web v2, then roll back to v1, then
 script-not-ready = ["test-images"]   # deploy a web v2 that never says it is ready, then exit
 script-drain-cap = ["test-images"]   # deploy web v2 asking for a drain longer than allowed, then exit
 script-commit = ["test-images"]      # deploy web v2, commit, deploy web v1 into small-0 again, then exit          # web v1 (with a manifest or key that must refuse it)
+# Volumes (RFD 3), with counter (http and a volume) and http/volume-probe:
+script-volume-one = ["test-images"]      # counter v1 in small-0 with epoch 1, for 4 s, then exit
+script-volume-fence = ["test-images"]    # v1 with epoch 1, v2 with epoch 2, v1 started again, epoch 1 again; exit
+script-volume-persist = ["test-images"]  # (a second boot) v2 with epoch 2 again, then epoch 1; exit
+script-volume-resize = ["test-images"]   # v1 with epoch 1, then v3 (another volume size); exit
+script-volume-none = ["test-images"]     # web v1 (no volume) in small-0; exit

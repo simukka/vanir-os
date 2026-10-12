@@ -1,0 +1,51 @@
+# Service volumes (RFD 3, V1): the agent deploys counter (http with a volume) into slots and
+# names each volume's writer to the storage task ("disk") with an epoch. Slot instances reach
+# their service's volume. A fixed task named "counter" (volumes-kinds) has a volume of its own,
+# apart from the service counter's.
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic"]
+
+[[task]]
+name = "blockdev"
+program = "virtio-blk"
+devices = ["virtio-blk"]
+dma_pages = 16
+
+[[task]]
+name = "disk"
+program = "storage"
+sends = ["blockdev", "keys"]
+
+[[task]]
+name = "keys"
+program = "unlocker"
+
+[[task]]
+name = "counter"
+program = "blktest"
+sends = ["disk"]
+
+[[task]]
+name = "agent"
+loads = true
+routes = true
+sends = ["net", "supervisor", "disk"]
+
+[[slot_class]]
+name = "small"
+count = 3
+memory_pages = 256
+image_pages = 128
+sends = ["net", "disk"]
