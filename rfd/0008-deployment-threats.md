@@ -50,6 +50,11 @@ signed image.
    without blocking everything else.
 6. **The control plane's key is pinned in the image** (RFD 2, P7). Rotating it, for example
    after it leaks, means evacuating and updating every node.
+7. **The control plane holds every volume's key** ([RFD 3](0003-service-volumes.md), P2). Whoever
+   compromises it can read any volume whose sealed blocks they can get, from a disk or a
+   transfer. *Possible fix:* keep the keys in an HSM or the control plane's own TPM, sealed so
+   they are only released wrapped to an attested node's per-boot key and never seen in plain
+   text by the control plane's software.
 
 ## Questions
 
