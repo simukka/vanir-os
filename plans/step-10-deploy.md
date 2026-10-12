@@ -71,13 +71,13 @@ harness restarts QEMU with the new ISO, standing in for that.
 | Reading the log | `runtime_log(buf, cap, start) -> (count, total)`, for the `tpm = true` task. `attest` quotes PCR 13 too, and sends the log in chunks after the quote | 1024 × 80 bytes doesn't fit one message |
 | `task_listen` for slots | answers from the loaded descriptor: service name and ports | `net` is unchanged and still trusts only the kernel |
 | Stopping | new syscall `stop(id)`, supervisor only: ends a live task with a new death kind `STOPPED` (5). The agent asks the supervisor (`OP_STOP`, `OP_START`); the supervisor never restarts `STOPPED` | a stop doesn't depend on the service cooperating, and the supervisor can tell a stop from a crash |
-| Exit 0 from a slot | **counts as a crash and is restarted.** Only `STOPPED` is final for slots; fixed tasks keep today's rule | departs from P4's wording ("stops it with exit code 0"); closes RFD 8 #2 at no cost. Needs sign-off: see "To confirm" |
+| Exit 0 from a slot | done, not restarted, as for fixed tasks; `STOPPED` is final too | P4. A service that can be made to exit cleanly stays down: RFD 8 #2, left open |
 | Restart backoff | a pending-restart table in the supervisor, woken by `recv` with `RECV_TIMEOUT`. 1 tick (10 ms) doubling to 3000 ticks (30 s); the count resets after 6000 ticks without a crash. Test feature `backoff-fast` caps it at 1 tick | determination 7 defaults, in the scheduler's 10 ms resolution |
 | Readiness and drains | `net` gets `OP_STATUS(id)` (ready, live, draining, drained) and an `OP_DRAIN` flag to answer at once; the agent polls on its own tick | the agent keeps one event loop and never blocks on a drain (switcher keeps the held reply) |
 | Lifecycle owner | `user/agent` from D2 on. A feature-gated script mode with images embedded (`include_bytes!`) stands in for the control plane until D4 | the real state machine is tested from D3; tests run under TCG without a network |
 | Outbound connections | `OP_CONNECT` in `net`, allowed only to tasks with the manifest flag `connects = true` (returned by `task_listen`) | P7: the node dials out; services can't |
-| Channel | Noise `IK_25519_ChaChaPoly_SHA256` in a new `user/noise` crate, no heap. The node's static key is made each boot and bound to a quote by `attest` (`OP_QUOTE_FOR`, agent only). The control plane's Noise key is pinned in the agent at build time (`VANIR_CP_PUB`) | determination 7 |
-| Commands | desired-state documents signed with a separate Ed25519 control-plane key (`VANIR_CP_SIGN_PUB`), each with a generation; the agent applies only a higher generation | P7: idempotent and replay-proof, and signed apart from the transport |
+| Channel | Noise `IK_25519_ChaChaPoly_SHA256` in a new `user/noise` crate, no heap. The node's static key is made each boot and bound to a quote by `attest` (`OP_QUOTE_FOR`, agent only). The control plane's Noise key is pinned in the agent at build time (`VANIR_CP_PUB`) | determination 7. Two pinned keys rather than one Ed25519 key converted to X25519, so each can be rotated alone (RFD 8 #6 applies to both) |
+| Commands | desired-state documents signed with a second control-plane key, Ed25519, also pinned in the agent (`VANIR_CP_SIGN_PUB`), each with a generation; the agent applies only a higher generation | P7: idempotent and replay-proof, and signed apart from the transport |
 | Telemetry | the agent serves `console::OP_WRITE`, so a manifest names it `uplink`, and telemetry reaches the control plane through it unchanged | P7 with no change to telemetry |
 | Mock control plane | `tools/control-plane.py`: Noise responder, quote check (`vanir_attest`), desired state, image server, and for D5 a TCP load balancer in front of two nodes | one tool, as `net-peer.py` is for networking |
 
@@ -153,7 +153,7 @@ KVM-only, as today).
 - `net`: `OP_STATUS`, and `OP_DRAIN`'s no-wait flag.
 - Supervisor: `OP_START`, `OP_STOP` from the agent (the only task it takes messages from),
   using `stop` and `restart`; backoff is reset on start.
-- Kernel: `stop(id)` and the `STOPPED` death kind; for slots, exit 0 is a crash (pending sign-off).
+- Kernel: `stop(id)` and the `STOPPED` death kind.
 - Agent: the state machine of P4 for each slot (EMPTY, STARTING, READY, LIVE, DRAINING, DRAINED,
   STOPPED, FAILED), with every transition reported to telemetry (`OP_LIFECYCLE`). `deploy`
   (load candidate, wait ready with a timeout, promote, drain the old one, stop it),
@@ -171,8 +171,8 @@ KVM-only, as today).
     the slot goes to FAILED; v1 stays live throughout.
   - `drain-deadline-cap`: a deadline above the descriptor's maximum is clipped to it (seen in the
     drain event).
-  - `stop-not-restarted`: a stopped instance stays stopped; one that exits 0 by itself is
-    restarted (pending sign-off).
+  - `stop-not-restarted`: a stopped instance stays stopped, and so does one that exits 0 by
+    itself; one that exits non-zero is restarted.
   - `deploy-commit`: after commit, the old slot is empty and a third version can be loaded into
     it.
 - Manual: a Deployment section (slots, descriptors, the lifecycle, the swap), the new manifest
@@ -230,15 +230,6 @@ KVM-only, as today).
   - `evacuate-update`: evacuate A to B under load; A reports empty, reboots into the new image,
     attests (PCR 12 changed as expected), and rejoins; `web` moves back. No request fails.
 - Manual: moves, evacuation, the control-plane interface; README status: step 10.
-
-## To confirm before D3
-
-1. **Exit 0 from a slot.** The plan restarts it and treats only a kernel `stop` as final, which
-   departs from P4's "stops it with exit code 0" and closes RFD 8 #2. Keeping P4 as written means
-   one match arm in the supervisor and changing `stop-not-restarted`.
-2. **Two control-plane keys** pinned in the agent: a Noise key and a key that signs desired
-   state. They could be one Ed25519 key converted to X25519, but that saves little and couples
-   rotation of both. RFD 8 #6 applies to both.
 
 ## Risks and how we'll know
 
