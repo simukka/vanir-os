@@ -1,0 +1,4 @@
+# A service that prints and exits 0: loaded and unloaded over and over (slot-unload-no-leak).
+name = "hello"
+version = 1
+slot_class = "small"

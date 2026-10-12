@@ -136,6 +136,8 @@ fn event_line(out: &mut Out, e: &Event) {
             err::name(e.b)
         ),
         events::IMAGE_REJECTED => write!(out, "\"event\":\"image_rejected\",\"reason\":\"{}\"", events::rejection(e.a)),
+        events::IMAGE_LOADED => write!(out, "\"event\":\"image_loaded\",\"version\":{}", e.a),
+        events::IMAGE_UNLOADED => write!(out, "\"event\":\"image_unloaded\",\"version\":{}", e.a),
         kind => write!(out, "\"event\":\"unknown\",\"kind\":{}", kind),
     };
     let _ = out.write_str("}");
@@ -231,7 +233,7 @@ fn heartbeat(out: &mut Out, n: u64) {
     );
     let mut first = true;
     for [id, state, ticks] in s.task.iter().copied().filter(|t| t[0] != 0) {
-        let state = ["running", "blocked", "exited", "faulted", "over_budget"].get(state as usize).unwrap_or(&"?");
+        let state = ["running", "blocked", "exited", "faulted", "over_budget", "rejected", "empty"].get(state as usize).unwrap_or(&"?");
         let _ = write!(
             out,
             "{}{{\"task\":{},\"id\":{},\"state\":\"{}\",\"ticks\":{}}}",

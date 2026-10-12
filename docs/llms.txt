@@ -33,14 +33,15 @@
 - [Boot](index.html#boot): kmain init order
 - [Memory and address spaces](index.html#memory): task address-space layout, PTE software bits
 - [Tasks and scheduling](index.html#tasks): states, preemption, budgets, outcomes
-- [App manifests](index.html#manifests): keys name, program, budget, supervisor, sends, devices, dma_pages, events, min_version, tpm, listen, service, routes; task names with meaning (uplink, telemetry, blockdev, disk, keys, attest, net, nic, mgmt-net, nic-mgmt, control)
+- [App manifests](index.html#manifests): keys name, program, budget, supervisor, sends, devices, dma_pages, events, min_version, tpm, listen, service, routes, loads, connects; top-level runtime_log and [[slot_class]] (name, count, memory_pages, image_pages, budget, sends); task names with meaning (uplink, telemetry, blockdev, disk, keys, attest, net, nic, mgmt-net, nic-mgmt, control)
 - [IPC](index.html#ipc): send/recv/reply, generations, error codes
 - [Supervisor](index.html#supervisor): death records, restart(id); restarts forever with backoff (10 ms doubling to 30 s, reset after 60 s), crash events; test features give-up-after-3/3000, backoff-fast, reset-after-2s, halt-on-exit
 - [Drivers](index.html#drivers): BARs, DMA regions, IRQ notifications
 - [Telemetry](index.html#telemetry): event ring, JSON line format, host-agent.py
-- [Boot chain and attestation](index.html#boot-chain): Secure Boot, signatures, PCR 12, quotes
+- [Boot chain and attestation](index.html#boot-chain): Secure Boot, signatures, PCR 12, quotes (PCRs 0, 4, 7, 12, 13)
 - [Storage](index.html#storage): on-disk format, key hierarchy, attested key release, restarts, storage events
 - [Networking](index.html#networking): virtio-net driver, the net task (smoltcp), socket ops, routing and draining, limits, counters and events, NET/NET_MGMT
+- [Deployment](index.html#deployment): generic slots ([[slot_class]]), signed descriptors (tools/sign-image.py sign-slot, VNRSIG02), slot_stage/slot_load/slot_unload by the agent (loads = true), PCR 13 and the kernel's run-time log, the TPM lock; agent test scripts are features
 - [Syscalls](index.html#syscalls): numbers and ABI (int 0x80; rdi, rsi, rdx, r10, r8, r9)
 - [Protections](index.html#protections): each protection and the test proving it
 - [Limitations](index.html#limitations)

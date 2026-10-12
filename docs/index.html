@@ -181,21 +181,28 @@ td code { white-space: nowrap; }
       <li><a href="#net-running">14.6 Running it</a></li>
     </ol>
   </li>
-  <li><a href="#syscalls">15. Syscalls</a></li>
-  <li><a href="#protections">16. Protections</a></li>
-  <li><a href="#limitations">17. Limitations</a></li>
+  <li><a href="#deployment">15. Deployment</a>
+    <ul>
+      <li><a href="#deploy-slots">15.1 Slots and descriptors</a></li>
+      <li><a href="#deploy-loading">15.2 Loading an image</a></li>
+      <li><a href="#deploy-measuring">15.3 Measuring what runs</a></li>
+    </ul>
+  </li>
+  <li><a href="#syscalls">16. Syscalls</a></li>
+  <li><a href="#protections">17. Protections</a></li>
+  <li><a href="#limitations">18. Limitations</a></li>
 </ol>
 <p class="part">Working on vanir-os</p>
 <ol>
-  <li><a href="#agents">18. Agent quick reference</a></li>
-  <li><a href="#build">19. Build, run, test</a></li>
-  <li><a href="#tests">20. Test catalogue</a></li>
-  <li><a href="#repo-map">21. Repository map</a></li>
-  <li><a href="#recipes">22. Recipes</a></li>
-  <li><a href="#invariants">23. Invariants</a></li>
-  <li><a href="#troubleshooting">24. Troubleshooting</a></li>
-  <li><a href="#dependencies">25. System dependencies</a></li>
-  <li><a href="#glossary">26. Glossary</a></li>
+  <li><a href="#agents">19. Agent quick reference</a></li>
+  <li><a href="#build">20. Build, run, test</a></li>
+  <li><a href="#tests">21. Test catalogue</a></li>
+  <li><a href="#repo-map">22. Repository map</a></li>
+  <li><a href="#recipes">23. Recipes</a></li>
+  <li><a href="#invariants">24. Invariants</a></li>
+  <li><a href="#troubleshooting">25. Troubleshooting</a></li>
+  <li><a href="#dependencies">26. System dependencies</a></li>
+  <li><a href="#glossary">27. Glossary</a></li>
 </ol>
 </nav>
 
@@ -255,7 +262,7 @@ network stacks, with routing and draining between instances.</p>
 
 <h2 id="quick-start"><span class="num">2</span>Quick start<a class="anchor" href="#quick-start">#</a></h2>
 
-<p>Install the dependencies (<a href="#dependencies">25</a>), then:</p>
+<p>Install the dependencies (<a href="#dependencies">26</a>), then:</p>
 <pre><code>make run                                   # build the ISO and boot it in QEMU
 make test                                  # boot all 85 scenarios and check each one
 make test ACCEL=kvm                        # the same under KVM
@@ -485,7 +492,7 @@ kernel.</p>
     <code>budget</code> is killed after that many ticks of CPU.</li>
   <li><strong>Outcomes.</strong> A task ends by <code>exit</code>, by faulting, or by using up
     its budget; the others keep running. When nothing can run, the kernel prints a summary and
-    halts with a status (<a href="#build">19</a>). Tasks waiting in <code>recv</code> count as
+    halts with a status (<a href="#build">20</a>). Tasks waiting in <code>recv</code> count as
     idle servers; tasks stuck in <code>send</code> mean a deadlock.</li>
 </ul>
 
@@ -525,11 +532,22 @@ listen = [{ port = 80, max_connections = 64, max_per_source = 16 }]
                        # optional: TCP ports it may listen on (max_connections default 64,
                        # max_per_source default max_connections; at most 8 entries)
 service = "web"        # optional: the network service it is an instance of (default: its name)
-routes = true          # optional: may route, drain and blocklist in the network stacks</code></pre>
+routes = true          # optional: may route, drain and blocklist in the network stacks
+loads = true           # optional: may load service images into slots (at most one: the agent)
+connects = true        # optional: may open outbound connections through a network stack
+
+runtime_log = 1024     # optional, top level: run-time measurement log entries
+
+[[slot_class]]         # optional: generic slots for services loaded at run time (15.1)
+name = "small"
+count = 2
+memory_pages = 256
+image_pages = 128</code></pre>
 
 <p>The build fails on unknown keys, duplicate names, unknown <code>sends</code> targets or
-device names, more than one supervisor, event reader or TPM task, or a port declared by two
-different services (instances of one service may share it). Each <code>devices</code>
+device names, more than one supervisor, event reader, TPM task or loader, more than 64 tasks
+and slots, or a port declared by two different services (instances of one service may share
+it). Each <code>devices</code>
 entry claims the next unclaimed device of that kind; a missing device is logged and the task
 runs without it.</p>
 
@@ -777,7 +795,8 @@ computes PCR 12 from the build output alone.</p>
 <p><strong>Attestation</strong>: the <code>attest</code> task (<code>tpm = true</code>) holds
 an attestation key in the TPM (restricted ECDSA P-256 under the endorsement hierarchy). When
 the host sends <code>attest &lt;nonce&gt;</code> over the vsock uplink, <code>control</code>
-asks <code>attest</code>, which returns a TPM quote of PCRs 0, 4, 7 and 12.
+asks <code>attest</code>, which returns a TPM quote of PCRs 0, 4, 7, 12 and 13 (13: images loaded
+into slots since boot, <a href="#deploy-measuring">15.3</a>).
 <code>tools/verify-quote.py</code> checks it is genuine TPM output, over this nonce, correctly
 signed, consistent with the reported PCRs and the kernel's measurement log, and equal to an
 approved reference.</p>
@@ -1137,7 +1156,98 @@ message; under TCG that serves about 1,400 keep-alive requests a second.</p></di
 <dt>tests</dt><dd><code>nic-*</code>, <code>http-*</code>, <code>net-*</code>, <code>mgmt-*</code>, <code>swap-under-load</code>, <code>drain-deadline</code>, <code>route-*</code></dd>
 </dl></div>
 
-<h2 id="syscalls"><span class="num">15</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
+<h2 id="deployment"><span class="num">15</span>Deployment<a class="anchor" href="#deployment">#</a></h2>
+
+<p>Services are deployed while a node runs, and move between nodes (RFD 2,
+<code>rfd/0002-deployment.md</code>; the plan is <code>plans/step-10-deploy.md</code>). A node's
+manifest can't name every service that might land on it, so it declares a pool of
+<strong>generic slots</strong>. The <strong>agent</strong> (<code>user/agent</code>, the only
+task with <code>loads = true</code>) loads signed service images into them at run time. Until
+there is a control plane, test scripts built into the agent stand in for it.</p>
+
+<h3 id="deploy-slots"><span class="num">15.1</span>Slots and descriptors<a class="anchor" href="#deploy-slots">#</a></h3>
+
+<pre><code>[[slot_class]]
+name = "small"           # slots are named small-0, small-1, ... after the tasks
+count = 2
+memory_pages = 256       # most frames a service may use: image, stack, page tables
+image_pages = 128        # image area: the largest image a slot can hold (512 KiB)
+budget = 20              # optional: CPU budget, as for tasks
+sends = ["net"]          # optional: tasks its services may send to (by task name)</code></pre>
+
+<p>Each slot is a task table entry that starts <em>empty</em>. At boot the kernel sets aside its
+image area (contiguous, never freed, like a DMA region) and checks that free memory covers every
+slot at its class's limit. Tasks' memory is fixed once loaded (there is no syscall to grow it),
+so after that check a load can't fail for want of memory. The manifest decides the table's
+size: tasks plus slots, at most 64.</p>
+
+<p>What a service may do comes with its image, in a <strong>descriptor</strong> signed with it
+(<code>tests/slots/*.toml</code>):</p>
+
+<pre><code>name = "web"             # the service
+version = 2
+min_version = 1          # oldest version that may still run
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+drain = { default_secs = 30, max_secs = 300 }</code></pre>
+
+<p><code>tools/sign-image.py sign-slot KEY ELF DESC.toml OUT</code> compiles it to the fixed
+256-byte layout the kernel reads (<code>OUT.desc</code>) and writes a <code>VNRSIG02</code>
+signature file (<code>OUT.sig</code>, 176 bytes) over the name, version, and SHA-256 of both the
+image and the descriptor, with the boot images' key. The Makefile builds the test images
+(<code>SLOT_IMAGES</code>) into <code>build/slots/</code>, then the agent, which carries them.
+<code>task_listen</code> answers for a slot from its descriptor, so <code>net</code> lets a
+service listen only on the ports it was signed with; it also returns the version, and
+<code>http</code> in a slot calls itself e.g. <code>web v1 on small-0</code>.</p>
+
+<h3 id="deploy-loading"><span class="num">15.2</span>Loading an image<a class="anchor" href="#deploy-loading">#</a></h3>
+
+<p>The agent copies the image into an empty slot's image area in pieces
+(<code>slot_stage</code>, so it never needs a buffer the image's size), then calls
+<code>slot_load</code> with the signature file and descriptor. The kernel, in order:</p>
+<ol>
+  <li>checks the signature, and that it covers this image and this descriptor;</li>
+  <li>checks the version against the descriptor's <code>min_version</code>;</li>
+  <li>checks the descriptor names the slot's class;</li>
+  <li>builds the address space, and refuses if it needs more frames than the class allows;</li>
+  <li>measures it (below), or fails with <code>BUSY</code> or <code>LOG_FULL</code> having
+    changed nothing;</li>
+  <li>records the descriptor and starts it as a new generation of the slot.</li>
+</ol>
+<p>A refused image fails with <code>REJECTED</code> and the reason, is logged as an
+<code>image_rejected</code> event, and is wiped from the image area. A crashed service is
+restarted from the image area like any task (<a href="#supervisor">9</a>), without being
+measured again. <code>slot_unload</code> empties a slot whose service has ended: it zeroes the
+image area and measures the unload. A slot holding an image, running or not, can't be staged
+over.</p>
+
+<h3 id="deploy-measuring"><span class="num">15.3</span>Measuring what runs<a class="anchor" href="#deploy-measuring">#</a></h3>
+
+<p>Each load and unload is extended into <strong>PCR 13</strong> and recorded in the kernel's
+<strong>run-time log</strong>: 80-byte entries (operation, slot, service name, version, SHA-256
+of the signed statement), and PCR 13 is extended with each entry's SHA-256. The kernel keeps the
+log, as it does the boot log, so a crash of any task can't make the node unattestable. It has a
+fixed length (<code>runtime_log</code> in the manifest, default 1024 entries, about 80 KiB); when
+it is full, loads fail with <code>LOG_FULL</code> until the node reboots.</p>
+
+<p>The attestation task sends TPM commands itself, so it takes a lock the kernel holds
+(<code>tpm_lock</code>/<code>tpm_unlock</code>) around each sequence of commands, and the kernel
+extends PCR 13 only while nobody holds it: a load meets <code>BUSY</code> instead of waiting.
+The kernel drops the lock if the task dies. Quotes cover PCRs 0, 4, 7, 12 and 13 and say how
+many run-time entries they cover; <code>control</code> then forwards those entries
+(<code>attest::OP_RUNTIME_LOG</code>, a JSON line of up to 20 at a time), and
+<code>tools/verify-quote.py</code> replays them to PCR 13 and lists what was loaded.
+<code>tools/expected-pcrs.py --runtime load:small-0:web-v1 ...</code> computes PCR 13 from the
+build. RFD 8 lists what this leaves open (rollback through an old descriptor, one key for boot
+and slot images, a task that holds the TPM lock forever).</p>
+
+<div class="agent"><span class="label">For agents</span><dl>
+<dt>files</dt><dd><code>kernel/src/process.rs</code> (slot syscalls), <code>kernel/src/verify.rs</code> (<code>check_slot</code>, descriptor layout), <code>kernel/src/measure.rs</code> (PCR 13, run-time log), <code>user/agent</code>, <code>tests/slots/</code></dd>
+<dt>test scripts</dt><dd>agent features <code>script-*</code> and <code>try-*</code> (<code>user/agent/Cargo.toml</code>)</dd>
+<dt>remember</dt><dd>A slot's id gets a new generation on every load; look it up by name (<code>small-0</code>). Slots aren't measured at boot, so they don't change PCR 12</dd>
+</dl></div>
+
+<h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
 <p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
 r8, r9</code>; results in <code>rax</code> (then <code>rdx</code>, <code>rsi</code>). Simple
@@ -1166,7 +1276,12 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
 <tr><td><code>measurements(buf, cap)</code></td><td>115</td><td>TPM task only &rarr; <code>(count, TPM address)</code>; the boot measurement log</td></tr>
 <tr><td><code>notify(target, bits)</code></td><td>116</td><td>post bits to a task in <code>sends</code> without waiting; it gets them in <code>recv</code> as <code>NOTIFY_POST</code></td></tr>
 <tr><td><code>halt(code)</code></td><td>117</td><td>supervisor only: stop the system, reporting every task's state</td></tr>
-<tr><td><code>task_listen(id, buf, cap)</code></td><td>118</td><td>a task's service, <code>routes</code> flag and declared ports (<code>ListenInfo</code>)</td></tr>
+<tr><td><code>task_listen(id, buf, cap)</code></td><td>118</td><td>a task's service, flags (<code>routes</code>, <code>connects</code>), declared ports and signed version (<code>ListenInfo</code>); for a slot, from its descriptor</td></tr>
+<tr><td><code>slot_stage(slot, offset, buf, len)</code></td><td>119</td><td>loader only: copy part of an image into an empty slot's image area</td></tr>
+<tr><td><code>slot_load(slot, sig, sig_len, desc, desc_len)</code></td><td>120</td><td>loader only: check, measure and start the staged image &rarr; new id; <code>REJECTED</code> (reason in <code>rdx</code>), <code>BUSY</code>, <code>LOG_FULL</code></td></tr>
+<tr><td><code>slot_unload(slot)</code></td><td>121</td><td>loader only: empty a slot whose service has ended; measured</td></tr>
+<tr><td><code>tpm_lock()</code>, <code>tpm_unlock()</code></td><td>122, 123</td><td>TPM task only: hold the TPM around commands</td></tr>
+<tr><td><code>runtime_log(buf, cap, start)</code></td><td>124</td><td>TPM task only &rarr; <code>(count, total)</code> run-time log entries</td></tr>
 </table>
 
 <p><code>recv</code> flags (in <code>rdx</code>): <code>RECV_EXPECT_IRQ</code> (1),
@@ -1176,7 +1291,7 @@ come as sender 0 with op <code>NOTIFY_DEATH</code> (1, supervisor), <code>NOTIFY
 drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits from
 <code>notify</code>).</p>
 
-<h2 id="protections"><span class="num">16</span>Protections<a class="anchor" href="#protections">#</a></h2>
+<h2 id="protections"><span class="num">17</span>Protections<a class="anchor" href="#protections">#</a></h2>
 
 <table>
 <tr><th>Protection</th><th>What it stops</th><th>Test</th></tr>
@@ -1206,6 +1321,8 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
 <tr><td>Key released only to an attested boot</td><td>a modified system getting the key</td><td><code>attest-unlock-refused</code></td></tr>
 <tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
+<tr><td>Slot images signed with their descriptor; checked, sized and measured at load</td><td>unsigned, changed, rolled-back or oversized services; a service claiming ports or a slot class it wasn't signed for</td><td><code>slot-*</code></td></tr>
+<tr><td>Run-time log and PCR 13 kept by the kernel</td><td>a node hiding what it loaded since boot</td><td><code>slot-measured</code>, <code>slot-attest</code></td></tr>
 <tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
@@ -1214,7 +1331,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Drain deadline</td><td>a connection that never ends keeping an old instance alive</td><td><code>drain-deadline</code></td></tr>
 </table>
 
-<h2 id="limitations"><span class="num">17</span>Limitations<a class="anchor" href="#limitations">#</a></h2>
+<h2 id="limitations"><span class="num">18</span>Limitations<a class="anchor" href="#limitations">#</a></h2>
 
 <p>Stated plainly, in one place:</p>
 <ul>
@@ -1255,7 +1372,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <!-- ============================================================ WORKING ON IT -->
 <p class="part-title">Part three: working on vanir-os</p>
 
-<h2 id="agents"><span class="num">18</span>Agent quick reference<a class="anchor" href="#agents">#</a></h2>
+<h2 id="agents"><span class="num">19</span>Agent quick reference<a class="anchor" href="#agents">#</a></h2>
 
 <p>Dense facts for coding agents (and people in a hurry). Every command runs from the
 repository root.</p>
@@ -1268,7 +1385,7 @@ repository root.</p>
 <dt>all tests</dt><dd><code>make test ACCEL=tcg &amp;&amp; make test ACCEL=kvm</code> &mdash; both must pass before committing</dd>
 <dt>pass/fail</dt><dd>a case passes when QEMU's exit status and the expected output both match; output is serial log + <code>build/telemetry.log</code> after a <code>--- build/telemetry.log ---</code> marker</dd>
 <dt>exit status</dt><dd>1 clean, 3 a task exited non-zero, 5 a task was killed, 7 kernel panic or supervisor died, 9 deadlock, 124 timeout</dd>
-<dt>new program</dt><dd>see <a href="#recipe-program">22.1</a>; must be in workspace <code>Cargo.toml</code> and Makefile <code>USER_PROGS</code></dd>
+<dt>new program</dt><dd>see <a href="#recipe-program">23.1</a>; must be in workspace <code>Cargo.toml</code> and Makefile <code>USER_PROGS</code></dd>
 <dt>secrets</dt><dd><code>keys/</code> (signing key, storage master key) and <code>build/</code> are git-ignored; never commit them</dd>
 <dt>serial log</dt><dd>kernel lines start <code>[kernel]</code>; tasks print <code>&lt;program&gt;: ...</code>; tests match these strings, so changing a message can break a test</dd>
 </dl></div>
@@ -1276,7 +1393,7 @@ repository root.</p>
 <h4>Where to change what</h4>
 <table>
 <tr><th>To change&hellip;</th><th>Edit</th><th>Then check</th></tr>
-<tr><td>a syscall</td><td><code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td>docs table <a href="#syscalls">15</a></td></tr>
+<tr><td>a syscall</td><td><code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td>docs table <a href="#syscalls">16</a></td></tr>
 <tr><td>scheduling, budgets, IPC, restarts</td><td><code>kernel/src/process.rs</code></td><td><code>ONLY='^(ipc|supervisor|restart|stale|sleep|cpu|preemption)'</code></td></tr>
 <tr><td>page tables, frames</td><td><code>kernel/src/memory.rs</code></td><td><code>no-leak</code>, <code>restart-no-leak</code>, <code>address-spaces</code></td></tr>
 <tr><td>a manifest key</td><td><code>kernel/build.rs</code>, <code>Task</code> in <code>kernel/src/process.rs</code></td><td><code>apps/README.md</code>, docs <a href="#manifests">7</a></td></tr>
@@ -1288,9 +1405,10 @@ repository root.</p>
 <tr><td>storage format or crypto</td><td><code>user/storage</code>, <code>tools/corrupt-disk.py</code></td><td><code>ONLY='^(storage|blk|attest-)'</code></td></tr>
 <tr><td>host tooling</td><td><code>tools/*.py</code> (Python 3.11+, <code>cryptography</code>)</td><td>vsock/attest cases need KVM + kvm group</td></tr>
 <tr><td>networking</td><td><code>user/net</code>, <code>user/virtio-net</code>, <code>user/http</code>, <code>tools/net-peer.py</code></td><td><code>ONLY='^(nic|http|net|mgmt|swap|drain|route|build)'</code></td></tr>
+<tr><td>slots, loading, PCR 13</td><td><code>kernel/src/process.rs</code> (slot syscalls), <code>kernel/src/verify.rs</code>, <code>kernel/src/measure.rs</code>, <code>tools/expected-pcrs.py</code>, <code>user/agent</code></td><td><code>ONLY='^slot-'</code></td></tr>
 </table>
 
-<h2 id="build"><span class="num">19</span>Build, run, test<a class="anchor" href="#build">#</a></h2>
+<h2 id="build"><span class="num">20</span>Build, run, test<a class="anchor" href="#build">#</a></h2>
 
 <pre><code>make                                  # build build/vanir-os.iso
 make run                              # boot in QEMU, serial output on the terminal
@@ -1353,7 +1471,7 @@ device:</p>
 matches; avoid quotes); with <code>cmd:</code>, a shell command that reads the output on stdin
 and must succeed.</p>
 
-<h2 id="tests"><span class="num">20</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
+<h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
 <p>85 cases and one build check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
@@ -1376,11 +1494,13 @@ attestation references earlier ones leave behind.</p>
 <tr><td>management network</td><td><code>mgmt-separate</code> <code>mgmt-under-flood</code></td><td>port 8081 too</td></tr>
 <tr><td>network telemetry</td><td><code>net-counters</code> <code>net-interval</code></td><td>vsock for <code>net-interval</code></td></tr>
 <tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
+<tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
+<tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>
 isn't writable even through <code>sg kvm</code>.</p>
 
-<h2 id="repo-map"><span class="num">21</span>Repository map<a class="anchor" href="#repo-map">#</a></h2>
+<h2 id="repo-map"><span class="num">22</span>Repository map<a class="anchor" href="#repo-map">#</a></h2>
 
 <pre><code>kernel/build.rs           generates the task table from the app manifest
 kernel/linker.ld          higher half at 0xffffffff80000000, Limine request sections
@@ -1398,9 +1518,9 @@ kernel/src/pci.rs         PCI discovery, BAR sizing, MSI-X (device kinds in pci_
 kernel/src/irq.rs         device interrupts to task notifications
 kernel/src/events.rs      kernel event log
 kernel/src/modules.rs     task images and signatures as Limine boot modules
-kernel/src/verify.rs      Ed25519 task image signatures
-kernel/src/tpm.rs         TPM 2.0 (CRB): PCR extend/read, kernel use at boot only
-kernel/src/measure.rs     measured boot into PCR 12
+kernel/src/verify.rs      Ed25519 task image signatures; slot images and their descriptors
+kernel/src/tpm.rs         TPM 2.0 (CRB): PCR extend/read
+kernel/src/measure.rs     measured boot into PCR 12; run-time log and PCR 13; the TPM lock
 kernel/src/syscall.rs     int 0x80 dispatch
 user/lib/                 shared runtime: entry!, syscall wrappers, println!, block/keys/telemetry protocols
 user/hello/               greeting plus the attack tests (features)
@@ -1425,28 +1545,31 @@ user/nictest/             answers ARP and ping by hand (driver test, no stack)
 user/net/                 network stack (smoltcp): sockets, routing, limits, counters
 user/http/                HTTP/1.1 service; exit-on-request, crash and listen-81 test features
 user/mgmt-echo/           TCP echo on the management stack (stands in for the agent)
-user/switcher/            routing scripts for tests (stands in for the agent)
+user/switcher/            routing scripts for tests (RFD 1)
+user/agent/               the node agent: loads service images into slots; test scripts (features)
 apps/                     app manifests and their format (apps/README.md)
 tests/apps/               manifests the tests boot
+tests/slots/              descriptors of the test slot images (built into build/slots/)
 tests/run.sh              the test harness
 tools/host-agent.py       receives and checks telemetry; attests; releases the key
 tools/vanir_attest.py     quote checks and key sealing (shared)
 tools/verify-quote.py     verifies a TPM quote against a reference
-tools/expected-pcrs.py    computes PCR 12 from the build output
-tools/sign-image.py       makes the signing key; signs task images
+tools/expected-pcrs.py    computes PCR 12 (and PCR 13 for given loads) from the build output
+tools/sign-image.py       makes the signing key; signs task images and slot images with descriptors
+tools/check-backoff.py    checks the supervisor's restart backoff from a run's output
 tools/with-swtpm.sh       runs QEMU with a software TPM
 tools/corrupt-disk.py     flips a byte of a volume's block in the disk image
 tools/check_lines.py      checks numbered lines arrived in order
 tools/net-peer.py         host side of the network tests: HTTP, echo, raw frames, floods
 tools/check-net-counters.py  compares network counters with a known transfer
-plans/                    step plans: step-7-iommu.md, step-8-bench.md (not built), step-9-net.md
+plans/                    step plans: step-7-iommu.md, step-8-bench.md (not built), step-9-net.md, step-10-deploy.md
 rfd/                      requests for discussion: network services, deployment, volumes, ...
 keys/                     signing key and storage master key (generated, git-ignored)
 docs/                     this manual (GitHub Pages) and llms.txt</code></pre>
 
-<h2 id="recipes"><span class="num">22</span>Recipes<a class="anchor" href="#recipes">#</a></h2>
+<h2 id="recipes"><span class="num">23</span>Recipes<a class="anchor" href="#recipes">#</a></h2>
 
-<h3 id="recipe-program"><span class="num">22.1</span>Add a user program<a class="anchor" href="#recipe-program">#</a></h3>
+<h3 id="recipe-program"><span class="num">23.1</span>Add a user program<a class="anchor" href="#recipe-program">#</a></h3>
 <ol>
   <li>Copy <code>user/hello/</code> to <code>user/&lt;name&gt;/</code> (keep <code>build.rs</code>: it
     applies <code>user/linker.ld</code>). Rename the package and <code>[[bin]]</code>.</li>
@@ -1468,7 +1591,7 @@ fn main() -&gt; u64 {
   <li>Reference it from a manifest: <code>program = "&lt;name&gt;"</code>.</li>
 </ol>
 
-<h3 id="recipe-test"><span class="num">22.2</span>Add a test case<a class="anchor" href="#recipe-test">#</a></h3>
+<h3 id="recipe-test"><span class="num">23.2</span>Add a test case<a class="anchor" href="#recipe-test">#</a></h3>
 <ol>
   <li>Add a manifest in <code>tests/apps/</code> if no existing one fits.</li>
   <li>Put test-only behaviour behind a cargo feature in the program's <code>Cargo.toml</code>,
@@ -1477,10 +1600,10 @@ fn main() -&gt; u64 {
     it depends on.</li>
   <li>Run it alone (<code>ONLY='^name$' make test</code>), then break the protection on purpose
     and confirm the case fails, then restore and run both full suites.</li>
-  <li>Add it to <a href="#tests">20</a> and, for a protection, <a href="#protections">16</a>.</li>
+  <li>Add it to <a href="#tests">21</a> and, for a protection, <a href="#protections">17</a>.</li>
 </ol>
 
-<h3 id="recipe-syscall"><span class="num">22.3</span>Add a syscall<a class="anchor" href="#recipe-syscall">#</a></h3>
+<h3 id="recipe-syscall"><span class="num">23.3</span>Add a syscall<a class="anchor" href="#recipe-syscall">#</a></h3>
 <ol>
   <li>Pick an unused number; add <code>SYS_&lt;NAME&gt;</code> to <code>kernel/src/syscall.rs</code>
     and a <code>dispatch</code> arm.</li>
@@ -1491,10 +1614,10 @@ fn main() -&gt; u64 {
   <li>Add the same constant and a wrapper to <code>user/lib/src/lib.rs</code>.</li>
   <li>Restrict privileged calls to the right task (as <code>restart</code> is supervisor-only)
     and return <code>NOT_ALLOWED</code> otherwise.</li>
-  <li>Document it in <a href="#syscalls">15</a>.</li>
+  <li>Document it in <a href="#syscalls">16</a>.</li>
 </ol>
 
-<h3 id="recipe-event"><span class="num">22.4</span>Add a kernel or storage event<a class="anchor" href="#recipe-event">#</a></h3>
+<h3 id="recipe-event"><span class="num">23.4</span>Add a kernel or storage event<a class="anchor" href="#recipe-event">#</a></h3>
 <ol>
   <li>Kernel event: a constant in <code>kernel/src/events.rs</code> (document what
     <code>a</code>, <code>b</code>, <code>c</code> hold), <code>events::log(...)</code> at the
@@ -1507,7 +1630,7 @@ fn main() -&gt; u64 {
     in a <code>cmd:</code> test.</li>
 </ol>
 
-<h3 id="recipe-device"><span class="num">22.5</span>Add a device kind or driver<a class="anchor" href="#recipe-device">#</a></h3>
+<h3 id="recipe-device"><span class="num">23.5</span>Add a device kind or driver<a class="anchor" href="#recipe-device">#</a></h3>
 <ol>
   <li>Add <code>(name, vendor, &amp;[device ids])</code> to <code>KINDS</code> in
     <code>kernel/src/pci_kinds.rs</code> (shared with <code>build.rs</code>, which validates
@@ -1519,7 +1642,7 @@ fn main() -&gt; u64 {
   <li>Add a crash feature and a restart test, as <code>virtio-blk/crash-after-10</code>.</li>
 </ol>
 
-<h3 id="recipe-manifest"><span class="num">22.6</span>Add a manifest key<a class="anchor" href="#recipe-manifest">#</a></h3>
+<h3 id="recipe-manifest"><span class="num">23.6</span>Add a manifest key<a class="anchor" href="#recipe-manifest">#</a></h3>
 <ol>
   <li>Add it to <code>known</code> in <code>kernel/build.rs</code>, parse and validate it, and
     emit it in the generated <code>Task</code> literal.</li>
@@ -1527,7 +1650,7 @@ fn main() -&gt; u64 {
   <li>Document it in <code>apps/README.md</code> and <a href="#manifests">7</a>.</li>
 </ol>
 
-<h2 id="invariants"><span class="num">23</span>Invariants<a class="anchor" href="#invariants">#</a></h2>
+<h2 id="invariants"><span class="num">24</span>Invariants<a class="anchor" href="#invariants">#</a></h2>
 
 <p>Rules the code relies on. Breaking one is a bug even when the tests pass.</p>
 <ol>
@@ -1553,7 +1676,7 @@ fn main() -&gt; u64 {
     statements go into PCR 12; <code>tools/expected-pcrs.py</code> must compute the same value.</li>
 </ol>
 
-<h2 id="troubleshooting"><span class="num">24</span>Troubleshooting<a class="anchor" href="#troubleshooting">#</a></h2>
+<h2 id="troubleshooting"><span class="num">25</span>Troubleshooting<a class="anchor" href="#troubleshooting">#</a></h2>
 
 <table>
 <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
@@ -1572,7 +1695,7 @@ fn main() -&gt; u64 {
 <tr><td>"Limine base revision 3 not supported"</td><td>wrong Limine binaries</td><td><code>make distclean</code>; the Makefile fetches branch <code>v11.x-binary</code></td></tr>
 </table>
 
-<h2 id="dependencies"><span class="num">25</span>System dependencies<a class="anchor" href="#dependencies">#</a></h2>
+<h2 id="dependencies"><span class="num">26</span>System dependencies<a class="anchor" href="#dependencies">#</a></h2>
 
 <table>
 <tr><th>Dependency</th><th>Used for</th><th>Debian/Ubuntu package</th></tr>
@@ -1595,7 +1718,7 @@ rustup target add x86_64-unknown-none</code></pre>
 <p>Nightly Rust isn't required. Limine (branch <code>v11.x-binary</code>) is cloned into
 <code>limine/</code> on the first build.</p>
 
-<h2 id="glossary"><span class="num">26</span>Glossary<a class="anchor" href="#glossary">#</a></h2>
+<h2 id="glossary"><span class="num">27</span>Glossary<a class="anchor" href="#glossary">#</a></h2>
 
 <table>
 <tr><th>Term</th><th>Meaning</th></tr>

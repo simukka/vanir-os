@@ -41,8 +41,8 @@ pub struct Task {
     pub events: bool,
     /// Oldest signed version of the program that may run (rollback protection).
     pub min_version: u64,
-    /// Gets the TPM's registers mapped, and the measurement log (for attestation). The kernel
-    /// itself uses the TPM only before tasks start.
+    /// Gets the TPM's registers mapped, and the measurement logs (for attestation). It shares
+    /// the TPM with the kernel through `tpm_lock`.
     pub tpm: bool,
     /// The network service this task is an instance of (default: its name).
     pub service: &'static str,
@@ -50,6 +50,22 @@ pub struct Task {
     pub listen: &'static [Listen],
     /// May change the network stack's routing (live instances, drains, blocklist).
     pub routes: bool,
+    /// May load signed service images into slots (`slot_stage`, `slot_load`, `slot_unload`).
+    pub loads: bool,
+    /// May open outbound connections through a network stack (`net` asks with `task_listen`).
+    pub connects: bool,
+    /// A generic slot (RFD 2, P1): its class. It runs whatever service image is loaded into it;
+    /// `program`, `service` and `listen` are empty, and come from the image's descriptor.
+    pub class: Option<&'static SlotClass>,
+}
+
+/// A class of generic slots, declared in the manifest with `[[slot_class]]`.
+pub struct SlotClass {
+    pub name: &'static str,
+    /// Most frames a service in the slot may use: its image's pages, stack and page tables.
+    pub memory_pages: u64,
+    /// Size of the slot's image area: the largest image it can hold.
+    pub image_pages: u64,
 }
 
 /// A port a task may listen on, with its connection limits.
@@ -61,7 +77,10 @@ pub struct Listen {
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
 
-pub const MAX_PROCESSES: usize = 16;
+/// Rows in the `Stats` record user code reads (`vanir_user::MAX_TASKS`); the manifest's
+/// `MAX_PROCESSES` is at most this.
+const STATS_TASKS: usize = 64;
+const _: () = assert!(MAX_PROCESSES <= STATS_TASKS);
 const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
 /// 64 KiB: drivers and servers keep several 4 KiB block or message buffers on their stacks.
 const USER_STACK_PAGES: u64 = 16;
@@ -84,8 +103,12 @@ const TPM_BASE: u64 = 0x30_0000_0000;
 /// What a task slot is given at boot and keeps across restarts.
 #[derive(Clone, Copy)]
 struct Grants {
-    /// The program's ELF image (a boot module).
+    /// The program's ELF image: a boot module, or for a generic slot the image loaded into its
+    /// image area (empty while nothing is loaded).
     image: &'static [u8],
+    /// A generic slot's image area: physically contiguous (physical address, pages), set aside at
+    /// boot. Images are staged into it and restarts reload from it.
+    image_area: Option<(u64, u64)>,
     /// PCI devices (indices for `pci::get`).
     devices: [Option<usize>; MAX_TASK_DEVICES],
     /// Physically contiguous DMA region: (physical address, pages).
@@ -101,6 +124,12 @@ pub mod err {
     pub const BAD_BUFFER: u64 = DEAD | 3;
     pub const TOO_LONG: u64 = DEAD | 4;
     pub const BAD_ARGUMENT: u64 = DEAD | 5;
+    /// The TPM is in use (the attestation task holds its lock); try again.
+    pub const BUSY: u64 = DEAD | 6;
+    /// The run-time measurement log is full: no more loads until the node reboots.
+    pub const LOG_FULL: u64 = DEAD | 7;
+    /// The image was refused; rdx holds the reason (`verify::Rejection`).
+    pub const REJECTED: u64 = DEAD | 8;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,11 +149,13 @@ enum State {
     OverBudget,
     /// Its image failed signature checks at boot; it never runs and can't be restarted.
     Rejected(Rejection),
+    /// A generic slot with no image loaded. Not restartable; `slot_load` starts it.
+    Empty,
 }
 
 impl State {
     fn is_dead(self) -> bool {
-        matches!(self, State::Exited(_) | State::Faulted(_) | State::OverBudget | State::Rejected(_))
+        matches!(self, State::Exited(_) | State::Faulted(_) | State::OverBudget | State::Rejected(_) | State::Empty)
     }
 }
 
@@ -189,6 +220,12 @@ struct Process {
     recv_deadline: Option<u64>,
     /// Bits posted by other tasks with `notify`, not yet received.
     posted: u64,
+    /// The signed version running (0 for an empty slot).
+    version: u64,
+    /// A generic slot's service, from its image's descriptor. None for tasks and empty slots.
+    loaded: Option<verify::Descriptor>,
+    /// Bytes staged into a generic slot's image area since it was last emptied.
+    staged: u64,
 }
 
 impl Process {
@@ -273,9 +310,14 @@ pub fn start(kernel_file: &[u8]) -> ! {
 
     // Grants first: DMA regions are permanent, so they belong in the baseline, not the leak check.
     let mut claimed = [false; pci::MAX_DEVICES];
-    let mut grants = [Grants { image: &[], devices: [None; MAX_TASK_DEVICES], dma: None }; MAX_PROCESSES];
+    let mut grants = [Grants { image: &[], image_area: None, devices: [None; MAX_TASK_DEVICES], dma: None }; MAX_PROCESSES];
     let mut vectors = irq::DEVICE_VECTORS;
     for (slot, task) in TASKS.iter().enumerate() {
+        if let Some(class) = task.class {
+            // Image areas are permanent, like DMA regions.
+            grants[slot].image_area = Some((memory::alloc_contiguous(class.image_pages), class.image_pages));
+            continue;
+        }
         grants[slot].image = modules::find(task.program)
             .unwrap_or_else(|| panic!("{}: no boot module for program {}", task.name, task.program));
         grants[slot].devices = claim_devices(task, &mut claimed);
@@ -295,10 +337,9 @@ pub fn start(kernel_file: &[u8]) -> ! {
     table.baseline_frames = memory::frames_in_use();
 
     let mut measured: [(&'static str, Option<&[u8]>); MAX_PROCESSES] = [("", None); MAX_PROCESSES];
+    let mut tasks = 0;
     for (slot, task) in TASKS.iter().enumerate() {
         let grants = grants[slot];
-        let checked = verify::check(task.program, modules::find(task.program), signature_of(task.program), task.min_version);
-        measured[slot] = (task.name, checked.ok().map(|(_, statement)| statement));
         let mut p = Process {
             slot,
             generation: 0,
@@ -311,12 +352,24 @@ pub fn start(kernel_file: &[u8]) -> ! {
             grants,
             recv_deadline: None,
             posted: 0,
+            version: 0,
+            loaded: None,
+            staged: 0,
         };
+        if task.class.is_some() {
+            p.state = State::Empty;
+            table.procs[slot] = Some(p);
+            continue;
+        }
+        let checked = verify::check(task.program, modules::find(task.program), signature_of(task.program), task.min_version);
+        measured[tasks] = (task.name, checked.ok().map(|(_, statement)| statement));
+        tasks += 1;
         match checked {
             Ok((version, _statement)) => {
-                let (space, context) = load(task, &grants);
+                let (space, context) = load(task, &grants).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
                 p.space = Some(space);
                 p.context = context;
+                p.version = version;
                 events::log(events::TASK_START, p.id(), version, 0, 0);
                 println!("[kernel] {}: {}-byte ELF, signed version {}, entry {:#x}", p.describe(), grants.image.len(), version, p.context.rip);
             }
@@ -330,7 +383,8 @@ pub fn start(kernel_file: &[u8]) -> ! {
         table.procs[slot] = Some(p);
     }
 
-    measure::boot(kernel_file, MANIFEST, &measured[..TASKS.len()]);
+    measure::boot(kernel_file, MANIFEST, &measured[..tasks]);
+    reserve_slots(table.baseline_frames);
 
     let Some(first) = table.procs.iter().flatten().position(|p| p.state == State::Ready) else {
         finish(&table, false) // every image was rejected
@@ -343,6 +397,27 @@ pub fn start(kernel_file: &[u8]) -> ! {
     drop(table);
     println!("[kernel] entering ring 3");
     enter_user(rip, rsp)
+}
+
+/// Check that memory can hold every slot at its class's limit, and say what the slots are. Tasks'
+/// memory is fixed once loaded (there is no syscall to grow it), and restarts free before they
+/// reload, so after this check a load can't fail for want of memory.
+fn reserve_slots(baseline: u64) {
+    let slots = TASKS.iter().filter(|t| t.class.is_some());
+    let reserve: u64 = slots.clone().map(|t| t.class.unwrap().memory_pages).sum();
+    if reserve == 0 {
+        return;
+    }
+    let available = memory::frames_available();
+    assert!(available >= reserve, "slots need {reserve} frames at their limits; only {available} are free");
+    println!(
+        "[kernel] {} slot(s) in {} class(es): {} frames set aside, {} free, {} in use before tasks",
+        slots.count(),
+        SLOT_CLASSES.len(),
+        reserve,
+        available,
+        baseline
+    );
 }
 
 /// The signature file shipped with `program` (boot module `<program>.sig`).
@@ -370,9 +445,9 @@ fn claim_devices(task: &Task, claimed: &mut [bool; pci::MAX_DEVICES]) -> [Option
 
 /// A fresh address space with `task` loaded, its stack, granted devices and DMA region mapped,
 /// and its starting registers.
-fn load(task: &Task, grants: &Grants) -> (AddressSpace, TrapFrame) {
+fn load(task: &Task, grants: &Grants) -> Result<(AddressSpace, TrapFrame), elf::LoadError> {
     let space = AddressSpace::new();
-    let entry = elf::load(grants.image, &space).unwrap_or_else(|e| panic!("cannot load {}: {e:?}", task.name));
+    let entry = elf::load(grants.image, &space)?;
     for page in 1..=USER_STACK_PAGES {
         space.map_user_page(USER_STACK_TOP - page * PAGE_SIZE, true, false);
     }
@@ -397,7 +472,7 @@ fn load(task: &Task, grants: &Grants) -> (AddressSpace, TrapFrame) {
             }
         }
     }
-    (space, initial_context(entry, USER_STACK_TOP))
+    Ok((space, initial_context(entry, USER_STACK_TOP)))
 }
 
 /// Timer interrupt: charge the tick to the running process, then preempt it, or kill it if it
@@ -511,6 +586,9 @@ fn end_current(table: &mut Table, frame: &mut TrapFrame, outcome: State) {
     }
     let has_supervisor = table.supervisor.is_some();
     let p = table.current();
+    if p.task.tpm {
+        measure::hold_tpm(false); // a lock nobody can drop would block every load
+    }
     if !matches!(outcome, State::Faulted(_)) {
         p.death = Death::default();
     }
@@ -877,8 +955,8 @@ pub fn restart(frame: &mut TrapFrame) {
     };
     let p = table.get(slot);
     let old_id = p.id();
-    if p.id() != id || !p.state.is_dead() || matches!(p.state, State::Rejected(_)) {
-        frame.rax = err::BAD_ARGUMENT; // already restarted, or still alive
+    if p.id() != id || !p.state.is_dead() || matches!(p.state, State::Rejected(_) | State::Empty) {
+        frame.rax = err::BAD_ARGUMENT; // already restarted, still alive, or nothing to run
         return;
     }
     if let Some((phys, pages)) = p.grants.dma {
@@ -886,7 +964,8 @@ pub fn restart(frame: &mut TrapFrame) {
         unsafe { memory::phys_to_virt(phys).write_bytes(0, (pages * PAGE_SIZE) as usize) };
     }
     irq::take(slot); // interrupts meant for the previous incarnation
-    let (space, context) = load(p.task, &p.grants);
+    // The image loaded before (boot module or slot image area) loaded then, so it loads again.
+    let (space, context) = load(p.task, &p.grants).unwrap_or_else(|e| panic!("cannot reload {}: {e:?}", p.task.name));
     p.space = Some(space);
     p.context = context;
     p.generation += 1;
@@ -913,7 +992,7 @@ pub fn halt(frame: &mut TrapFrame) {
 }
 
 /// `task_state(id) -> (state, current id)`: 0 running or ready, 1 blocked in IPC, 2 exited,
-/// 3 faulted, 4 over budget. Supervisor only.
+/// 3 faulted, 4 over budget, 5 image rejected, 6 empty slot. Supervisor only.
 pub fn task_state(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     if table.supervisor != Some(table.current) {
@@ -929,7 +1008,8 @@ pub fn task_state(frame: &mut TrapFrame) {
     frame.rdx = p.id();
 }
 
-/// 0 running or ready, 1 blocked (IPC or sleep), 2 exited, 3 faulted, 4 over budget.
+/// 0 running or ready, 1 blocked (IPC or sleep), 2 exited, 3 faulted, 4 over budget, 5 image
+/// rejected, 6 empty slot.
 fn state_code(state: State) -> u64 {
     match state {
         State::Ready | State::Running => 0,
@@ -938,6 +1018,7 @@ fn state_code(state: State) -> u64 {
         State::Faulted(_) => 3,
         State::OverBudget => 4,
         State::Rejected(_) => 5,
+        State::Empty => 6,
     }
 }
 
@@ -1056,7 +1137,7 @@ struct Stats {
     events_logged: u64,
     tasks: u64,
     /// Per task: id, state (as `task_state`), CPU ticks.
-    task: [[u64; 3]; MAX_PROCESSES],
+    task: [[u64; 3]; STATS_TASKS],
 }
 
 /// `stats(buf, cap) -> bytes`: a `Stats` record. Only for the task with `events = true`.
@@ -1072,7 +1153,7 @@ pub fn stats(frame: &mut TrapFrame) {
         device_interrupts: irq::count(),
         events_logged: events::logged(),
         tasks: 0,
-        task: [[0; 3]; MAX_PROCESSES],
+        task: [[0; 3]; STATS_TASKS],
     };
     for p in table.procs.iter().flatten() {
         stats.task[p.slot] = [p.id(), state_code(p.state), p.ticks];
@@ -1109,8 +1190,8 @@ pub fn task_name(frame: &mut TrapFrame) {
     }
 }
 
-/// What `task_listen` writes: a task's service, flags (bit 0: may route) and ports, each as
-/// (port, max_connections, max_per_source, 0).
+/// What `task_listen` writes: a task's service, flags (bit 0: may route; bit 1: may connect
+/// out; bit 2: is a generic slot) and ports, each as (port, max_connections, max_per_source, 0), and its signed version.
 #[repr(C)]
 struct ListenInfo {
     service: [u8; 32],
@@ -1118,23 +1199,42 @@ struct ListenInfo {
     flags: u64,
     count: u64,
     ports: [[u16; 4]; 8],
+    version: u64,
 }
 
 /// `task_listen(id, buf, cap) -> bytes`: the network declarations of task `id` (any generation)
-/// from the manifest, as a `ListenInfo`. The network stack uses it to check who may listen
-/// where; the kernel vouches for it as it does for task names.
+/// as a `ListenInfo`: from the manifest, or for a slot from its service's signed descriptor. The
+/// network stack uses it to check who may listen where; the kernel vouches for it as it does for
+/// task names.
 pub fn task_listen(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     let Some(slot) = table.slot_of(frame.rdi) else {
         frame.rax = err::BAD_TARGET;
         return;
     };
-    let task = table.get(slot).task;
-    let mut info = ListenInfo { service: [0; 32], service_len: task.service.len() as u64, flags: task.routes as u64, count: 0, ports: [[0; 4]; 8] };
-    info.service[..task.service.len()].copy_from_slice(task.service.as_bytes());
-    for (out, l) in info.ports.iter_mut().zip(task.listen) {
-        *out = [l.port, l.max_connections, l.max_per_source, 0];
-        info.count += 1;
+    let p = table.get(slot);
+    let task = p.task;
+    let flags = task.routes as u64 | (task.connects as u64) << 1 | (task.class.is_some() as u64) << 2;
+    let mut info = ListenInfo { service: [0; 32], service_len: 0, flags, count: 0, ports: [[0; 4]; 8], version: p.version };
+    let service = match &p.loaded {
+        Some(d) => d.name(),
+        None => task.service.as_bytes(),
+    };
+    info.service[..service.len()].copy_from_slice(service);
+    info.service_len = service.len() as u64;
+    match &p.loaded {
+        Some(d) => {
+            for (out, &(port, max, per_source)) in info.ports.iter_mut().zip(&d.listen[..d.listen_count]) {
+                *out = [port, max, per_source, 0];
+                info.count += 1;
+            }
+        }
+        None => {
+            for (out, l) in info.ports.iter_mut().zip(task.listen) {
+                *out = [l.port, l.max_connections, l.max_per_source, 0];
+                info.count += 1;
+            }
+        }
     }
     let bytes = unsafe { core::slice::from_raw_parts(&info as *const ListenInfo as *const u8, size_of::<ListenInfo>()) };
     if frame.rdx < bytes.len() as u64 {
@@ -1143,6 +1243,220 @@ pub fn task_listen(frame: &mut TrapFrame) {
     }
     match memory::copy_to_user_space(table.current().space(), frame.rsi, bytes) {
         Ok(()) => frame.rax = bytes.len() as u64,
+        Err(_) => frame.rax = err::BAD_BUFFER,
+    }
+}
+
+// ---- Slots: loading service images at run time (RFD 2, P1, P2, P6) --------------------------
+
+/// The generic slot `id` names (any generation), for the task allowed to load images.
+fn loader_target(table: &mut Table, id: u64) -> Result<usize, u64> {
+    if !table.current().task.loads {
+        return Err(err::NOT_ALLOWED);
+    }
+    let slot = table.slot_of(id).ok_or(err::BAD_TARGET)?;
+    if table.get(slot).task.class.is_none() {
+        return Err(err::BAD_TARGET);
+    }
+    Ok(slot)
+}
+
+/// A slot's image area in the kernel's direct map.
+fn image_area(p: &Process) -> &'static mut [u8] {
+    let (phys, pages) = p.grants.image_area.expect("a slot has an image area");
+    unsafe { core::slice::from_raw_parts_mut(memory::phys_to_virt(phys), (pages * PAGE_SIZE) as usize) }
+}
+
+/// Zero what was staged into a slot's image area and forget it.
+fn clear_image(p: &mut Process) {
+    let staged = p.staged as usize;
+    image_area(p)[..staged].fill(0);
+    p.staged = 0;
+    p.grants.image = &[];
+}
+
+/// `slot_stage(slot, offset, buf, len) -> 0`: copy `len` bytes of a service image into an empty
+/// slot's image area at `offset`, so an image arriving in pieces never needs a buffer its size.
+/// TOO_LONG past the end of the area; BAD_ARGUMENT unless the slot is empty.
+pub fn slot_stage(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let slot = match loader_target(&mut table, frame.rdi) {
+        Ok(slot) => slot,
+        Err(e) => return frame.rax = e,
+    };
+    let (offset, buf, len) = (frame.rsi, frame.rdx, frame.r10);
+    let p = table.get(slot);
+    if p.state != State::Empty {
+        frame.rax = err::BAD_ARGUMENT; // unload it first
+        return;
+    }
+    let area = image_area(p);
+    let Some(end) = offset.checked_add(len).filter(|&end| end <= area.len() as u64) else {
+        frame.rax = err::TOO_LONG;
+        return;
+    };
+    if crate::usercopy::copy_from_user(&mut area[offset as usize..end as usize], buf).is_err() {
+        frame.rax = err::BAD_BUFFER;
+        return;
+    }
+    p.staged = p.staged.max(end);
+    frame.rax = 0;
+}
+
+/// `slot_load(slot, sig, sig_len, desc, desc_len) -> new id`: check the staged image against its
+/// signature and descriptor, check it fits the slot's class, measure it, and start it (RFD 2,
+/// P2). Fails, changing nothing, with REJECTED (reason in rdx; the staged image is discarded),
+/// BUSY (the TPM is in use: try again) or LOG_FULL; BAD_ARGUMENT if the slot isn't empty or
+/// nothing is staged.
+pub fn slot_load(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let slot = match loader_target(&mut table, frame.rdi) {
+        Ok(slot) => slot,
+        Err(e) => return frame.rax = e,
+    };
+    let (sig_ptr, sig_len, desc_ptr, desc_len) = (frame.rsi, frame.rdx, frame.r10, frame.r8);
+    let mut sig = [0u8; verify::SIG_FILE_LEN_V2];
+    let mut desc = [0u8; verify::DESCRIPTOR_LEN];
+    let (Some(sig), Some(desc)) = (sig.get_mut(..sig_len as usize), desc.get_mut(..desc_len as usize)) else {
+        frame.rax = err::TOO_LONG;
+        return;
+    };
+    if crate::usercopy::copy_from_user(sig, sig_ptr).is_err() || crate::usercopy::copy_from_user(desc, desc_ptr).is_err() {
+        frame.rax = err::BAD_BUFFER;
+        return;
+    }
+    let p = table.get(slot);
+    if p.state != State::Empty || p.staged == 0 {
+        frame.rax = err::BAD_ARGUMENT;
+        return;
+    }
+    let class = p.task.class.unwrap();
+    let image: &'static [u8] = &image_area(p)[..p.staged as usize];
+
+    // Steps 1-3: signature, version floor, class. Then build its address space, which shows how
+    // much memory it needs; nothing outside this syscall can see it until it starts.
+    let rejected = |table: &mut Table, frame: &mut TrapFrame, why: Rejection| {
+        let p = table.get(slot);
+        clear_image(p);
+        events::log(events::IMAGE_REJECTED, p.id(), why as u64, 0, 0);
+        println!("[kernel] {}: image REJECTED: {}", p.describe(), why.describe());
+        frame.rax = err::REJECTED;
+        frame.rdx = why as u64;
+    };
+    let descriptor = match verify::check_slot(image, sig, desc, class.name) {
+        Ok(d) => d,
+        Err(why) => return rejected(&mut table, frame, why),
+    };
+    p.grants.image = image;
+    let before = memory::frames_in_use();
+    let Ok((space, context)) = load(p.task, &p.grants) else {
+        p.grants.image = &[];
+        return rejected(&mut table, frame, Rejection::BadElf);
+    };
+    let pages = memory::frames_in_use() - before;
+    if pages > class.memory_pages {
+        drop(space);
+        println!("[kernel] {}: the image needs {} frames; class {} allows {}", p.describe(), pages, class.name, class.memory_pages);
+        p.grants.image = &[];
+        return rejected(&mut table, frame, Rejection::TooLarge);
+    }
+
+    // Step 5: measure, or give up with nothing recorded.
+    if let Err(why) = measure::runtime(measure::LOAD, slot, descriptor.name(), descriptor.version, &descriptor.statement_hash) {
+        drop(space);
+        p.grants.image = &[];
+        frame.rax = match why {
+            measure::Refused::Busy => err::BUSY,
+            measure::Refused::Full => err::LOG_FULL,
+        };
+        return;
+    }
+
+    // Step 6: record the descriptor and start it, as a new generation of the slot.
+    p.space = Some(space);
+    p.context = context;
+    p.generation += 1;
+    p.state = State::Ready;
+    p.ticks = 0;
+    p.death = Death::default();
+    p.posted = 0;
+    p.version = descriptor.version;
+    p.loaded = Some(descriptor);
+    irq::take(slot);
+    events::log(events::IMAGE_LOADED, p.id(), descriptor.version, 0, 0);
+    println!(
+        "[kernel] {}: loaded {} version {} ({}-byte image, {} frames of {})",
+        p.describe(),
+        core::str::from_utf8(descriptor.name()).unwrap_or("?"),
+        descriptor.version,
+        image.len(),
+        pages,
+        class.memory_pages
+    );
+    frame.rax = p.id();
+}
+
+/// `slot_unload(slot) -> 0`: empty a slot whose service has ended (or discard a staged image
+/// that was never loaded): zero its image area, forget its descriptor, and measure the unload.
+/// BAD_ARGUMENT while it runs; BUSY or LOG_FULL as for `slot_load`.
+pub fn slot_unload(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let slot = match loader_target(&mut table, frame.rdi) {
+        Ok(slot) => slot,
+        Err(e) => return frame.rax = e,
+    };
+    let p = table.get(slot);
+    if !p.state.is_dead() {
+        frame.rax = err::BAD_ARGUMENT;
+        return;
+    }
+    if let Some(d) = p.loaded {
+        if let Err(why) = measure::runtime(measure::UNLOAD, slot, d.name(), d.version, &d.statement_hash) {
+            frame.rax = match why {
+                measure::Refused::Busy => err::BUSY,
+                measure::Refused::Full => err::LOG_FULL,
+            };
+            return;
+        }
+        events::log(events::IMAGE_UNLOADED, p.id(), d.version, 0, 0);
+        println!("[kernel] {}: unloaded {} version {}", p.describe(), core::str::from_utf8(d.name()).unwrap_or("?"), d.version);
+    }
+    clear_image(p);
+    p.loaded = None;
+    p.version = 0;
+    p.state = State::Empty;
+    p.death.unreported = false; // nothing left to restart
+    frame.rax = 0;
+}
+
+/// `tpm_lock()` / `tpm_unlock()`: the task with `tpm = true` holds the TPM around its commands,
+/// so the kernel never extends PCR 13 in the middle of one.
+pub fn tpm_lock(frame: &mut TrapFrame, held: bool) {
+    let mut table = TABLE.lock();
+    if !table.current().task.tpm {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    measure::hold_tpm(held);
+    frame.rax = 0;
+}
+
+/// `runtime_log(buf, cap, start) -> (count, total)`: run-time log entries from `start`
+/// (`measure::ENTRY_LEN` bytes each), for the task with `tpm = true`.
+pub fn runtime_log(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    if !table.current().task.tpm {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let mut out = [0u8; measure::ENTRY_LEN * 32];
+    let cap = (frame.rsi as usize).min(out.len());
+    let (count, total) = measure::runtime_log(frame.rdx as usize, &mut out[..cap]);
+    match memory::copy_to_user_space(table.current().space(), frame.rdi, &out[..count * measure::ENTRY_LEN]) {
+        Ok(()) => {
+            frame.rax = count as u64;
+            frame.rdx = total as u64;
+        }
         Err(_) => frame.rax = err::BAD_BUFFER,
     }
 }
@@ -1176,6 +1490,7 @@ fn finish(table: &Table, stopped: bool) -> ! {
                 status = status.max(2);
                 "image rejected"
             }
+            State::Empty => "empty slot",
             State::RecvBlocked => "waiting for messages",
             State::SendBlocked(_) | State::ReplyBlocked(_) if stopped => "waiting in send",
             State::SendBlocked(_) | State::ReplyBlocked(_) => {

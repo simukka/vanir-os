@@ -1,0 +1,10 @@
+# Slots without a network: for loading checks that need no service to answer.
+[[task]]
+name = "agent"
+loads = true
+
+[[slot_class]]
+name = "small"
+count = 2
+memory_pages = 256
+image_pages = 128

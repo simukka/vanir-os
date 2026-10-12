@@ -1,6 +1,7 @@
 //! Commands from the control plane, read line by line from the uplink:
 //!
-//!   attest <nonce hex, up to 32 bytes>   -> the attestation task's JSON quote, sent back
+//!   attest <nonce hex, up to 32 bytes>   -> the attestation task's JSON quote, sent back, then
+//!                                           the run-time log entries it covers
 //!   key <hex: host X25519 key, sealed key> -> the attestation task opens it, unlocks storage
 //!   interval <ms>                         -> telemetry's counter snapshot interval
 //!   bye                                   -> end this task (the host is done with us)
@@ -10,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use vanir_user::attest::{OP_QUOTE, OP_UNWRAP};
+use vanir_user::attest::{OP_QUOTE, OP_RUNTIME_LOG, OP_UNWRAP};
 use vanir_user::{console, err, lookup, println, send, telemetry};
 
 vanir_user::entry!(main);
@@ -82,6 +83,21 @@ fn handle<'a>(line: &[u8], attest: Option<u64>, out: &'a mut [u8; 4096]) -> &'a 
     }
 }
 
+/// After a quote: send the run-time log entries it covers, a JSON line at a time.
+fn forward_runtime_log(attest: u64, uplink: u64) {
+    let mut start = 0u64;
+    let mut out = [0u8; 4096];
+    while let Ok((0, len)) = send(attest, OP_RUNTIME_LOG, &start.to_le_bytes(), &mut out) {
+        let line = &out[..len];
+        // Each entry is one `"op":` object.
+        start += line.windows(5).filter(|w| w == b"\"op\":").count() as u64;
+        if let Err(e) = console::write(uplink, line) {
+            println!("control: run-time log failed: {}", err::name(e));
+            return;
+        }
+    }
+}
+
 fn main() -> u64 {
     let uplink = lookup("uplink").expect("no uplink task");
     let attest = lookup("attest").ok();
@@ -113,6 +129,11 @@ fn main() -> u64 {
             let reply = handle(&line[..len], attest, &mut out);
             if let Err(e) = console::write(uplink, reply) {
                 println!("control: reply failed: {}", err::name(e));
+            }
+            if line[..len].starts_with(b"attest ")
+                && let Some(attest) = attest
+            {
+                forward_runtime_log(attest, uplink);
             }
             len = 0;
         }

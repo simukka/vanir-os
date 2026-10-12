@@ -1,0 +1,10 @@
+# A class too small in memory for the HTTP service (it needs about 130 frames).
+[[task]]
+name = "agent"
+loads = true
+
+[[slot_class]]
+name = "small"
+count = 1
+memory_pages = 64
+image_pages = 128

@@ -9,7 +9,7 @@ Sources:
   host-agent.py --socket build/tel.sock    a Unix socket (QEMU -chardev socket,...,server=on)
   host-agent.py --listen-vsock 5000        accept the guest's vsock connection (CID 2, port 5000)
   ... --save FILE                          also copy the raw stream to FILE as it arrives
-  ... --attest                             once connected, challenge the guest with a fresh
+  ... --attest [--attest-delay SECONDS]    once connected (and after the delay), challenge the guest with a fresh
                                            nonce ("attest <hex>"); the challenge is logged; then
                                            tell it "bye"
   ... --set-interval MS                    once connected, set the counter snapshot interval
@@ -34,6 +34,7 @@ import os
 import secrets
 import socket
 import sys
+import time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -99,9 +100,12 @@ def lines_from(args):
                     f.write(line + "\n")
             return line
 
+        if args.attest_delay:
+            time.sleep(args.attest_delay)
         nonce = secrets.token_hex(32)
         yield note({"event": "challenge", "nonce": nonce})
         conn.sendall(f"attest {nonce}\n".encode())
+        quote, runtime, decided = None, [], False
         for line in stream_lines(conn, args.save, append=True):
             yield line
             try:
@@ -109,15 +113,24 @@ def lines_from(args):
             except ValueError:
                 continue
             event = record.get("event")
-            if event == "quote" and args.release_key:
-                problems = check(record, nonce) + compare(record, json.load(open(args.reference)))
+            if event == "quote":
+                quote = record
+            elif event == "runtime_log":
+                runtime += record["entries"]
+            # Decide once the quote and the run-time log entries it covers have arrived.
+            if event in ("quote", "runtime_log") and quote and not decided and len(runtime) >= quote.get("runtime_count", 0):
+                decided = True
+                if not args.release_key:
+                    conn.sendall(b"bye\n")
+                    continue
+                problems = check(quote, nonce, runtime=runtime) + compare(quote, json.load(open(args.reference)))
                 if problems:
                     yield note({"event": "key_refused", "reasons": problems})
                     conn.sendall(b"bye\n")
                 else:
-                    conn.sendall(f"key {seal_key(master_key(args.release_key), record['kx_pub'], nonce)}\n".encode())
+                    conn.sendall(f"key {seal_key(master_key(args.release_key), quote['kx_pub'], nonce)}\n".encode())
                     yield note({"event": "key_released"})
-            elif event == "quote" or (event in ("unlocked", "error") and args.release_key):
+            elif event in ("unlocked", "error") and args.release_key:
                 conn.sendall(b"bye\n")
         return
     if args.socket:
@@ -138,6 +151,7 @@ def main():
     p.add_argument("--listen-vsock", type=int, metavar="PORT")
     p.add_argument("--save", metavar="FILE")
     p.add_argument("--attest", action="store_true")
+    p.add_argument("--attest-delay", type=float, default=0, metavar="SECONDS", help="wait this long before the challenge")
     p.add_argument("--set-interval", type=int, metavar="MS")
     p.add_argument("--expect-interval", type=int, metavar="TICKS")
     p.add_argument("--release-key", metavar="KEY")

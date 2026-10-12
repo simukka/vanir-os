@@ -1,0 +1,28 @@
+# Generic slots (RFD 2): the agent loads signed service images into them at run time.
+runtime_log = 1024
+
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic"]
+
+[[task]]
+name = "agent"
+loads = true
+
+[[slot_class]]
+name = "small"
+count = 2
+memory_pages = 256
+image_pages = 128
+sends = ["net"]

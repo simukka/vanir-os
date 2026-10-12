@@ -1,7 +1,13 @@
-//! Attestation: on request, quote PCRs 0, 4, 7 and 12 over the requester's nonce with the TPM's
-//! attestation key, and reply with one JSON line the host can verify (tools/verify-quote.py):
-//! the signed TPMS_ATTEST, the ECDSA signature, the key, the PCR values, and the kernel's
-//! measurement log for PCR 12.
+//! Attestation: on request, quote PCRs 0, 4, 7, 12 and 13 over the requester's nonce with the
+//! TPM's attestation key, and reply with one JSON line the host can verify
+//! (tools/verify-quote.py): the signed TPMS_ATTEST, the ECDSA signature, the key, the PCR values,
+//! the kernel's measurement log for PCR 12, and how many run-time log entries PCR 13 covers.
+//! `OP_RUNTIME_LOG` then returns those entries (images loaded into and unloaded from slots, RFD 2,
+//! P6) a JSON line at a time.
+//!
+//! The kernel extends PCR 13 at run time too, so this task holds the TPM lock around each
+//! sequence of TPM commands (RFD 2, determination 8). Holding it over a quote and the PCR reads
+//! after it also keeps the values, the quote and the entry count consistent.
 //!
 //! Key release: at start the task makes an X25519 key pair from TPM randomness and quotes over
 //! SHA-256(nonce || public key), so a verifier knows the key belongs to the attested system. The
@@ -18,13 +24,24 @@ use ed25519_compact::x25519;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use tpm2::{AttestationKey, Tpm};
-use vanir_user::attest::{OP_QUOTE, OP_UNWRAP};
+use vanir_user::attest::{OP_QUOTE, OP_RUNTIME_LOG, OP_UNWRAP};
 use vanir_user::block::{self, code_name};
-use vanir_user::{err, lookup, measurements, println, recv, reply};
+use vanir_user::{RUNTIME_ENTRY_LEN, err, lookup, measurements, println, recv, reply, runtime_log, tpm_lock, tpm_unlock};
 
 vanir_user::entry!(main);
 
-const PCRS: [u32; 4] = [0, 4, 7, 12];
+const PCRS: [u32; 5] = [0, 4, 7, 12, 13];
+
+/// Run-time log entries per `OP_RUNTIME_LOG` reply (one JSON line, under 4 KiB).
+const ENTRIES_PER_LINE: usize = 20;
+
+/// Run `f` holding the TPM lock.
+fn locked<T>(f: impl FnOnce() -> T) -> T {
+    let _ = tpm_lock();
+    let result = f();
+    let _ = tpm_unlock();
+    result
+}
 
 struct Hex<'a>(&'a [u8]);
 
@@ -61,11 +78,13 @@ fn quote(
     entries: usize,
     nonce: &[u8],
     out: &mut Line,
-) -> Result<(), tpm2::Error> {
+) -> Result<usize, tpm2::Error> {
     // Binding the key-exchange public key into the quote.
     let qualifying: [u8; 32] = Sha256::new().chain_update(nonce).chain_update(kx_public).finalize().into();
     let mut buf = [0u8; tpm2::BUF];
     let q = tpm.quote(&mut buf, key, &qualifying, &PCRS)?;
+    // Under the lock no load can happen between the quote and this count.
+    let (_, runtime_count) = runtime_log(&mut [], 0).unwrap_or((0, 0));
     let _ = write!(
         out,
         "{{\"event\":\"quote\",\"nonce\":\"{}\",\"kx_pub\":\"{}\",\"attest\":\"{}\",\"sig_r\":\"{}\",\"sig_s\":\"{}\",\"ak_x\":\"{}\",\"ak_y\":\"{}\",\"pcrs\":{{",
@@ -88,8 +107,35 @@ fn quote(
         let name = core::str::from_utf8(&entry[..name_len]).unwrap_or("?");
         let _ = write!(out, "{}{{\"what\":\"{}\",\"digest\":\"{}\"}}", if i == 0 { "" } else { "," }, name, Hex(&entry[16..]));
     }
+    let _ = write!(out, "],\"runtime_count\":{}}}\n", runtime_count);
+    Ok(runtime_count)
+}
+
+/// Run-time log entries `start..` (up to `count`, the number the last quote covered) as one
+/// JSON line. Returns false if there are none.
+fn runtime_line(start: usize, count: usize, out: &mut Line) -> bool {
+    if start >= count {
+        return false;
+    }
+    let mut entries = [0u8; RUNTIME_ENTRY_LEN * ENTRIES_PER_LINE];
+    let want = (count - start).min(ENTRIES_PER_LINE);
+    let Ok((n, _)) = runtime_log(&mut entries[..want * RUNTIME_ENTRY_LEN], start) else { return false };
+    let _ = write!(out, "{{\"event\":\"runtime_log\",\"start\":{},\"entries\":[", start);
+    for (i, e) in entries.chunks(RUNTIME_ENTRY_LEN).take(n).enumerate() {
+        let name_len = e[8..40].iter().position(|&b| b == 0).unwrap_or(32);
+        let _ = write!(
+            out,
+            "{}{{\"op\":\"{}\",\"slot\":{},\"name\":\"{}\",\"version\":{},\"statement\":\"{}\"}}",
+            if i == 0 { "" } else { "," },
+            if e[0] == 1 { "load" } else { "unload" },
+            e[1],
+            core::str::from_utf8(&e[8..8 + name_len]).unwrap_or("?"),
+            u64::from_le_bytes(e[40..48].try_into().unwrap()),
+            Hex(&e[48..80])
+        );
+    }
     let _ = out.write_str("]}\n");
-    Ok(())
+    true
 }
 
 /// Open the master key the host sealed to our key-exchange key (host public key, then
@@ -129,7 +175,15 @@ fn main() -> u64 {
         }
     };
     let tpm = Tpm::new(base);
-    let key = match tpm.create_attestation_key() {
+    // Test only: keep the TPM from the kernel for a second, so a load meets BUSY.
+    #[cfg(feature = "hold-lock-1s")]
+    {
+        let _ = tpm_lock();
+        println!("attest: holding the TPM lock for 1 s");
+        vanir_user::sleep(100);
+        let _ = tpm_unlock();
+    }
+    let key = match locked(|| tpm.create_attestation_key()) {
         Ok(k) => k,
         Err(e) => {
             println!("attest: cannot create the attestation key: {:?}", e);
@@ -138,7 +192,7 @@ fn main() -> u64 {
     };
     println!("attest: attestation key ready (P-256, x {}...)", Hex(&key.x[..8]));
     let mut seed = [0u8; 32];
-    if let Err(e) = tpm.get_random(&mut seed) {
+    if let Err(e) = locked(|| tpm.get_random(&mut seed)) {
         println!("attest: no randomness from the TPM: {:?}", e);
         return 1;
     }
@@ -147,6 +201,8 @@ fn main() -> u64 {
     // The nonce of the last quote: key release is bound to it.
     let mut last_nonce = [0u8; 32];
     let mut last_nonce_len = None;
+    // Run-time log entries the last quote covered.
+    let mut runtime_count = 0;
 
     let mut msg = [0u8; 128];
     loop {
@@ -165,13 +221,23 @@ fn main() -> u64 {
             let _ = reply(m.sender, code, &[]);
             continue;
         }
+        if m.op == OP_RUNTIME_LOG && m.len == 8 {
+            let start = u64::from_le_bytes(msg[..8].try_into().unwrap()) as usize;
+            let mut line = Line { buf: [0; 4096], len: 0 };
+            match runtime_line(start, runtime_count, &mut line) {
+                true => drop(reply(m.sender, 0, &line.buf[..line.len])),
+                false => drop(reply(m.sender, 1, &[])),
+            }
+            continue;
+        }
         if m.op != OP_QUOTE || m.len > 32 {
             let _ = reply(m.sender, 1, &[]);
             continue;
         }
         let mut line = Line { buf: [0; 4096], len: 0 };
-        match quote(&tpm, &key, &kx_public, &log, entries, &msg[..m.len], &mut line) {
-            Ok(()) => {
+        match locked(|| quote(&tpm, &key, &kx_public, &log, entries, &msg[..m.len], &mut line)) {
+            Ok(count) => {
+                runtime_count = count;
                 last_nonce[..m.len].copy_from_slice(&msg[..m.len]);
                 last_nonce_len = Some(m.len);
                 let _ = reply(m.sender, 0, &line.buf[..line.len]);

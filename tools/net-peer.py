@@ -388,7 +388,7 @@ def finish(ok, port=NET_PORT):
 
 
 @scenario
-def http_get(args):
+def http_get(args, want="hello from web\n"):
     """100 GETs over one keep-alive connection, then 100 over new connections."""
     deadline = time.monotonic() + args.timeout
     body = wait_ready(deadline)
@@ -396,7 +396,6 @@ def http_get(args):
         say("the guest never answered")
         return finish(False)
     say(f"first answer: {body.strip()!r}")
-    want = "hello from web\n"
     ok = 0
     start = time.monotonic()
     c = Http()
@@ -421,6 +420,12 @@ def http_get(args):
     rate = fresh / (time.monotonic() - start)
     say(f"new connections: {fresh}/100 ok ({rate:.0f} requests/s)")
     return finish(ok == 100 and fresh == 100)
+
+
+@scenario
+def slot_http_get(args):
+    """http_get against web v1 loaded into slot small-0 at run time (RFD 2)."""
+    return http_get(args, want="hello from web v1 on small-0\n")
 
 
 @scenario

@@ -1,0 +1,9 @@
+# The agent without `loads = true`: every slot syscall is refused.
+[[task]]
+name = "agent"
+
+[[slot_class]]
+name = "small"
+count = 1
+memory_pages = 256
+image_pages = 128

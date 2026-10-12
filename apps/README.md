@@ -20,11 +20,30 @@ listen = [{ port = 80, max_connections = 64, max_per_source = 16 }]
                        # max_per_source default max_connections; at most 8 entries)
 service = "web"        # optional: the network service it is an instance of (default: its name)
 routes = true          # optional: may route, drain and blocklist in the network stacks
+loads = true           # optional: may load service images into slots (at most one: the agent)
+connects = true        # optional: may open outbound connections through a network stack
+```
+
+Generic slots (RFD 2) run service images the agent loads at run time; see "Deployment" in
+docs/index.html. A class becomes `count` table entries named `<class>-0`, `<class>-1`, ...,
+after the tasks:
+
+```toml
+runtime_log = 1024     # optional, top level: run-time measurement log entries (default 1024)
+
+[[slot_class]]
+name = "small"
+count = 2
+memory_pages = 256     # most frames a service in it may use
+image_pages = 128      # its image area: the largest image it can hold
+budget = 20            # optional: CPU budget, as for tasks
+sends = ["net"]        # optional: tasks its services may send to
 ```
 
 Tasks get ids 1, 2, ... in manifest order (programs can also find one with `lookup(name)`). The
 build fails on unknown keys, duplicate names, unknown `sends` targets or device names, or more than
-one supervisor, event reader or TPM task, or a port declared by two different services. Each `devices` entry claims the next unclaimed device of that kind
+one supervisor, event reader, TPM task or loader, more than 64 tasks and slots, or a port
+declared by two different services. Each `devices` entry claims the next unclaimed device of that kind
 at boot; a missing device is logged and the task runs without it.
 
 Storage (see "Storage" in docs/index.html) goes by task names too: the block driver is

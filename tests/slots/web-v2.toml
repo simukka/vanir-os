@@ -1,0 +1,7 @@
+# The same program as web-v1, signed as version 2: a deployment needs only a new version.
+name = "web"
+version = 2
+min_version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+drain = { default_secs = 30, max_secs = 300 }

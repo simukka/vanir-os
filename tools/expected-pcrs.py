@@ -5,6 +5,11 @@ task's signed statement (first 80 bytes of its .sig), in manifest order; a rejec
 contributes 32 zero bytes.
 
   expected-pcrs.py --boot build/esp/boot --app tests/apps/hello.toml [--rejected NAME ...]
+
+With --runtime OP:SLOT:IMAGE (repeatable), print PCR 13 instead: the run-time log the kernel
+keeps as images are loaded into slots (RFD 2, P6), e.g. --runtime load:small-0:web-v1 for
+build/slots/web-v1.{desc,sig}. Each entry is extended as SHA-256 of its 80 bytes: operation,
+slot index, 6 zero bytes, service name, version, SHA-256 of the signed statement.
 """
 import argparse
 import hashlib
@@ -15,16 +20,41 @@ def extend(pcr, digest):
     return hashlib.sha256(pcr + digest).digest()
 
 
+def runtime_pcr(manifest, args):
+    """PCR 13 after the given run-time operations."""
+    slots = [t["name"] for t in manifest["task"]]
+    for c in manifest.get("slot_class", []):
+        slots += [f"{c['name']}-{i}" for i in range(c["count"])]
+    pcr = bytes(32)
+    for item in args.runtime:
+        op, slot, image = item.split(":")
+        with open(f"{args.slots}/{image}.desc", "rb") as f:
+            desc = f.read()
+        with open(f"{args.slots}/{image}.sig", "rb") as f:
+            statement = f.read()[:112]
+        entry = bytes([{"load": 1, "unload": 2}[op], slots.index(slot)]) + bytes(6) + desc[8:40] + desc[40:48]
+        entry += hashlib.sha256(statement).digest()
+        pcr = extend(pcr, hashlib.sha256(entry).digest())
+        if args.log:
+            print(f"{op} {image} into {slot}: {hashlib.sha256(entry).hexdigest()}")
+    return pcr.hex()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--boot", default="build/esp/boot", help="directory with vanir-kernel, *.sig")
     p.add_argument("--app", required=True, help="the app manifest the kernel was built with")
     p.add_argument("--rejected", action="append", default=[], help="task whose image was rejected")
     p.add_argument("--log", action="store_true", help="print each measurement too")
+    p.add_argument("--runtime", action="append", default=[], metavar="OP:SLOT:IMAGE")
+    p.add_argument("--slots", default="build/slots", help="directory with the slot images")
     args = p.parse_args()
 
     with open(args.app, "rb") as f:
         manifest = f.read()
+    if args.runtime:
+        print(runtime_pcr(tomllib.loads(manifest.decode()), args))
+        return
     entries = [("kernel", hashlib.sha256(open(f"{args.boot}/vanir-kernel", "rb").read()).digest()),
                ("manifest", hashlib.sha256(manifest).digest())]
     for task in tomllib.loads(manifest.decode())["task"]:

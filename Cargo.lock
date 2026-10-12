@@ -13,6 +13,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent"
+version = "0.1.0"
+dependencies = [
+ "vanir-user",
+]
+
+[[package]]
 name = "attest"
 version = "0.1.0"
 dependencies = [

@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 TPM_GENERATED = 0xFF544347
 ST_ATTEST_QUOTE = 0x8018
-PCRS = ["0", "4", "7", "12"]
+PCRS = ["0", "4", "7", "12", "13"]
 
 
 class Reader:
@@ -59,9 +59,25 @@ def parse_attest(blob):
     return extra, [str(p) for p in selected], digest
 
 
-def check(quote, nonce, tamper=False):
+def runtime_entry(e):
+    """The kernel's 80-byte run-time log entry (kernel/src/measure.rs) for a JSON entry."""
+    op = {"load": 1, "unload": 2}[e["op"]]
+    return (bytes([op, e["slot"]]) + bytes(6) + e["name"].encode().ljust(32, b"\0")
+            + struct.pack("<Q", e["version"]) + bytes.fromhex(e["statement"]))
+
+
+def replay_runtime(entries):
+    """PCR 13 after extending with each run-time log entry."""
+    pcr = bytes(32)
+    for e in entries:
+        pcr = hashlib.sha256(pcr + hashlib.sha256(runtime_entry(e)).digest()).digest()
+    return pcr
+
+
+def check(quote, nonce, tamper=False, runtime=()):
     """Return the problems with `quote` as a quote over `nonce` (empty if none). A quote that
-    carries a key-exchange public key (`kx_pub`) must be over SHA-256(nonce || kx_pub)."""
+    carries a key-exchange public key (`kx_pub`) must be over SHA-256(nonce || kx_pub).
+    `runtime` holds the run-time log entries sent after the quote; they must replay to PCR 13."""
     problems = []
     attest = bytearray.fromhex(quote["attest"])
     if tamper:
@@ -91,11 +107,17 @@ def check(quote, nonce, tamper=False):
         pcr12 = hashlib.sha256(pcr12 + bytes.fromhex(entry["digest"])).digest()
     if pcr12.hex() != quote["pcrs"]["12"]:
         problems.append("the measurement log does not replay to PCR 12")
+    count = quote.get("runtime_count", 0)
+    if len(runtime) != count:
+        problems.append(f"the quote covers {count} run-time log entries; {len(runtime)} arrived")
+    elif replay_runtime(runtime).hex() != quote["pcrs"]["13"]:
+        problems.append("the run-time log does not replay to PCR 13")
     return problems
 
 
 
-PCR_NAMES = {"0": "firmware", "4": "boot loader", "7": "Secure Boot state", "12": "kernel/manifest/tasks"}
+PCR_NAMES = {"0": "firmware", "4": "boot loader", "7": "Secure Boot state", "12": "kernel/manifest/tasks",
+             "13": "images loaded at run time"}
 
 
 def compare(quote, reference):

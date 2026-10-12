@@ -1,0 +1,6 @@
+# Version 1 with a floor of 2: refused as too old (slot-too-old).
+name = "web"
+version = 1
+min_version = 2
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]

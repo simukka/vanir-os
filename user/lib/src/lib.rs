@@ -32,6 +32,12 @@ pub const SYS_MEASUREMENTS: u64 = 115;
 pub const SYS_NOTIFY: u64 = 116;
 pub const SYS_HALT: u64 = 117;
 pub const SYS_TASK_LISTEN: u64 = 118;
+pub const SYS_SLOT_STAGE: u64 = 119;
+pub const SYS_SLOT_LOAD: u64 = 120;
+pub const SYS_SLOT_UNLOAD: u64 = 121;
+pub const SYS_TPM_LOCK: u64 = 122;
+pub const SYS_TPM_UNLOCK: u64 = 123;
+pub const SYS_RUNTIME_LOG: u64 = 124;
 
 /// The most tasks (fixed tasks and slots) a manifest may declare; size per-task tables with it.
 pub const MAX_TASKS: usize = 64;
@@ -47,6 +53,12 @@ pub mod err {
     pub const BAD_BUFFER: u64 = DEAD | 3;
     pub const TOO_LONG: u64 = DEAD | 4;
     pub const BAD_ARGUMENT: u64 = DEAD | 5;
+    /// The TPM is in use; try again.
+    pub const BUSY: u64 = DEAD | 6;
+    /// The run-time measurement log is full: no more loads until the node reboots.
+    pub const LOG_FULL: u64 = DEAD | 7;
+    /// The image was refused (the reason comes with it: `events::rejection`).
+    pub const REJECTED: u64 = DEAD | 8;
 
     pub fn is_error(code: u64) -> bool {
         code & DEAD != 0
@@ -60,6 +72,9 @@ pub mod err {
             BAD_BUFFER => "BAD_BUFFER",
             TOO_LONG => "TOO_LONG",
             BAD_ARGUMENT => "BAD_ARGUMENT",
+            BUSY => "BUSY",
+            LOG_FULL => "LOG_FULL",
+            REJECTED => "REJECTED",
             _ => "OK",
         }
     }
@@ -453,6 +468,8 @@ pub mod events {
     pub const RESTART: u64 = 5;
     pub const IPC_REFUSED: u64 = 6;
     pub const IMAGE_REJECTED: u64 = 7;
+    pub const IMAGE_LOADED: u64 = 8;
+    pub const IMAGE_UNLOADED: u64 = 9;
 
     /// Why the kernel refused a task image (`IMAGE_REJECTED`'s `a`, a death record's `code`).
     pub fn rejection(reason: u64) -> &'static str {
@@ -464,6 +481,12 @@ pub mod events {
             5 => "signed for another program",
             6 => "image does not match its signature",
             7 => "version older than the manifest allows",
+            8 => "malformed descriptor",
+            9 => "descriptor does not match its signature",
+            10 => "descriptor asks for another slot class",
+            11 => "image needs more memory than its slot class has",
+            12 => "not a loadable ELF image",
+            13 => "version below its min_version",
             _ => "unknown",
         }
     }
@@ -490,7 +513,7 @@ pub mod events {
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy)]
     pub struct Stats {
         pub uptime_ticks: u64,
         pub frames_in_use: u64,
@@ -498,12 +521,12 @@ pub mod events {
         pub events_logged: u64,
         pub tasks: u64,
         /// Per task slot: id, state (0 running/ready, 1 blocked, 2 exited, 3 faulted,
-        /// 4 over budget), CPU ticks.
-        pub task: [[u64; 3]; 16],
+        /// 4 over budget, 5 image rejected, 6 empty slot), CPU ticks.
+        pub task: [[u64; 3]; super::MAX_TASKS],
     }
 
     pub fn stats() -> Result<Stats, u64> {
-        let mut s = Stats::default();
+        let mut s = Stats { uptime_ticks: 0, frames_in_use: 0, device_interrupts: 0, events_logged: 0, tasks: 0, task: [[0; 3]; super::MAX_TASKS] };
         let size = core::mem::size_of::<Stats>() as u64;
         let (n, _, _) = syscall6(SYS_STATS, [&mut s as *mut Stats as u64, size, 0, 0, 0, 0]);
         if err::is_error(n) { Err(n) } else { Ok(s) }
@@ -525,6 +548,9 @@ pub mod attest {
     /// Message: the host's X25519 public key (32 bytes) and the master key sealed to ours (48
     /// bytes). The attest task opens it and unlocks the storage task. Reply code 0 on success.
     pub const OP_UNWRAP: u64 = 2;
+    /// Message: the first entry wanted (u64). Reply: one JSON line of run-time log entries from
+    /// there, up to the count the last quote covered; code 1 when there are none.
+    pub const OP_RUNTIME_LOG: u64 = 3;
 }
 
 /// The key server (the task named "keys", `user/unlocker`): a stand-in for a local key store.
@@ -862,17 +888,21 @@ pub mod net {
     }
 }
 
-/// A task's network declarations from the manifest (`task_listen`).
+/// A task's network declarations (`task_listen`): from the manifest, or for a slot from its
+/// service's signed descriptor.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ListenInfo {
     service: [u8; 32],
     service_len: u64,
-    /// Bit 0: may route (`routes = true`).
+    /// Bit 0: may route (`routes = true`); bit 1: may connect out (`connects = true`); bit 2: is
+    /// a generic slot (RFD 2).
     pub flags: u64,
     pub count: u64,
     /// (port, max_connections, max_per_source, 0)
     pub ports: [[u16; 4]; 8],
+    /// The signed version running (0 for an empty slot).
+    pub version: u64,
 }
 
 impl ListenInfo {
@@ -882,6 +912,14 @@ impl ListenInfo {
 
     pub fn may_route(&self) -> bool {
         self.flags & 1 != 0
+    }
+
+    pub fn may_connect(&self) -> bool {
+        self.flags & 2 != 0
+    }
+
+    pub fn is_slot(&self) -> bool {
+        self.flags & 4 != 0
     }
 
     /// (max_connections, max_per_source) if the task may listen on `port`.
@@ -1067,4 +1105,60 @@ extern "C" fn start() -> ! {
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     exit(101)
+}
+
+/// Loading service images into generic slots (RFD 2), for the task with `loads = true`.
+pub mod slot {
+    use super::{SYS_SLOT_LOAD, SYS_SLOT_STAGE, SYS_SLOT_UNLOAD, err, syscall6};
+
+    /// Copy part of an image into empty slot `slot`'s image area, at `offset`.
+    pub fn stage(slot: u64, offset: u64, bytes: &[u8]) -> Result<(), u64> {
+        let (status, _, _) = syscall6(SYS_SLOT_STAGE, [slot, offset, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0]);
+        if status == 0 { Ok(()) } else { Err(status) }
+    }
+
+    /// Stage a whole image in 64 KiB pieces.
+    pub fn stage_all(slot: u64, image: &[u8]) -> Result<(), u64> {
+        for (i, chunk) in image.chunks(64 * 1024).enumerate() {
+            stage(slot, (i * 64 * 1024) as u64, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Check and start the staged image with its signature file and descriptor. Returns the
+    /// slot's new id, or `Err((err::REJECTED, reason))`, `Err((err::BUSY, 0))`, ...
+    pub fn load(slot: u64, sig: &[u8], descriptor: &[u8]) -> Result<u64, (u64, u64)> {
+        let args = [slot, sig.as_ptr() as u64, sig.len() as u64, descriptor.as_ptr() as u64, descriptor.len() as u64, 0];
+        let (id, reason, _) = syscall6(SYS_SLOT_LOAD, args);
+        if err::is_error(id) { Err((id, reason)) } else { Ok(id) }
+    }
+
+    /// Empty a slot whose service has ended.
+    pub fn unload(slot: u64) -> Result<(), u64> {
+        let (status, _, _) = syscall6(SYS_SLOT_UNLOAD, [slot, 0, 0, 0, 0, 0]);
+        if status == 0 { Ok(()) } else { Err(status) }
+    }
+}
+
+/// For the task with `tpm = true`: hold the TPM around commands, so the kernel never extends a
+/// PCR in the middle of one.
+pub fn tpm_lock() -> Result<(), u64> {
+    let (status, _, _) = syscall6(SYS_TPM_LOCK, [0; 6]);
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
+pub fn tpm_unlock() -> Result<(), u64> {
+    let (status, _, _) = syscall6(SYS_TPM_UNLOCK, [0; 6]);
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
+/// Bytes per run-time log entry: operation (1 load, 2 unload), slot index, 6 zero bytes,
+/// service name (32), version (8), SHA-256 of the signed statement (32).
+pub const RUNTIME_ENTRY_LEN: usize = 80;
+
+/// For the task with `tpm = true`: run-time log entries from `start` into `buf`. Returns
+/// (entries copied, entries in the log).
+pub fn runtime_log(buf: &mut [u8], start: usize) -> Result<(usize, usize), u64> {
+    let (count, total, _) = syscall6(SYS_RUNTIME_LOG, [buf.as_mut_ptr() as u64, buf.len() as u64, start as u64, 0, 0, 0]);
+    if err::is_error(count) { Err(count) } else { Ok((count as usize, total as usize)) }
 }

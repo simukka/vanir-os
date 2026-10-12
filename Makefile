@@ -11,7 +11,12 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest net http mgmt-echo switcher
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest net http mgmt-echo switcher agent
+# Service images for generic slots (RFD 2), built into build/slots/: <name>:<program>:<descriptor>.
+# The agent is built after them, since its test scripts carry them.
+SLOT_IMAGES    := web-v1:http:tests/slots/web-v1.toml web-v2:http:tests/slots/web-v2.toml \
+                  web-floor:http:tests/slots/web-floor.toml web-large:http:tests/slots/web-large.toml \
+                  hello:hello:tests/slots/hello.toml crasher:crasher:tests/slots/crasher.toml
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -27,6 +32,8 @@ SIGNING_PUB    := $(SIGNING_KEY:.key=.pub)
 # The public key compiled into the kernel: images must be signed with its private half.
 TRUSTED_PUB    := $(SIGNING_PUB)
 SIGN_VERSION   := 1
+# Slot images are signed with this key (the rogue-key test changes it).
+SLOT_SIGNING_KEY := $(SIGNING_KEY)
 # Tests of the signature checks: changed after signing, shipped unsigned, signatures swapped (a:b).
 TAMPER         :=
 UNSIGNED       :=
@@ -93,7 +100,10 @@ QEMU_FLAGS     := $(BOOT_FLAGS) $(CPU_FLAGS) -serial stdio -display none \
                   -chardev file,id=tel,path=$(CONSOLE_LOG) -device virtconsole,chardev=tel,bus=vser.0 \
                   $(VSOCK_FLAGS) $(DISK_FLAGS) $(NET_FLAGS)
 
-USER_CARGO_FEATURES   := $(if $(USER_FEATURES),--features "$(USER_FEATURES)")
+# The agent embeds the slot images, so it's built in a second cargo run, with its own features.
+BUILD_PROGS           := $(filter-out agent,$(USER_PROGS))
+USER_CARGO_FEATURES   := $(if $(filter-out agent/%,$(USER_FEATURES)),--features "$(filter-out agent/%,$(USER_FEATURES))")
+AGENT_CARGO_FEATURES  := $(if $(filter agent/%,$(USER_FEATURES)),--features "$(filter agent/%,$(USER_FEATURES))")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
 
 .PHONY: all iso esp image disk kernel user run run-debug test qemu-cmd clean distclean FORCE
@@ -115,10 +125,21 @@ $(SIGNING_KEY):
 	@mkdir -p $(dir $@)
 	tools/sign-image.py gen-key $(SIGNING_KEY) $(SIGNING_PUB)
 
-user: $(SIGNING_KEY) FORCE
-	cargo build $(addprefix -p ,$(USER_PROGS)) --$(PROFILE) $(USER_CARGO_FEATURES)
-	@mkdir -p build
-	for p in $(USER_PROGS); do objcopy --strip-all $(TARGET_DIR)/$$p build/$$p.elf; done
+ifneq ($(SLOT_SIGNING_KEY),$(SIGNING_KEY))
+$(SLOT_SIGNING_KEY):
+	@mkdir -p $(dir $@)
+	tools/sign-image.py gen-key $@ $(@:.key=.pub)
+endif
+
+user: $(SIGNING_KEY) $(SLOT_SIGNING_KEY) FORCE
+	cargo build $(addprefix -p ,$(BUILD_PROGS)) --$(PROFILE) $(USER_CARGO_FEATURES)
+	@mkdir -p build/slots
+	for p in $(BUILD_PROGS); do objcopy --strip-all $(TARGET_DIR)/$$p build/$$p.elf; done
+	for s in $(SLOT_IMAGES); do set -- $$(echo $$s | tr : ' '); \
+	    cp build/$$2.elf build/slots/$$1.elf; \
+	    tools/sign-image.py sign-slot $(SLOT_SIGNING_KEY) build/slots/$$1.elf $$3 build/slots/$$1 || exit 1; done
+	VANIR_SLOTS="$(abspath build/slots)" cargo build -p agent --$(PROFILE) $(AGENT_CARGO_FEATURES)
+	objcopy --strip-all $(TARGET_DIR)/agent build/agent.elf
 	tools/sign-image.py sign-all $(SIGNING_KEY) build $(USER_PROGS) --version $(SIGN_VERSION)
 
 kernel: user

@@ -1,0 +1,4 @@
+# A service that faults at once: restarted from its slot's image area (slot-restart).
+name = "crasher"
+version = 1
+slot_class = "small"

@@ -40,11 +40,13 @@ struct FrameAllocator {
     next: u64,
     /// Head of the list of freed frames (0 = empty); each free frame's first word links the next.
     free: u64,
+    /// Frames on that list.
+    free_count: u64,
     in_use: u64,
 }
 
 static FRAMES: Mutex<FrameAllocator> =
-    Mutex::new(FrameAllocator { regions: &[], region: 0, next: 0, free: 0, in_use: 0 });
+    Mutex::new(FrameAllocator { regions: &[], region: 0, next: 0, free: 0, free_count: 0, in_use: 0 });
 static mut HHDM_OFFSET: u64 = 0;
 /// Limine's top-level table: the source of the kernel half for every address space.
 static mut KERNEL_PML4: u64 = 0;
@@ -54,7 +56,7 @@ pub fn init(hhdm_offset: u64, memmap: &'static [&'static Entry]) {
         HHDM_OFFSET = hhdm_offset;
         KERNEL_PML4 = Cr3::read().0.start_address().as_u64();
     }
-    *FRAMES.lock() = FrameAllocator { regions: memmap, region: 0, next: 0, free: 0, in_use: 0 };
+    *FRAMES.lock() = FrameAllocator { regions: memmap, region: 0, next: 0, free: 0, free_count: 0, in_use: 0 };
 }
 
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
@@ -68,6 +70,7 @@ pub fn alloc_frame() -> u64 {
     if a.free != 0 {
         let frame = a.free;
         a.free = unsafe { *(phys_to_virt(frame) as *const u64) };
+        a.free_count -= 1;
         unsafe { phys_to_virt(frame).write_bytes(0, PAGE_SIZE as usize) };
         return frame;
     }
@@ -113,11 +116,27 @@ pub fn free_frame(frame: u64) {
     let mut a = FRAMES.lock();
     unsafe { *(phys_to_virt(frame) as *mut u64) = a.free };
     a.free = frame;
+    a.free_count += 1;
     a.in_use -= 1;
 }
 
 pub fn frames_in_use() -> u64 {
     FRAMES.lock().in_use
+}
+
+/// Frames that can still be allocated: the free list, plus what the bump allocator hasn't reached.
+pub fn frames_available() -> u64 {
+    let a = FRAMES.lock();
+    let mut available = a.free_count;
+    for (i, entry) in a.regions.iter().enumerate().skip(a.region) {
+        if entry.entry_type != EntryType::USABLE {
+            continue;
+        }
+        let start = entry.base.next_multiple_of(PAGE_SIZE);
+        let from = if i == a.region { a.next.max(start) } else { start };
+        available += (entry.base + entry.length).saturating_sub(from) / PAGE_SIZE;
+    }
+    available
 }
 
 fn table(phys: u64) -> &'static mut [u64; 512] {

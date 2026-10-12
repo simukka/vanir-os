@@ -1,0 +1,7 @@
+# The HTTP service as a slot image (RFD 2): what it may do, signed with it.
+name = "web"
+version = 1
+min_version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+drain = { default_secs = 30, max_secs = 300 }

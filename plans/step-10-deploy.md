@@ -1,6 +1,6 @@
 # Step 10 plan: deployment (RFD 2)
 
-Status: planned, not implemented.
+Status: in progress: D1 and D2 done. See "As built" at the end for where the implementation departs from this plan.
 
 ## Goal
 
@@ -250,3 +250,32 @@ KVM-only, as today).
   KVM only.
 - **Run-time log in every quote.** 80 KB of entries at full log. Fine for tests; later the
   verifier can ask for entries after the last one it has.
+
+## As built
+
+Where it departs from the plan so far:
+
+- **D1 test features.** Tests whose only work is a crash loop can't end if restarts never stop,
+  so `supervisor-restart`, `restart-no-leak` and the telemetry cases use `give-up-after-3` or
+  `give-up-after-3000` (with `backoff-fast`, which restarts at once). `crash-loop` uses
+  `halt-on-exit` and `spinner/spin-2s` instead. Crash events go to telemetry through a new
+  generic `telemetry::OP_EVENT`, with the crashed task in `of` and `index`.
+- **Slot memory is checked at load, not at run time.** A task's memory is fixed once it is
+  loaded (no syscall grows it), so the kernel counts the frames a slot image's address space
+  takes when it builds it, and refuses the image if that is over `memory_pages`
+  (`slot-memory`, reason "image needs more memory than its slot class has"). The boot check
+  that free memory covers every slot at its limit replaces the reserve kept in the allocator.
+- **Same program, two versions.** `web-v1` and `web-v2` are the same `http` ELF signed with
+  different descriptors; `http` in a slot calls itself `web v1 on small-0`, so tests can tell
+  them apart without building `http` twice.
+- **Refusals.** New reasons `BadDescriptor`, `WrongDescriptor`, `ClassMismatch`, `TooLarge`,
+  `BadElf` and `BelowFloor` ("version below its min_version": the boot message talks about
+  the manifest). Staging past the image area fails with `TOO_LONG` (`slot-image-size`).
+- **Test names.** `slot-tampered-image` and `slot-tampered-desc` replace `slot-tampered`;
+  `slot-below-floor` replaces `slot-too-old`; `slot-occupied` stages over a slot holding an
+  image that has ended (any slot that isn't empty refuses).
+- **Run-time log transport.** A quote says how many run-time entries it covers
+  (`runtime_count`); `control` then fetches them from `attest` (`OP_RUNTIME_LOG`, 20 per JSON
+  line) and forwards them. `attest` holds the TPM lock over a whole quote (quote, PCR reads,
+  entry count) so the three agree. `host-agent.py` waits for those entries before releasing a
+  key, and `--attest-delay` lets `slot-attest` challenge after the load.

@@ -1,0 +1,5 @@
+# Asks for a large slot: refused by a small one (slot-class).
+name = "web"
+version = 1
+slot_class = "large"
+listen = [{ port = 80, max_connections = 64 }]

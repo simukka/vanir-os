@@ -28,6 +28,12 @@ pub const SYS_MEASUREMENTS: u64 = 115;
 pub const SYS_NOTIFY: u64 = 116;
 pub const SYS_HALT: u64 = 117;
 pub const SYS_TASK_LISTEN: u64 = 118;
+pub const SYS_SLOT_STAGE: u64 = 119;
+pub const SYS_SLOT_LOAD: u64 = 120;
+pub const SYS_SLOT_UNLOAD: u64 = 121;
+pub const SYS_TPM_LOCK: u64 = 122;
+pub const SYS_TPM_UNLOCK: u64 = 123;
+pub const SYS_RUNTIME_LOG: u64 = 124;
 
 const ERROR: u64 = u64::MAX;
 
@@ -57,6 +63,12 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_HALT => process::halt(frame),
         SYS_TASK_LISTEN => process::task_listen(frame),
         SYS_TASK_STATE => process::task_state(frame),
+        SYS_SLOT_STAGE => process::slot_stage(frame),
+        SYS_SLOT_LOAD => process::slot_load(frame),
+        SYS_SLOT_UNLOAD => process::slot_unload(frame),
+        SYS_TPM_LOCK => process::tpm_lock(frame, true),
+        SYS_TPM_UNLOCK => process::tpm_lock(frame, false),
+        SYS_RUNTIME_LOG => process::runtime_log(frame),
         _ => frame.rax = ERROR,
     }
 }

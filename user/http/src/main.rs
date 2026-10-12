@@ -20,7 +20,7 @@
 use core::fmt::Write;
 use vanir_user::net::{self, CODE_CLOSED, EV_ACCEPT, EV_CLOSED, EV_DRAIN, EV_READ, EV_WRITE, Event};
 use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
-use vanir_user::{err, getpid, lookup, println, rdtsc, sleep, task_name, uptime};
+use vanir_user::{err, getpid, lookup, println, rdtsc, sleep, task_listen, task_name, uptime};
 
 vanir_user::entry!(main);
 
@@ -508,6 +508,16 @@ fn main() -> u64 {
     let me = task_name(getpid(), &mut name).unwrap_or("http").len();
     s.name = name;
     s.name_len = me;
+    // In a generic slot (RFD 2), say which service and version this is, and where.
+    if let Ok(info) = task_listen(getpid())
+        && info.is_slot()
+    {
+        let mut w = Buf { buf: &mut s.name, len: 0 };
+        let service = core::str::from_utf8(info.service()).unwrap_or("?");
+        let slot = core::str::from_utf8(&name[..me]).unwrap_or("?");
+        let _ = write!(w, "{} v{} on {}", service, info.version, slot);
+        s.name_len = w.len;
+    }
     s.cycles_per_tick = vanir_user::tsc_per_tick();
     s.attach();
 

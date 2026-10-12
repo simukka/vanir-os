@@ -1,0 +1,36 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "agent"
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+
+[features]
+# Test scripts, standing in for the control plane until there is one. Each carries the slot
+# images it needs (built into build/slots by the Makefile).
+test-images = []
+# load web v1 into small-0, then wait
+script-load = ["test-images"]
+# load hello into small-0 and unload it again after it exits, 200 times, then exit
+script-hello-loop = ["test-images"]
+# load crasher into small-0 (the supervisor restarts it), then wait
+script-crasher = ["test-images"]
+# load hello, unload, load, unload, ... until the run-time log is full, then exit
+script-fill-log = ["test-images"]
+# load hello into small-0, retrying while the TPM is busy, then exit
+script-load-retry = ["test-images"]
+# try to load something the kernel must refuse into small-0, then exit:
+try-unsigned = ["test-images"]        # no signature
+try-tampered-image = ["test-images"]  # a byte of the image changed after signing
+try-tampered-desc = ["test-images"]   # a byte of the descriptor changed after signing
+try-boot-sig = ["test-images"]        # a boot image's signature file (VNRSIG01)
+try-floor = ["test-images"]           # version below the descriptor's min_version
+try-large = ["test-images"]           # descriptor asks for another slot class
+try-occupied = ["test-images"]        # load web v1, then stage over it while it runs
+try-web-v1 = ["test-images"]          # web v1 (with a manifest or key that must refuse it)

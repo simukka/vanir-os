@@ -23,10 +23,16 @@ fn main() {
     println!("cargo:rerun-if-changed={app}");
     let text = std::fs::read_to_string(&app).unwrap_or_else(|e| panic!("{app}: {e}"));
     let manifest: Table = text.parse().unwrap_or_else(|e| panic!("{app}: {e}"));
+    for key in manifest.keys() {
+        assert!(["task", "slot_class", "runtime_log"].contains(&key.as_str()), "{app}: unknown top-level key {key}");
+    }
     let tasks = match manifest.get("task") {
         Some(Value::Array(tasks)) => tasks,
         _ => panic!("{app}: expected one or more [[task]] tables"),
     };
+    // Length of the kernel's run-time measurement log (RFD 2, P6): loads refused once it's full.
+    let runtime_log = manifest.get("runtime_log").map_or(1024, |v| v.as_integer().expect("runtime_log: integer"));
+    assert!((1..=65536).contains(&runtime_log), "{app}: runtime_log must be 1..=65536");
 
     let names: Vec<&str> = tasks
         .iter()
@@ -35,6 +41,7 @@ fn main() {
     let mut supervisors = 0;
     let mut readers = 0;
     let mut tpm_users = 0;
+    let mut loaders = 0;
     // (port, task, service) for every listen declaration so far.
     let mut ports: Vec<(u16, String, String)> = vec![];
     let mut out = String::from("pub static TASKS: &[Task] = &[\n");
@@ -43,7 +50,7 @@ fn main() {
         for key in task.keys() {
             let known = [
                 "name", "program", "budget", "supervisor", "sends", "devices", "dma_pages", "events", "min_version", "tpm", "service",
-                "listen", "routes",
+                "listen", "routes", "loads", "connects",
             ];
             assert!(known.contains(&key.as_str()), "{app}: task {name}: unknown key {key}");
         }
@@ -93,6 +100,9 @@ fn main() {
         let service = task.get("service").map_or(*name, |v| v.as_str().expect("service: string"));
         assert!(!service.is_empty() && service.len() <= 32, "{app}: {name}: service name must be 1..=32 bytes");
         let routes = task.get("routes").is_some_and(|v| v.as_bool().expect("routes: bool"));
+        let loads = task.get("loads").is_some_and(|v| v.as_bool().expect("loads: bool"));
+        loaders += loads as u32;
+        let connects = task.get("connects").is_some_and(|v| v.as_bool().expect("connects: bool"));
         let listen: Vec<(u16, u16, u16)> = match task.get("listen") {
             None => vec![],
             Some(v) => v
@@ -138,15 +148,78 @@ fn main() {
             out,
             "    Task {{ name: {name:?}, program: {program:?}, budget_ticks: {budget}, \
              supervisor: {supervisor}, sends: &{sends:?}, devices: &{devices:?}, dma_pages: {dma_pages}, events: {events}, min_version: {min_version}, tpm: {tpm}, \
-             service: {service:?}, listen: &[{}], routes: {routes} }},",
+             service: {service:?}, listen: &[{}], routes: {routes}, loads: {loads}, connects: {connects}, class: None }},",
             listen.join(", ")
         )
         .unwrap();
     }
+
+    // Generic slots (RFD 2, P1): each class becomes `count` table entries named <class>-<i>, after
+    // the tasks. A slot runs whatever signed service image the task with `loads = true` puts in it.
+    let mut classes = String::from("pub static SLOT_CLASSES: &[SlotClass] = &[\n");
+    let mut slots = 0;
+    let class_list = match manifest.get("slot_class") {
+        None => &vec![],
+        Some(v) => v.as_array().expect("[[slot_class]] tables"),
+    };
+    let mut class_names: Vec<&str> = vec![];
+    for (index, class) in class_list.iter().enumerate() {
+        let class = class.as_table().expect("[[slot_class]] tables");
+        for key in class.keys() {
+            let known = ["name", "count", "memory_pages", "image_pages", "budget", "sends"];
+            assert!(known.contains(&key.as_str()), "{app}: slot_class: unknown key {key}");
+        }
+        let name = class.get("name").and_then(Value::as_str).unwrap_or_else(|| panic!("{app}: slot_class without name"));
+        assert!(!name.is_empty() && name.len() <= 16, "{app}: slot class name {name:?} must be 1..=16 bytes");
+        assert!(!class_names.contains(&name), "{app}: duplicate slot class {name}");
+        class_names.push(name);
+        let int = |key: &str, range: std::ops::RangeInclusive<i64>| {
+            let v = class.get(key).unwrap_or_else(|| panic!("{app}: slot class {name}: no {key}"));
+            let v = v.as_integer().unwrap_or_else(|| panic!("{app}: slot class {name}: {key} must be an integer"));
+            assert!(range.contains(&v), "{app}: slot class {name}: {key} = {v} is outside {range:?}");
+            v
+        };
+        let count = int("count", 1..=32);
+        let memory_pages = int("memory_pages", 32..=1 << 20);
+        let image_pages = int("image_pages", 1..=4096);
+        let budget = class.get("budget").map_or(0, |v| v.as_integer().expect("budget: integer"));
+        let sends: Vec<usize> = match class.get("sends") {
+            None => vec![],
+            Some(v) => v
+                .as_array()
+                .expect("sends: array of task names")
+                .iter()
+                .map(|t| {
+                    let t = t.as_str().expect("sends: task names");
+                    names.iter().position(|n| *n == t).unwrap_or_else(|| panic!("{app}: slot class {name} sends to unknown task {t}"))
+                })
+                .collect(),
+        };
+        writeln!(classes, "    SlotClass {{ name: {name:?}, memory_pages: {memory_pages}, image_pages: {image_pages} }},").unwrap();
+        for i in 0..count {
+            let slot = format!("{name}-{i}");
+            assert!(!names.contains(&slot.as_str()), "{app}: slot {slot} has the name of a task");
+            writeln!(
+                out,
+                "    Task {{ name: {slot:?}, program: \"\", budget_ticks: {budget}, supervisor: false, sends: &{sends:?}, devices: &[], \
+                 dma_pages: 0, events: false, min_version: 0, tpm: false, service: \"\", listen: &[], routes: false, loads: false, \
+                 connects: false, class: Some(&SLOT_CLASSES[{index}]) }},"
+            )
+            .unwrap();
+            slots += 1;
+        }
+    }
+    classes.push_str("];\n");
+    let total = tasks.len() + slots;
+    assert!(total <= 64, "{app}: {total} tasks and slots; at most 64");
     assert!(supervisors <= 1, "{app}: at most one supervisor");
     assert!(readers <= 1, "{app}: at most one task may read the event log");
     assert!(tpm_users <= 1, "{app}: at most one task may use the TPM");
+    assert!(loaders <= 1, "{app}: at most one task may load images");
     out.push_str("];\n");
+    out.push_str(&classes);
+    out.push_str(&format!("pub const MAX_PROCESSES: usize = {total};\n"));
+    out.push_str(&format!("pub const RUNTIME_LOG: usize = {runtime_log};\n"));
     // The manifest itself, measured into the TPM at boot.
     out.push_str(&format!("pub static MANIFEST: &str = include_str!({app:?});\n"));
     let out_dir = std::env::var("OUT_DIR").unwrap();

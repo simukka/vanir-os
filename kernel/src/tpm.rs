@@ -1,5 +1,6 @@
-//! Just enough of a TPM 2.0 driver (CRB interface, locality 0) to measure the boot: extend
-//! PCRs and read them back. The kernel uses the TPM only before any task runs.
+//! Just enough of a TPM 2.0 driver (CRB interface, locality 0) to measure the boot and what
+//! is loaded at run time: extend PCRs and read them back. Once tasks run, the attestation task
+//! uses the TPM too; `measure` keeps the lock that keeps the two apart.
 
 use core::ptr::{read_volatile, write_volatile};
 use sha2::{Digest, Sha256};

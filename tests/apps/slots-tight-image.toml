@@ -1,0 +1,10 @@
+# A class whose image area can't hold the HTTP service's image (about 400 KiB).
+[[task]]
+name = "agent"
+loads = true
+
+[[slot_class]]
+name = "small"
+count = 1
+memory_pages = 256
+image_pages = 64
