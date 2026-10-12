@@ -39,6 +39,8 @@ SLOT_SIGNING_KEY := $(SIGNING_KEY)
 # dials (the host, through slirp, on the management network).
 CP_KEY         := keys/cp-noise.key
 CP_ADDR        := 10.0.2.2:7000
+# The node's name in the agent's reports (two-node tests build "a" and "b").
+NODE           := a
 # Tests of the signature checks: changed after signing, shipped unsigned, signatures swapped (a:b).
 TAMPER         :=
 UNSIGNED       :=
@@ -147,7 +149,7 @@ user: $(SIGNING_KEY) $(SLOT_SIGNING_KEY) $(CP_KEY) FORCE
 	    cp build/$$2.elf build/slots/$$1.elf; \
 	    tools/sign-image.py sign-slot $(SLOT_SIGNING_KEY) build/slots/$$1.elf $$3 build/slots/$$1 || exit 1; done
 	VANIR_SLOTS="$(abspath build/slots)" VANIR_CP_PUB="$(abspath $(dir $(CP_KEY))cp-noise.pub)" \
-	    VANIR_CP_SIGN_PUB="$(abspath $(dir $(CP_KEY))cp-sign.pub)" VANIR_CP_ADDR="$(CP_ADDR)" \
+	    VANIR_CP_SIGN_PUB="$(abspath $(dir $(CP_KEY))cp-sign.pub)" VANIR_CP_ADDR="$(CP_ADDR)" VANIR_NODE="$(NODE)" \
 	    cargo build -p agent --$(PROFILE) $(AGENT_CARGO_FEATURES)
 	objcopy --strip-all $(TARGET_DIR)/agent build/agent.elf
 	tools/sign-image.py sign-all $(SIGNING_KEY) build $(USER_PROGS) --version $(SIGN_VERSION)

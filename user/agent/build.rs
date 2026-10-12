@@ -16,6 +16,11 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
         println!("cargo:rustc-env={var}={path}");
     }
+    // The node's name in reports (tests run two nodes from one tree). A real fleet would name
+    // a node by its TPM's attestation key instead.
+    println!("cargo:rerun-if-env-changed=VANIR_NODE");
+    let node = std::env::var("VANIR_NODE").unwrap_or_else(|_| "a".into());
+    println!("cargo:rustc-env=VANIR_NODE={node}");
     println!("cargo:rerun-if-env-changed=VANIR_CP_ADDR");
     let addr = std::env::var("VANIR_CP_ADDR").unwrap_or_else(|_| "10.0.2.2:7000".into());
     println!("cargo:rustc-env=VANIR_CP_ADDR={addr}");

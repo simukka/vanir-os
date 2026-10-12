@@ -1016,6 +1016,20 @@ pub fn stop(frame: &mut TrapFrame) {
     frame.rax = 0;
 }
 
+/// `reboot()`: reset the machine, so it boots whatever image is installed now (RFD 2, P3:
+/// evacuate and update). Supervisor only; the agent asks it, and only when it runs no instances.
+/// Under QEMU with `-no-reboot`, QEMU exits with status 0 instead.
+pub fn reboot(frame: &mut TrapFrame) {
+    let table = TABLE.lock();
+    if table.supervisor != Some(table.current) {
+        drop(table);
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    println!("[kernel] rebooting");
+    crate::reset()
+}
+
 /// `halt(code)`: stop the system now, reporting every task's state as when nothing can run.
 /// Supervisor only: it decides when a run is over (e.g. tests whose servers never go idle).
 pub fn halt(frame: &mut TrapFrame) {

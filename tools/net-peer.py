@@ -594,6 +594,19 @@ def rollback_under_load(args):
 
 
 @scenario
+def move_under_load(args):
+    """web moves from node a to node b, through the control plane's load balancer (RFD 2, D5;
+    NET_PORT is the load balancer's port)."""
+    return under_load(args, ["web v1 on small-0", "web v1 on small-1"])
+
+
+@scenario
+def evacuate_under_load(args):
+    """web moves from node a to node b, node a updates and reboots, and web moves back."""
+    return under_load(args, ["web v1 on small-0", "web v1 on small-1", "web v1 on small-0"])
+
+
+@scenario
 def drain_deadline(args):
     """Hold a connection to web-1 open without sending anything while it is drained: it is
     reset at the drain's deadline."""

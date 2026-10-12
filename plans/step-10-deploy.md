@@ -1,6 +1,6 @@
 # Step 10 plan: deployment (RFD 2)
 
-Status: in progress: D1 to D4 done. See "As built" at the end for where the implementation departs from this plan.
+Status: implemented (D1-D5). See "As built" at the end for where the implementation departs from this plan.
 
 ## Goal
 
@@ -302,3 +302,16 @@ Where it departs from the plan so far:
   `agent-telemetry` is folded into `agent-drain` (which checks `build/cp-telemetry.log`).
   `noise-vectors` checks both Noise implementations against the cacophony vector, from a new
   `HOST_CHECKS` stage in `tests/run.sh`.
+- **D5's nodes and harness.** Nodes are named in their reports (`report <generation> node <name>
+  image <version>`); the name is built into the agent (`NODE=a|b`), standing in for naming a
+  node by its TPM's attestation key. `tests/two-nodes.sh` builds both images, runs both QEMUs,
+  and boots node a again from its updated image when it reboots (`-no-reboot` makes QEMU exit
+  with status 0). The control plane's load balancer is a thread in `tools/control-plane.py`
+  (`--lb`, `--backend`), which lingers until the harness stops it so the peer's last request gets
+  through. `commit` unloads a service's stopped slots whether or not it is live on the same node
+  (after a move it isn't). `update-refused` runs on one node.
+- **Reboot** is a supervisor-only syscall (`reboot`, the 8042 reset line, then a triple fault),
+  asked for with `supervisor::OP_REBOOT`.
+- **Flaky test, from before this step.** `http-restart` fails intermittently on `main` too
+  (requests fail after `web` restarts): it failed in the baseline run and passed in the final
+  one. Nothing in this step changes it.

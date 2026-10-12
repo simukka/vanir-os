@@ -121,6 +121,21 @@ pub fn halt(code: u8) -> ! {
     }
 }
 
+/// Reset the machine through the 8042 keyboard controller's reset line, or, if that does
+/// nothing, by triple faulting (an empty IDT, then an interrupt).
+pub fn reset() -> ! {
+    cpu_interrupts::disable();
+    unsafe { Port::<u8>::new(0x64).write(0xfe) };
+    for _ in 0..1_000_000 {
+        core::hint::spin_loop();
+    }
+    let empty = x86_64::structures::DescriptorTablePointer { limit: 0, base: x86_64::VirtAddr::new(0) };
+    unsafe {
+        x86_64::instructions::tables::lidt(&empty);
+        core::arch::asm!("int3", options(noreturn));
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial::print_unlocked(format_args!("\n[kernel] PANIC: {}\n", info));

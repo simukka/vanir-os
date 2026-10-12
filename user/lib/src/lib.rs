@@ -39,6 +39,7 @@ pub const SYS_TPM_LOCK: u64 = 122;
 pub const SYS_TPM_UNLOCK: u64 = 123;
 pub const SYS_RUNTIME_LOG: u64 = 124;
 pub const SYS_STOP: u64 = 125;
+pub const SYS_REBOOT: u64 = 126;
 
 /// The most tasks (fixed tasks and slots) a manifest may declare; size per-task tables with it.
 pub const MAX_TASKS: usize = 64;
@@ -213,6 +214,11 @@ pub fn stop(id: u64) -> Result<(), u64> {
     if status == 0 { Ok(()) } else { Err(status) }
 }
 
+/// Supervisor only: reset the machine (returns only on error).
+pub fn reboot() -> u64 {
+    syscall6(SYS_REBOOT, [0; 6]).0
+}
+
 /// Requests to the supervisor (from the agent, RFD 2, P4). Message: a task id (u64). Reply
 /// code 0 and the new id (u64) on success; otherwise 0x100 | the kernel error's low bits.
 pub mod supervisor {
@@ -222,6 +228,9 @@ pub mod supervisor {
     pub const OP_STOP: u64 = 1;
     /// Start a dead task again (e.g. a stopped slot, for a rollback), with its backoff reset.
     pub const OP_START: u64 = 2;
+    /// Reboot the node into the image installed now (message: anything). Only answered if it
+    /// fails.
+    pub const OP_REBOOT: u64 = 3;
 
     fn call(supervisor: u64, op: u64, id: u64) -> Result<u64, u64> {
         let mut out = [0u8; 8];
@@ -239,6 +248,11 @@ pub mod supervisor {
     /// Returns the task's new id.
     pub fn start(supervisor: u64, id: u64) -> Result<u64, u64> {
         call(supervisor, OP_START, id)
+    }
+
+    /// Returns only if the supervisor refused.
+    pub fn reboot(supervisor: u64) -> u64 {
+        call(supervisor, OP_REBOOT, 0).err().unwrap_or(0)
     }
 }
 

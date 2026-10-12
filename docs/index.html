@@ -188,6 +188,7 @@ td code { white-space: nowrap; }
       <li><a href="#deploy-measuring">15.3 Measuring what runs</a></li>
       <li><a href="#deploy-lifecycle">15.4 The lifecycle and the local swap</a></li>
       <li><a href="#deploy-control">15.5 The agent and the control plane</a></li>
+      <li><a href="#deploy-moves">15.6 Moves, evacuation and updates</a></li>
     </ul>
   </li>
   <li><a href="#syscalls">16. Syscalls</a></li>
@@ -266,7 +267,7 @@ network stacks, with routing and draining between instances.</p>
 
 <p>Install the dependencies (<a href="#dependencies">26</a>), then:</p>
 <pre><code>make run                                   # build the ISO and boot it in QEMU
-make test                                  # boot all 85 scenarios and check each one
+make test                                  # boot all 123 scenarios and check each one
 make test ACCEL=kvm                        # the same under KVM
 make run APP=tests/apps/two-spinners.toml  # boot a different set of tasks</code></pre>
 
@@ -1350,6 +1351,32 @@ the cacophony test vector in <code>tests/vectors/noise-ik.json</code> (<code>noi
 a host check). <code>tools/control-plane.py gen-keys keys</code> makes the dev keys on the first
 build; tests run it with <code>CP=&lt;scenario&gt;</code> (<a href="#build">20</a>).</p>
 
+<h3 id="deploy-moves"><span class="num">15.6</span>Moves, evacuation and updates<a class="anchor" href="#deploy-moves">#</a></h3>
+
+<p>A <strong>move</strong> takes a service to another node with the same pieces as a swap,
+driven by the control plane: it makes the service live on the new node, sends new connections
+there (its load balancer), then drains and stops the old instance and commits. Clients of the old
+node get <code>Connection: close</code> on their next request and reconnect through the load
+balancer to the new one (<code>move-under-load</code>: eight clients, no failed request).</p>
+
+<p>A node's own image (kernel, drivers, <code>net</code>, the agent) only changes when it runs
+no instances (RFD 2, determination 1). The desired-state line <code>update</code> is refused by a
+node with instances, and its report says how many (<code>agent-update-refused</code>). The
+control plane <strong>evacuates</strong> it first, moving each instance away; an empty node then
+asks the supervisor to reboot it (<code>supervisor::OP_REBOOT</code>, the kernel's
+<code>reboot</code>: the 8042 reset line), and comes back with the image installed now. Its
+reports carry the node's name and its own signed version, so the control plane sees which image
+it rejoined with (<code>evacuate-update</code>: node a refuses, is evacuated to node b, reboots
+into an image signed as version 2, rejoins, and the service moves back, all under load).</p>
+
+<p><code>tests/two-nodes.sh</code> runs these cases: two images from one tree (agent built with
+<code>NODE=a</code> or <code>b</code>; with <code>UPDATE=1</code> a second one for node a with
+<code>SIGN_VERSION=2</code>), two QEMUs (data ports 8080 and 8090), the control plane with its
+load balancer on port 8000, and the peer through it. QEMU runs with <code>-no-reboot</code>, so a
+reboot ends it with status 0, and the harness boots node a again from the updated image, standing
+in for an A/B update of its disk. Staging that image on a real disk is out of scope (RFD 2's
+plan).</p>
+
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
 <p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
@@ -1386,6 +1413,7 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
 <tr><td><code>tpm_lock()</code>, <code>tpm_unlock()</code></td><td>122, 123</td><td>TPM task only: hold the TPM around commands</td></tr>
 <tr><td><code>runtime_log(buf, cap, start)</code></td><td>124</td><td>TPM task only &rarr; <code>(count, total)</code> run-time log entries</td></tr>
 <tr><td><code>stop(id)</code></td><td>125</td><td>supervisor only: end a live task on purpose; reported as stopped (death kind 5)</td></tr>
+<tr><td><code>reboot()</code></td><td>126</td><td>supervisor only: reset the machine (QEMU with <code>-no-reboot</code> exits with status 0)</td></tr>
 </table>
 
 <p><code>recv</code> flags (in <code>rdx</code>): <code>RECV_EXPECT_IRQ</code> (1),
@@ -1430,6 +1458,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Swap and rollback through ready checks and drains</td><td>failed requests during a deployment; traffic sent to an instance that never got ready</td><td><code>deploy-under-load</code>, <code>rollback-under-load</code>, <code>deploy-not-ready</code></td></tr>
 <tr><td>Control plane key pinned; Noise IK; node keys bound to a TPM quote</td><td>a node taking orders from someone else; a control plane trusting an unattested node</td><td><code>agent-wrong-cp-key</code>, <code>agent-attested</code>, <code>agent-unbound-key</code></td></tr>
 <tr><td>Desired state signed, with a generation that only rises</td><td>forged, replayed or reordered commands</td><td><code>agent-signed-state</code></td></tr>
+<tr><td>A node with instances refuses to update; moves through drains</td><td>a node update cutting traffic; failed requests during a move</td><td><code>agent-update-refused</code>, <code>move-under-load</code>, <code>evacuate-update</code></td></tr>
 <tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
@@ -1585,7 +1614,7 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>85 cases and one build check, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>123 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -1609,6 +1638,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
 <tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code></td><td>port 7000; KVM, swtpm for the last two</td></tr>
+<tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>
@@ -1665,6 +1695,8 @@ user/noise/               Noise IK initiator (no heap), checked against tests/ve
 apps/                     app manifests and their format (apps/README.md)
 tests/apps/               manifests the tests boot
 tests/slots/              descriptors of the test slot images (built into build/slots/)
+tests/two-nodes.sh        runs a case on two nodes, with the control plane's load balancer
+tests/vectors/            the Noise IK test vector (cacophony)
 tests/run.sh              the test harness
 tools/host-agent.py       receives and checks telemetry; attests; releases the key
 tools/vanir_attest.py     quote checks and key sealing (shared)

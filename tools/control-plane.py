@@ -11,6 +11,10 @@ keys for this handshake (unless the node has no TPM: `no-tpm`), then exchange fr
 signed desired state (S) and images (C chunks, E end) when asked (G); the agent sends reports
 (R) and telemetry lines (T, written to --telemetry). See user/agent/src/control.rs.
 
+Nodes are named by their reports ("node a"). With --lb PORT and --backend NAME=PORT, we also
+run a TCP load balancer: each new client connection goes to the first node in the backend list,
+which scenarios change to move a service between nodes (tests/two-nodes.sh runs two).
+
 Scenarios print "control-plane: PASS" or "control-plane: FAIL ..." at the end.
 """
 import argparse
@@ -143,15 +147,67 @@ class ControlPlane:
         self.sign_key = serialization.load_pem_private_key(open(args.sign_key, "rb").read(), password=None)
         self.images = load_images(args.slots)
         self.by_hash = {h: (name, elf, sig, desc) for name, (h, elf, sig, desc) in self.images.items()}
-        self.node = None
-        self.report = None
+        self.nodes = {}  # name -> its current connection
+        self.latest = {}  # name -> its last report
         self.reports = 0
+        self.generations = {}  # name -> last generation sent
+        self.backends = {}  # name -> data port, for the load balancer
+        self.lb = []  # names new client connections go to (the first one)
         self.handshake_failures = 0
         self.connections = 0
         self.attested = None
         self.drop_after_chunks = None
         self.changed = threading.Condition()
         self.telemetry = open(args.telemetry, "w") if args.telemetry else None
+
+    @property
+    def node(self):
+        return self.nodes.get("a")
+
+    @property
+    def report(self):
+        return self.latest.get("a")
+
+    # ---- the load balancer ----
+
+    def balance(self, port):
+        listener = socket.create_server(("127.0.0.1", port), reuse_port=True)
+        while True:
+            client, _ = listener.accept()
+            threading.Thread(target=self.proxy, args=(client,), daemon=True).start()
+
+    def proxy(self, client):
+        with self.changed:
+            name = self.lb[0] if self.lb else None
+        if name is None:
+            client.close()
+            return
+        try:
+            upstream = socket.create_connection(("127.0.0.1", self.backends[name]), timeout=5)
+        except OSError:
+            client.close()
+            return
+        upstream.settimeout(None)
+
+        def pump(a, b):
+            try:
+                while data := a.recv(65536):
+                    b.sendall(data)
+            except OSError:
+                pass
+            for s in (a, b):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
+        pump(client, upstream)
+
+    def route(self, *names):
+        with self.changed:
+            self.lb = list(names)
+        say(f"load balancer: new connections go to node {names[0] if names else 'nowhere'}")
 
     # ---- the network side ----
 
@@ -181,7 +237,6 @@ class ControlPlane:
 
     def connected(self, node):
         with self.changed:
-            self.node = node
             self.connections += 1
             self.attested = node.attested
             self.changed.notify_all()
@@ -189,8 +244,9 @@ class ControlPlane:
 
     def disconnected(self, node):
         with self.changed:
-            if self.node is node:
-                self.node = None
+            for name, n in list(self.nodes.items()):
+                if n is node:
+                    del self.nodes[name]
             if not node.handshaken:
                 self.handshake_failures += 1
             self.changed.notify_all()
@@ -198,12 +254,16 @@ class ControlPlane:
     def frame(self, node, kind, body):
         if kind == b"R":
             report = parse_report(body.decode())
+            name = report["node"]
             with self.changed:
-                if report != self.report:
-                    head = f"generation {report['generation']}" + (f" refused {report['refused']}" if report["refused"] else "")
+                if report != self.latest.get(name):
+                    head = f"node {name} image {report['image']} generation {report['generation']}"
+                    head += f" update refused ({report['update_refused']} instances)" if report["update_refused"] else ""
+                    head += f" refused {report['refused']}" if report["refused"] else ""
                     slots = [f"{s} {v['service']} v{v['version']} {v['state']}" for s, v in report["slots"].items()]
                     say("report: " + "; ".join([head] + slots))
-                self.report = report
+                self.nodes[name] = node
+                self.latest[name] = report
                 self.reports += 1
                 self.changed.notify_all()
         elif kind == b"G":
@@ -237,13 +297,18 @@ class ControlPlane:
 
     # ---- the scenario side ----
 
-    def send_desired(self, generation, lines, key=None):
+    def send_desired(self, generation, lines, key=None, node="a"):
         doc = "\n".join(["vanir-desired 1", f"generation {generation}"] + lines).encode()
         signature = (key or self.sign_key).sign(doc)
-        self.wait(lambda: self.node is not None, "a connection")
-        say(f"desired state {generation}: " + "; ".join(lines))
-        self.node.send_frame(b"S", struct.pack("<I", len(doc)) + doc + signature)
+        self.wait(lambda: node in self.nodes, f"connection from node {node}")
+        say(f"desired state {generation} for node {node}: " + "; ".join(lines))
+        self.generations[node] = generation
+        self.nodes[node].send_frame(b"S", struct.pack("<I", len(doc)) + doc + signature)
         return doc, signature
+
+    def tell(self, node, lines):
+        """Send `node` the next generation of desired state."""
+        return self.send_desired(self.generations.get(node, 0) + 1, lines, node=node)
 
     def resend(self, doc, signature, why):
         generation = doc.decode().split("\n")[1]
@@ -259,13 +324,14 @@ class ControlPlane:
                     raise TimeoutError(f"no {what}")
                 self.changed.wait(min(left, 0.5))
 
-    def wait_slots(self, what, **want):
+    def wait_slots(self, what, node="a", **want):
         """Wait for a report whose slots match: slot=(service, version, state) or slot=state."""
         def ok():
-            if not self.report:
+            report = self.latest.get(node)
+            if not report:
                 return False
             for slot, w in want.items():
-                s = self.report["slots"].get(slot.replace("_", "-"))
+                s = report["slots"].get(slot.replace("_", "-"))
                 if s is None:
                     return False
                 got = s["state"] if isinstance(w, str) else (s["service"], s["version"], s["state"])
@@ -281,9 +347,16 @@ class ControlPlane:
 
 
 def parse_report(text):
+    """report <generation> node <name> image <version> [update-refused <n>] [refused <why>]"""
     lines = text.strip().split("\n")
     head = lines[0].split()
-    report = {"generation": int(head[1]), "refused": " ".join(head[3:]) if len(head) > 2 else None, "slots": {}}
+    report = {"generation": int(head[1]), "node": head[3], "image": int(head[5]), "update_refused": None, "refused": None, "slots": {}}
+    rest = head[6:]
+    if rest[:1] == ["update-refused"]:
+        report["update_refused"] = int(rest[1])
+        rest = rest[2:]
+    if rest[:1] == ["refused"]:
+        report["refused"] = " ".join(rest[1:])
     for line in lines[1:]:
         _, name, service, version, digest, state = line.split()
         report["slots"][name] = {"service": service, "version": int(version), "hash": digest, "state": state}
@@ -382,6 +455,70 @@ def drain(cp):
     return True
 
 
+@scenario
+def update_refused(cp):
+    """A node running an instance refuses to update (RFD 2, determination 1)."""
+    cp.wait(lambda: cp.report is not None, "report")
+    cp.tell("a", [cp.live("web", "small-0", "web-v1")])
+    cp.wait_slots("web v1 live in small-0", small_0=("web", 1, "LIVE"))
+    cp.tell("a", [cp.live("web", "small-0", "web-v1"), "update"])
+    cp.wait(lambda: cp.report["update_refused"] == 1, "the update refused")
+    say("node a refused the update: it runs 1 instance")
+    cp.tell("a", [cp.live("web", "small-0", "web-v1"), "end"])
+    cp.wait(lambda: cp.report["generation"] == 3, "report of generation 3")
+    return True
+
+
+def move_web(cp, src, src_slot, dst, dst_slot):
+    """Move web from node `src` to node `dst` (RFD 2, P3: a move): start it on `dst`, wait until
+    it is live there, send new connections to `dst`, then drain and stop it on `src`, and commit."""
+    cp.tell(dst, [cp.live("web", dst_slot, "web-v1")])
+    cp.wait_slots(f"web live on node {dst}", node=dst, **{dst_slot: ("web", 1, "LIVE")})
+    cp.route(dst)
+    cp.tell(src, ["stop web drain 30"])
+    cp.wait_slots(f"web stopped on node {src}", node=src, **{src_slot: "STOPPED"})
+    cp.tell(src, ["commit web"])
+    cp.wait_slots(f"web unloaded from node {src}", node=src, **{src_slot: "EMPTY"})
+
+
+@scenario
+def move(cp):
+    """web moves from node a (small-0) to node b (small-1) under load, through the load
+    balancer; then node a, now empty, ends."""
+    cp.wait(lambda: "a" in cp.latest and "b" in cp.latest, "reports from nodes a and b")
+    cp.tell("a", [cp.live("web", "small-0", "web-v1")])
+    cp.wait_slots("web live on node a", node="a", small_0=("web", 1, "LIVE"))
+    cp.route("a")
+    time.sleep(5)  # serve from node a for a while
+    move_web(cp, "a", "small-0", "b", "small-1")
+    cp.tell("a", ["end"])
+    return True
+
+
+@scenario
+def evacuate(cp):
+    """Node a runs web, refuses an update, is evacuated to node b, accepts the update, reboots
+    into its new image (signed version 2), reconnects, and web moves back to it. All under load."""
+    cp.wait(lambda: "a" in cp.latest and "b" in cp.latest, "reports from nodes a and b")
+    first_image = cp.latest["a"]["image"]
+    cp.tell("a", [cp.live("web", "small-0", "web-v1")])
+    cp.wait_slots("web live on node a", node="a", small_0=("web", 1, "LIVE"))
+    cp.route("a")
+    time.sleep(3)
+    cp.tell("a", [cp.live("web", "small-0", "web-v1"), "update"])
+    cp.wait(lambda: cp.latest["a"]["update_refused"] == 1, "node a refusing the update")
+    say("node a refused the update: it runs 1 instance")
+    move_web(cp, "a", "small-0", "b", "small-1")
+    connections = cp.connections
+    cp.tell("a", ["update"])
+    cp.wait(lambda: cp.connections > connections and cp.latest["a"]["image"] != first_image, "node a back with a new image", timeout=cp.args.timeout)
+    say(f"node a rejoined with image version {cp.latest['a']['image']} (was {first_image})")
+    cp.generations["a"] = 0  # a rebooted agent starts from no desired state
+    move_web(cp, "b", "small-1", "a", "small-0")
+    cp.tell("b", ["end"])
+    return True
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "gen-keys":
         if len(sys.argv) != 3:
@@ -398,6 +535,10 @@ def main():
     p.add_argument("--require-attestation", action="store_true")
     p.add_argument("--reference", help="also compare quotes with this reference (verify-quote.py --record)")
     p.add_argument("--timeout", type=float, default=60)
+    p.add_argument("--lb", type=int, metavar="PORT", help="run a load balancer on this port")
+    p.add_argument("--linger", type=float, default=1, metavar="SECONDS",
+                   help="keep serving (the load balancer too) this long after the scenario")
+    p.add_argument("--backend", action="append", default=[], metavar="NAME=PORT", help="a node's data port")
     args = p.parse_args()
     if not os.path.exists(args.noise_key):  # e.g. a rogue key for a test
         key = X25519PrivateKey.generate().private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
@@ -406,13 +547,19 @@ def main():
             f.write(key)
     cp = ControlPlane(args)
     threading.Thread(target=cp.serve, daemon=True).start()
+    for b in args.backend:
+        name, port = b.split("=")
+        cp.backends[name] = int(port)
+    if args.lb:
+        threading.Thread(target=cp.balance, args=(args.lb,), daemon=True).start()
     try:
         ok = SCENARIOS[args.scenario](cp)
     except TimeoutError as e:
         say(f"FAIL: {e}")
         sys.exit(1)
     say("PASS" if ok else "FAIL")
-    time.sleep(1)  # let the last frames go out
+    sys.stdout.flush()
+    time.sleep(args.linger)  # let the last frames go out, and clients finish through the balancer
     sys.exit(0 if ok else 1)
 
 

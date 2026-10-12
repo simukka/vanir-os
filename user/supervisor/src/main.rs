@@ -7,7 +7,7 @@
 //!
 //! The agent asks it to stop and start tasks (`supervisor::OP_STOP`, `OP_START`, RFD 2, P4): a
 //! stopped task is reported as stopped and never restarted; starting one again resets its
-//! backoff.
+//! backoff. It also asks it to reboot an empty node into a new image (`OP_REBOOT`).
 //!
 //! Test features: `halt-on-exit` stops the system when any task exits (tests whose servers never
 //! go idle); `give-up-after-3` / `give-up-after-3000` stop restarting a task after that many
@@ -18,7 +18,7 @@
 #![no_main]
 
 use core::fmt::Write;
-use vanir_user::supervisor::{OP_START, OP_STOP};
+use vanir_user::supervisor::{OP_REBOOT, OP_START, OP_STOP};
 use vanir_user::telemetry::{self, Record};
 use vanir_user::{
     DeathRecord, LineWriter, MAX_TASKS, NOTIFY_DEATH, NOTIFY_TIMER, err, lookup, println, recv, recv_timeout, restart, task_index,
@@ -115,6 +115,11 @@ fn main() -> u64 {
                 let id = u64::from_le_bytes(buf[..8].try_into().unwrap());
                 let (code, data) = on_request(&mut slots, m.op, id);
                 let _ = vanir_user::reply(m.sender, code, &data.to_le_bytes());
+            }
+            Ok(m) if m.op == OP_REBOOT => {
+                report(telemetry, format_args!("rebooting at the request of task {}", task_index(m.sender)));
+                let e = vanir_user::reboot();
+                let _ = vanir_user::reply(m.sender, 0x100 | (e & 0xff), &[]);
             }
             Ok(m) => {
                 let _ = vanir_user::reply(m.sender, 1, &[]);

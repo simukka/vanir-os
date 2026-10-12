@@ -35,6 +35,7 @@ pub const SYS_TPM_LOCK: u64 = 122;
 pub const SYS_TPM_UNLOCK: u64 = 123;
 pub const SYS_RUNTIME_LOG: u64 = 124;
 pub const SYS_STOP: u64 = 125;
+pub const SYS_REBOOT: u64 = 126;
 
 const ERROR: u64 = u64::MAX;
 
@@ -71,6 +72,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_TPM_UNLOCK => process::tpm_lock(frame, false),
         SYS_RUNTIME_LOG => process::runtime_log(frame),
         SYS_STOP => process::stop(frame),
+        SYS_REBOOT => process::reboot(frame),
         _ => frame.rax = ERROR,
     }
 }

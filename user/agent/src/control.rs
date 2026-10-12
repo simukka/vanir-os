@@ -30,13 +30,17 @@
 //!   live web small-1 <statement hash, hex> [drain <secs>]   # web's live instance
 //!   stop web [drain <secs>]                                 # drain and stop every instance
 //!   commit web                                              # unload web's stopped slots
+//!   update                                  # reboot into the image installed now, if empty
 //!   ```
 //!
 //!   The agent keeps reconciling towards the last one it applied: it fetches the images it
 //!   lacks into the named slot, deploys, rolls back to a stopped slot that holds the wanted
 //!   image, drains, and commits.
-//! - **Reports** (`R`) say what it has: the generation applied, each slot's service, version,
-//!   image hash and state. Sent after the handshake, on every change, and every 5 s.
+//! - **Reports** (`R`) say what it has: the generation applied, the node's name and its own
+//!   signed version (the node image), each slot's service, version, image hash and state. Sent
+//!   after the handshake, on every change, and every 5 s.
+//! - **Update** (RFD 2, P3, determination 1): a node with instances refuses, and says how many in
+//!   its report; an empty one asks the supervisor to reboot it into the image installed now.
 
 use crate::Image;
 use crate::lifecycle::{Agent, MAX_SLOTS, State};
@@ -44,7 +48,7 @@ use ed25519_compact::{PublicKey, Signature};
 use noise::{Initiator, Transport};
 use vanir_user::attest::OP_QUOTE_FOR;
 use vanir_user::net::{self, CODE_WOULD_BLOCK, EV_CLOSED, EV_READ, EV_WRITE, Event};
-use vanir_user::{LineWriter, err, lookup, println, send, slot, telemetry, uptime};
+use vanir_user::{LineWriter, err, getpid, lookup, println, send, slot, supervisor, task_listen, telemetry, uptime};
 
 use core::fmt::Write;
 
@@ -141,6 +145,8 @@ pub struct Control {
     pub failures: u32,
     /// The desired state said `end` (test feature `exit-on-end`).
     pub end: bool,
+    /// An `update` refused because the node runs instances: how many.
+    update_refused: Option<usize>,
 }
 
 impl Control {
@@ -166,6 +172,7 @@ impl Control {
             next_report: 0,
             failures: 0,
             end: false,
+            update_refused: None,
         }
     }
 
@@ -433,6 +440,7 @@ impl Control {
         }
         self.desired[..len].copy_from_slice(doc);
         self.desired_len = len;
+        self.update_refused = None;
         self.generation = generation;
         self.refused = None;
         self.next_report = 0;
@@ -494,9 +502,27 @@ impl Control {
                         agent.drain(k, self.drain_for(service));
                     }
                 }
+                b"update" => {
+                    let busy = agent.slots.iter().flatten().filter(|s| s.state != State::Empty).count();
+                    if busy != 0 {
+                        if self.update_refused != Some(busy) {
+                            println!("agent: update refused: {} slot(s) still hold instances", busy);
+                            self.update_refused = Some(busy);
+                            self.next_report = 0;
+                        }
+                    } else if self.connected() {
+                        println!("agent: the node is empty; rebooting into the new image");
+                        self.report(agent);
+                        let supervisor = lookup("supervisor").unwrap_or(0);
+                        let e = supervisor::reboot(supervisor);
+                        println!("agent: reboot refused: {}", err::name(e));
+                    }
+                }
                 b"commit" => {
+                    // The control plane commits once the service is live where it wants it, on
+                    // this node or (after a move) another.
                     let service = w[1];
-                    if !agent.busy(service) && agent.live(service).is_some() {
+                    if !agent.busy(service) {
                         agent.commit(service);
                     }
                 }
@@ -529,7 +555,11 @@ impl Control {
             }
         };
         let mut line = LineWriter::new();
-        let _ = write!(line, "report {}", self.generation);
+        let image = task_listen(getpid()).map_or(0, |i| i.version);
+        let _ = write!(line, "report {} node {} image {}", self.generation, env!("VANIR_NODE"), image);
+        if let Some(n) = self.update_refused {
+            let _ = write!(line, " update-refused {}", n);
+        }
         if let Some(why) = self.refused {
             let _ = write!(line, " refused {}", why);
         }

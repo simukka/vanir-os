@@ -12,6 +12,10 @@
 # PEER=<scenario> in the make variables runs `tools/net-peer.py <scenario>` next to QEMU (it
 # talks to the guest over NET/NET_MGMT); its output is checked with the serial log, after a
 # "--- peer ---" line. SLOW=0 skips the cases marked SLOW=1 (floods, drains).
+#
+# CP=<scenario> runs tools/control-plane.py next to QEMU (see below). NODES=2 runs the case on two
+# nodes with tests/two-nodes.sh (the control plane load-balances their data ports; with UPDATE=1
+# node a boots an updated image when it reboots).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -138,6 +142,9 @@ CASES=(
   "agent-drain           | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=drain                                                                                              | 1 | cmd:out=\$(cat); grep -q \"net: draining small-0 (deadline in 200 ticks)\" <<<\"\$out\" && grep -q \"control-plane: reached: web v1 stopped\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && grep -q \\\"event\\\":\\\"instance\\\".*\\\"to\\\":\\\"STOPPED\\\" build/cp-telemetry.log && grep -q \\\"event\\\":\\\"image_loaded\\\" build/cp-telemetry.log && grep -q \\\"event\\\":\\\"stopped\\\" build/cp-telemetry.log"
   "agent-attested        | agent-tpm               | supervisor/halt-on-exit agent/exit-on-end                   |               | BOOT=uefi-secure ACCEL=kvm TPM=1 NET=user NET_MGMT=user CP=connect CP_ARGS=--require-attestation                             | 1 | re:control-plane: node attested: the quote binds this handshake.s keys to a measured boot[\s\S]*node connected \(attested\)[\s\S]*control-plane: PASS"
   "agent-unbound-key     | agent-tpm               | supervisor/halt-on-exit agent/exit-after-failures agent/quote-wrong-key|               | BOOT=uefi-secure ACCEL=kvm TPM=1 NET=user NET_MGMT=user CP=wrong-key CP_ARGS=--require-attestation                           | 1 | re:agent: no control plane after 3 attempts[\s\S]*refused: the quote doesn.t bind this handshake.s static key[\s\S]*control-plane: PASS"
+  "agent-update-refused  | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=update-refused                                                                                     | 1 | re:agent: update refused: 1 slot\(s\) still hold instances[\s\S]*node a refused the update: it runs 1 instance[\s\S]*control-plane: PASS"
+  "move-under-load       | agent                   | supervisor/halt-on-exit http/exit-on-request agent/exit-on-end|               | NODES=2 NET=user NET_MGMT=user CP=move PEER=move-under-load SLOW=1 TIMEOUT=120                                               | 1 | cmd:out=\$(cat); grep -q \"followed web v1 on small-0 -> web v1 on small-1: 8/8\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\" && grep -q \"control-plane: reached: web unloaded from node a\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\""
+  "evacuate-update       | agent                   | supervisor/halt-on-exit http/exit-on-request agent/exit-on-end|               | NODES=2 UPDATE=1 NET=user NET_MGMT=user CP=evacuate PEER=evacuate-under-load SLOW=1 TIMEOUT=240                              | 1 | cmd:out=\$(cat); grep -q \"node a refused the update: it runs 1 instance\" <<<\"\$out\" && grep -q \"agent: the node is empty; rebooting into the new image\" <<<\"\$out\" && grep -q \"node a rejoined with image version 2 (was 1)\" <<<\"\$out\" && grep -q \"followed web v1 on small-0 -> web v1 on small-1 -> web v1 on small-0: 8/8\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\""
 )
 
 # Manifests that must not build: app | text the build error must contain.
@@ -193,64 +200,71 @@ for case in "${CASES[@]}"; do
     else echo "SKIP $name: no access to /dev/vhost-vsock (join the kvm group)"; continue
     fi
   fi
-  if ! build_log=$(make -s image APP="tests/apps/$app.toml" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" "${vars[@]}" 2>&1); then
-    echo "FAIL $name: build failed"; echo "$build_log"; failed=1; continue
-  fi
-  qemu=$(make -s qemu-cmd "${vars[@]}")
-  peer=""
-  for v in $env; do [[ "$v" == PEER=* ]] && peer=${v#PEER=}; done
-  # CP=<scenario> runs the mock control plane next to QEMU (CP_ARGS=a,b,c adds options); its
-  # output is checked with the serial log, after a "--- control plane ---" line.
-  cp=""
-  cp_args=()
-  for v in $env; do
-    [[ "$v" == CP=* ]] && cp=${v#CP=}
-    [[ "$v" == CP_ARGS=* ]] && IFS=, read -r -a cp_args <<<"${v#CP_ARGS=}"
-  done
-  if [ -n "$cp" ]; then
-    rm -f build/cp.log build/cp-telemetry.log
-    tools/control-plane.py "$cp" --timeout "$limit" "${cp_args[@]}" >build/cp.log 2>&1 &
-    cp_pid=$!
-    sleep 0.5
-  fi
-  if [ -n "$peer" ]; then
-    rm -f build/peer.log
-    tools/net-peer.py "$peer" --timeout "$limit" >build/peer.log 2>&1 &
-    peer_pid=$!
-  fi
-  if [ ${#wrap[@]} -ne 0 ]; then
-    rm -f build/telemetry.log
-    agent_args=()
-    [[ " $env " == *" ATTEST=1 "* ]] && agent_args+=(--attest)
-    for v in $env; do
-      [[ "$v" == RELEASE=* ]] && agent_args+=(--release-key keys/master.key --reference "${v#RELEASE=}")
-      [[ "$v" == INTERVAL=* ]] && agent_args+=(--set-interval "${v#INTERVAL=}")
-      [[ "$v" == ATTEST_DELAY=* ]] && agent_args+=(--attest-delay "${v#ATTEST_DELAY=}")
-      [[ "$v" == ATTEST_DELAY=* ]] && agent_args+=(--attest-delay "${v#ATTEST_DELAY=}")
-    done
-    tools/host-agent.py --listen-vsock 5000 --save build/telemetry.log --quiet "${agent_args[@]}" >/dev/null 2>&1 &
-    agent=$!
-    for _ in $(seq 50); do [ -e build/telemetry.log ] && break; sleep 0.1; done
-    out=$(timeout "$limit" "${wrap[@]}" "$qemu" 2>&1)
+  if [[ " $env " == *" NODES=2 "* ]]; then
+    # Two nodes, the control plane and the peer: tests/two-nodes.sh does it all.
+    out=$(tests/two-nodes.sh "$app" "$user" "$kernel" "$limit" "${vars[@]}" 2>&1)
     status=$?
-    sleep 0.5; kill $agent 2>/dev/null; wait $agent 2>/dev/null
+    out=$(sed 's/\x1b\[[0-9;:?=]*[A-Za-z]//g; s/\x1b[()][0-9A-Za-z]//g; s/\r//g' <<<"$out")
   else
-    out=$(timeout "$limit" $qemu 2>&1)
-    status=$?
-  fi
-  # Firmware consoles (OVMF under BOOT=uefi-secure) position every character with escape codes;
-  # match against plain text.
-  out=$(sed 's/\x1b\[[0-9;:?=]*[A-Za-z]//g; s/\x1b[()][0-9A-Za-z]//g; s/\r//g' <<<"$out")
-  if [ -n "$peer" ]; then
-    # The peer finishes on its own once the guest is done; give it a moment, then stop it.
-    for _ in $(seq 50); do kill -0 $peer_pid 2>/dev/null || break; sleep 0.1; done
-    kill $peer_pid 2>/dev/null; wait $peer_pid 2>/dev/null
-    out+=$'\n--- peer ---\n'"$(cat build/peer.log)"
-  fi
-  if [ -n "$cp" ]; then
-    for _ in $(seq 30); do kill -0 $cp_pid 2>/dev/null || break; sleep 0.1; done
-    kill $cp_pid 2>/dev/null; wait $cp_pid 2>/dev/null
-    out+=$'\n--- control plane ---\n'"$(cat build/cp.log)"
+    if ! build_log=$(make -s image APP="tests/apps/$app.toml" USER_FEATURES="$user" KERNEL_FEATURES="$kernel" "${vars[@]}" 2>&1); then
+      echo "FAIL $name: build failed"; echo "$build_log"; failed=1; continue
+    fi
+    qemu=$(make -s qemu-cmd "${vars[@]}")
+    peer=""
+    for v in $env; do [[ "$v" == PEER=* ]] && peer=${v#PEER=}; done
+    # CP=<scenario> runs the mock control plane next to QEMU (CP_ARGS=a,b,c adds options); its
+    # output is checked with the serial log, after a "--- control plane ---" line.
+    cp=""
+    cp_args=()
+    for v in $env; do
+      [[ "$v" == CP=* ]] && cp=${v#CP=}
+      [[ "$v" == CP_ARGS=* ]] && IFS=, read -r -a cp_args <<<"${v#CP_ARGS=}"
+    done
+    if [ -n "$cp" ]; then
+      rm -f build/cp.log build/cp-telemetry.log
+      tools/control-plane.py "$cp" --timeout "$limit" "${cp_args[@]}" >build/cp.log 2>&1 &
+      cp_pid=$!
+      sleep 0.5
+    fi
+    if [ -n "$peer" ]; then
+      rm -f build/peer.log
+      tools/net-peer.py "$peer" --timeout "$limit" >build/peer.log 2>&1 &
+      peer_pid=$!
+    fi
+    if [ ${#wrap[@]} -ne 0 ]; then
+      rm -f build/telemetry.log
+      agent_args=()
+      [[ " $env " == *" ATTEST=1 "* ]] && agent_args+=(--attest)
+      for v in $env; do
+        [[ "$v" == RELEASE=* ]] && agent_args+=(--release-key keys/master.key --reference "${v#RELEASE=}")
+        [[ "$v" == INTERVAL=* ]] && agent_args+=(--set-interval "${v#INTERVAL=}")
+        [[ "$v" == ATTEST_DELAY=* ]] && agent_args+=(--attest-delay "${v#ATTEST_DELAY=}")
+        [[ "$v" == ATTEST_DELAY=* ]] && agent_args+=(--attest-delay "${v#ATTEST_DELAY=}")
+      done
+      tools/host-agent.py --listen-vsock 5000 --save build/telemetry.log --quiet "${agent_args[@]}" >/dev/null 2>&1 &
+      agent=$!
+      for _ in $(seq 50); do [ -e build/telemetry.log ] && break; sleep 0.1; done
+      out=$(timeout "$limit" "${wrap[@]}" "$qemu" 2>&1)
+      status=$?
+      sleep 0.5; kill $agent 2>/dev/null; wait $agent 2>/dev/null
+    else
+      out=$(timeout "$limit" $qemu 2>&1)
+      status=$?
+    fi
+    # Firmware consoles (OVMF under BOOT=uefi-secure) position every character with escape codes;
+    # match against plain text.
+    out=$(sed 's/\x1b\[[0-9;:?=]*[A-Za-z]//g; s/\x1b[()][0-9A-Za-z]//g; s/\r//g' <<<"$out")
+    if [ -n "$peer" ]; then
+      # The peer finishes on its own once the guest is done; give it a moment, then stop it.
+      for _ in $(seq 50); do kill -0 $peer_pid 2>/dev/null || break; sleep 0.1; done
+      kill $peer_pid 2>/dev/null; wait $peer_pid 2>/dev/null
+      out+=$'\n--- peer ---\n'"$(cat build/peer.log)"
+    fi
+    if [ -n "$cp" ]; then
+      for _ in $(seq 30); do kill -0 $cp_pid 2>/dev/null || break; sleep 0.1; done
+      kill $cp_pid 2>/dev/null; wait $cp_pid 2>/dev/null
+      out+=$'\n--- control plane ---\n'"$(cat build/cp.log)"
+    fi
   fi
   # What reached the host over the virtio console, for the checks below.
   out+=$'\n--- build/telemetry.log ---\n'"$(cat build/telemetry.log 2>/dev/null)"

@@ -4,7 +4,7 @@
 
 ## Rules for agents
 
-- Every commit must pass `make test ACCEL=tcg` and `make test ACCEL=kvm` (85 cases and a build check each). Run one case with `ONLY='^name$' make test`.
+- Every commit must pass `make test ACCEL=tcg` and `make test ACCEL=kvm` (123 cases, a build check and a host check each). Run one case with `ONLY='^name$' make test`.
 - Stable Rust only, `no_std`, target `x86_64-unknown-none`. Keep the soft-backend `--cfg` flags in `.cargo/config.toml` (SIMD crypto backends crash rustc with SIGILL).
 - Never commit `keys/` (image-signing key, storage master key) or `build/`.
 - The kernel never blocks mid-syscall; user pointers are always range-checked and copied with fault recovery; servers identify clients with `task_name(sender)`, never from message contents.
@@ -41,7 +41,7 @@
 - [Boot chain and attestation](index.html#boot-chain): Secure Boot, signatures, PCR 12, quotes (PCRs 0, 4, 7, 12, 13)
 - [Storage](index.html#storage): on-disk format, key hierarchy, attested key release, restarts, storage events
 - [Networking](index.html#networking): virtio-net driver, the net task (smoltcp), socket ops, routing and draining, limits, counters and events, NET/NET_MGMT
-- [Deployment](index.html#deployment): generic slots ([[slot_class]]), signed descriptors (tools/sign-image.py sign-slot, VNRSIG02), slot_stage/slot_load/slot_unload by the agent (loads = true), PCR 13 and the kernel's run-time log, the TPM lock; agent test scripts are features; the agent's lifecycle (EMPTY, STARTING, READY, LIVE, DRAINING, DRAINED, STOPPED, FAILED), local swap, rollback, commit; supervisor OP_STOP/OP_START, kernel stop(); net OP_STATUS, DRAIN_NOWAIT; the agent dials the control plane over mgmt-net (OP_CONNECT, connects = true) with Noise IK (user/noise; pinned keys keys/cp-noise.pub and keys/cp-sign.pub), binds its keys with attest OP_QUOTE_FOR, applies signed desired state (live/stop/commit lines, rising generation), fetches images into slots, reports, and pulls telemetry (OP_PULL); tools/control-plane.py is the mock control plane (tests: CP=<scenario>)
+- [Deployment](index.html#deployment): generic slots ([[slot_class]]), signed descriptors (tools/sign-image.py sign-slot, VNRSIG02), slot_stage/slot_load/slot_unload by the agent (loads = true), PCR 13 and the kernel's run-time log, the TPM lock; agent test scripts are features; the agent's lifecycle (EMPTY, STARTING, READY, LIVE, DRAINING, DRAINED, STOPPED, FAILED), local swap, rollback, commit; supervisor OP_STOP/OP_START, kernel stop(); net OP_STATUS, DRAIN_NOWAIT; the agent dials the control plane over mgmt-net (OP_CONNECT, connects = true) with Noise IK (user/noise; pinned keys keys/cp-noise.pub and keys/cp-sign.pub), binds its keys with attest OP_QUOTE_FOR, applies signed desired state (live/stop/commit lines, rising generation), fetches images into slots, reports, and pulls telemetry (OP_PULL); tools/control-plane.py is the mock control plane (tests: CP=<scenario>); moves and evacuation between two nodes (tests/two-nodes.sh, NODES=2, UPDATE=1), desired-state line update (refused with instances; an empty node reboots: supervisor OP_REBOOT, kernel reboot())
 - [Syscalls](index.html#syscalls): numbers and ABI (int 0x80; rdi, rsi, rdx, r10, r8, r9)
 - [Protections](index.html#protections): each protection and the test proving it
 - [Limitations](index.html#limitations)
@@ -50,7 +50,7 @@
 
 - [Agent quick reference](index.html#agents): where to change what
 - [Build, run, test](index.html#build): Make variables, exit status, test format
-- [Test catalogue](index.html#tests): all 85 cases by area and what they need
+- [Test catalogue](index.html#tests): all 123 cases by area and what they need
 - [Repository map](index.html#repo-map)
 - [Recipes](index.html#recipes): add a program, test, syscall, event, device, manifest key
 - [Invariants](index.html#invariants)
