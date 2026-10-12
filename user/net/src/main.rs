@@ -52,6 +52,10 @@ const BUFFER: usize = 4096;
 const MAX_PORTS: usize = 8;
 const MAX_SERVICES: usize = 8;
 const MAX_INSTANCES: usize = 8;
+/// The `port` of an outbound connection's `Use::Owned` (no listening port: `OP_CONNECT`).
+const OUTBOUND: u8 = 0xff;
+/// Local ports for outbound connections: 49152 and up.
+const EPHEMERAL: u16 = 49152;
 /// Sockets kept listening on each port in use.
 const LISTENING: usize = 4;
 /// Most half-open connections (handshakes in progress) per port; past it, a new SYN takes the
@@ -256,6 +260,8 @@ struct Stack {
     next_generation: u16,
     /// Connections handed to instances (accepted).
     handed_out: u64,
+    /// The next local port for an outbound connection, as an offset from `EPHEMERAL`.
+    next_local_port: u16,
 }
 
 fn instant(ticks: u64) -> Instant {
@@ -341,7 +347,7 @@ impl Stack {
             self.forget(k, now);
         }
         let info = task_listen(sender).map_err(|_| CODE_NOT_ALLOWED)?;
-        if info.count == 0 {
+        if info.count == 0 && !info.may_connect() {
             return Err(CODE_NOT_ALLOWED);
         }
         let service = self.service_for(info.service()).ok_or(CODE_NO_SOCKETS)?;
@@ -510,7 +516,8 @@ impl Stack {
             let want_write = self.slots[i].want_write;
             let s = self.socket(i);
             let mut flags = 0;
-            if s.can_recv() || !s.may_recv() {
+            // An outbound connection still in its handshake can't receive yet, but isn't closed.
+            if s.can_recv() || (!s.may_recv() && s.state() != State::SynSent) {
                 flags |= EV_READ;
             }
             if s.state() == State::Closed {
@@ -632,6 +639,7 @@ impl Stack {
                     let s = self.socket(i);
                     let max = (max as usize).min(out.len());
                     let r = match s.recv_slice(&mut out[..max]) {
+                        Ok(0) if s.state() == State::SynSent => Err(CODE_WOULD_BLOCK),
                         Ok(0) if !s.may_recv() => Err(CODE_CLOSED),
                         Ok(0) => Err(CODE_WOULD_BLOCK),
                         Ok(n) => Ok(n),
@@ -704,6 +712,16 @@ impl Stack {
                     _ => Err(CODE_BAD_OP),
                 }
             }
+            OP_CONNECT => match (msg.get(..4), msg.get(4..6)) {
+                (Some(addr), Some(port)) => {
+                    let addr: [u8; 4] = addr.try_into().unwrap();
+                    self.connect(sender, addr, u16::from_le_bytes([port[0], port[1]]), now).map(|h| {
+                        out[..4].copy_from_slice(&h.to_le_bytes());
+                        4
+                    })
+                }
+                _ => Err(CODE_BAD_OP),
+            },
             OP_STATUS => {
                 let routes = task_listen(sender).is_ok_and(|i| i.may_route());
                 match msg.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) {
@@ -767,6 +785,41 @@ impl Stack {
             Ok(n) => (CODE_OK, n),
             Err(code) => (code, 0),
         })
+    }
+
+    /// Open an outbound connection for `sender` (`connects = true`, RFD 2, P7: the node dials
+    /// out). It is owned at once, like an accepted connection; sending waits (`EV_WRITE`) until
+    /// the handshake is done, and a refused connection reads as closed.
+    fn connect(&mut self, sender: u64, addr: [u8; 4], port: u16, now: u64) -> Result<u32, u64> {
+        let mut name = [0u8; 32];
+        if !task_listen(sender).is_ok_and(|i| i.may_connect()) {
+            println!("{}: {} may not connect out", self.name, task_name(sender, &mut name).unwrap_or("?"));
+            return Err(CODE_NOT_ALLOWED);
+        }
+        let k = self.instance_for(sender, now)?;
+        let i = self.free_slot().ok_or(CODE_NO_SOCKETS)?;
+        let local = EPHEMERAL + self.next_local_port % 16384;
+        self.next_local_port = self.next_local_port.wrapping_add(1);
+        let handle = self.slots[i].handle;
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        socket.abort();
+        let remote = (IpAddress::Ipv4(Ipv4Address::from(addr)), port);
+        if socket.connect(self.iface.context(), remote, local).is_err() {
+            return Err(CODE_NOT_READY); // no address yet (DHCP), or a bad endpoint
+        }
+        self.set_use(i, Use::Owned { port: OUTBOUND, instance: k as u8 }, now);
+        self.slots[i].want_write = true;
+        println!(
+            "{}: {} connects to {}.{}.{}.{}:{}",
+            self.name,
+            task_name(sender, &mut name).unwrap_or("?"),
+            addr[0],
+            addr[1],
+            addr[2],
+            addr[3],
+            port
+        );
+        Ok(connection_handle(i, self.slots[i].generation))
     }
 
     /// Instance `id`'s `STATUS_*`, and its drain_forced count.
@@ -1334,6 +1387,7 @@ fn main() -> u64 {
         instances: [None; MAX_INSTANCES],
         next_generation: 0,
         handed_out: 0,
+            next_local_port: 0,
     };
 
     let mut msg = [0u8; 4096];

@@ -1,16 +1,18 @@
 //! The node agent (RFD 2, P7): the only task that loads service images into slots.
 //!
-//! Until there is a control plane to talk to, test scripts (features, see Cargo.toml) stand in
-//! for it, carrying the signed slot images they load. Without a script the agent waits.
+//! It dials the control plane, keeps the slots in the state the control plane wants, and reports
+//! what it has (`control`); the lifecycle of each instance is in `lifecycle`. Test scripts
+//! (features, see Cargo.toml) carrying signed slot images can stand in for the control plane.
 
 #![no_std]
 #![no_main]
 
+mod control;
 #[cfg(feature = "test-images")]
 mod images;
 mod lifecycle;
 
-use vanir_user::{err, events, lookup, println, recv, slot};
+use vanir_user::{err, events, lookup, println, slot};
 
 vanir_user::entry!(main);
 
@@ -32,6 +34,12 @@ impl Image {
 
     pub fn version(&self) -> u64 {
         u64::from_le_bytes(self.descriptor[40..48].try_into().unwrap())
+    }
+
+    /// SHA-256 of its signed statement: how the control plane names an image.
+    pub fn hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&self.sig[..self.sig.len().min(112)]).into()
     }
 
     /// The drain deadline's default and maximum, in seconds.
@@ -86,9 +94,22 @@ fn main() -> u64 {
     if let Some(code) = images::script() {
         return code;
     }
-    println!("agent: no control plane yet; waiting");
-    let mut buf = [0u8; 64];
+    let mut agent = lifecycle::Agent::new();
+    let mut control = control::Control::new();
     loop {
-        let _ = recv(&mut buf);
+        control.turn(&mut agent);
+        // Test only: end the run when the control plane says so, once nothing is under way.
+        #[cfg(feature = "exit-on-end")]
+        if control.end && agent.idle() {
+            control.turn(&mut agent); // a last report
+            println!("agent: the control plane says the test is over");
+            return 0;
+        }
+        // Test only: end the run after failing to connect three times in a row.
+        #[cfg(feature = "exit-after-failures")]
+        if control.failures >= 3 {
+            println!("agent: no control plane after {} attempts", control.failures);
+            return 0;
+        }
     }
 }

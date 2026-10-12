@@ -1,0 +1,47 @@
+# A node as RFD 2 has it: platform tasks, the management network, the agent talking to the
+# control plane (tools/control-plane.py) and slots for the services it deploys.
+[[task]]
+name = "supervisor"
+supervisor = true
+sends = ["telemetry"]
+
+[[task]]
+name = "telemetry"
+events = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic", "telemetry"]
+
+[[task]]
+name = "nic-mgmt"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["mgmt-net"]
+
+[[task]]
+name = "mgmt-net"
+program = "net"
+sends = ["nic-mgmt"]
+
+[[task]]
+name = "agent"
+loads = true
+routes = true
+connects = true
+sends = ["net", "mgmt-net", "supervisor", "telemetry"]
+
+[[slot_class]]
+name = "small"
+count = 2
+memory_pages = 256
+image_pages = 128
+sends = ["net"]

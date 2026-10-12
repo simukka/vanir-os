@@ -1,6 +1,6 @@
 # Step 10 plan: deployment (RFD 2)
 
-Status: in progress: D1 to D3 done. See "As built" at the end for where the implementation departs from this plan.
+Status: in progress: D1 to D4 done. See "As built" at the end for where the implementation departs from this plan.
 
 ## Goal
 
@@ -288,3 +288,17 @@ Where it departs from the plan so far:
   names itself `web v1 on small-0` only in a slot.
 - **Supervisor replies.** `OP_STOP`/`OP_START` answer 0 and the new id, or `0x100 | ` the kernel
   error's low bits (reply codes can't have the top bit set).
+- **Telemetry is pulled, not pushed.** Telemetry pushing its stream to the agent (as its
+  `uplink`) would close a cycle of sends (agent to `net`, `net` to telemetry, telemetry to the
+  agent) that can deadlock. With no uplink driver, telemetry keeps its lines in a 16 KiB ring and
+  the agent pulls them (`telemetry::OP_PULL`) and sends them as `T` frames.
+- **Freshness of the binding.** The quote is over SHA-256(ephemeral key || static key), so it
+  is fresh for each handshake without a nonce from the control plane (IK has the initiator
+  speak first). Keys come from RDRAND (`-cpu max` under TCG, `-cpu host` under KVM).
+- **Desired state** is a short text document (`live`, `stop`, `commit`, and `end` for tests)
+  rather than JSON: the agent has no heap and no JSON parser. Slots are named in it, since the
+  control plane knows each node's classes.
+- **Test names.** `agent-replay` and `agent-unsigned-state` are one test, `agent-signed-state`;
+  `agent-telemetry` is folded into `agent-drain` (which checks `build/cp-telemetry.log`).
+  `noise-vectors` checks both Noise implementations against the cacophony vector, from a new
+  `HOST_CHECKS` stage in `tests/run.sh`.

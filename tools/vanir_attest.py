@@ -77,7 +77,8 @@ def replay_runtime(entries):
 def check(quote, nonce, tamper=False, runtime=()):
     """Return the problems with `quote` as a quote over `nonce` (empty if none). A quote that
     carries a key-exchange public key (`kx_pub`) must be over SHA-256(nonce || kx_pub).
-    `runtime` holds the run-time log entries sent after the quote; they must replay to PCR 13."""
+    `runtime` holds the run-time log entries sent after the quote; they must replay to PCR 13.
+    With `runtime=None` PCR 13 isn't checked (the caller didn't get the log)."""
     problems = []
     attest = bytearray.fromhex(quote["attest"])
     if tamper:
@@ -108,7 +109,9 @@ def check(quote, nonce, tamper=False, runtime=()):
     if pcr12.hex() != quote["pcrs"]["12"]:
         problems.append("the measurement log does not replay to PCR 12")
     count = quote.get("runtime_count", 0)
-    if len(runtime) != count:
+    if runtime is None:
+        pass
+    elif len(runtime) != count:
         problems.append(f"the quote covers {count} run-time log entries; {len(runtime)} arrived")
     elif replay_runtime(runtime).hex() != quote["pcrs"]["13"]:
         problems.append("the run-time log does not replay to PCR 13")

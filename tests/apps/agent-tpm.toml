@@ -1,0 +1,50 @@
+# The agent node with a TPM: the agent gets quotes over its handshake keys from attest.
+[[task]]
+name = "supervisor"
+supervisor = true
+sends = ["telemetry"]
+
+[[task]]
+name = "telemetry"
+events = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic", "telemetry"]
+
+[[task]]
+name = "nic-mgmt"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["mgmt-net"]
+
+[[task]]
+name = "mgmt-net"
+program = "net"
+sends = ["nic-mgmt"]
+
+[[task]]
+name = "attest"
+tpm = true
+
+[[task]]
+name = "agent"
+loads = true
+routes = true
+connects = true
+sends = ["net", "mgmt-net", "supervisor", "telemetry", "attest"]
+
+[[slot_class]]
+name = "small"
+count = 2
+memory_pages = 256
+image_pages = 128
+sends = ["net"]

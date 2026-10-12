@@ -5,6 +5,9 @@
 //! `OP_RUNTIME_LOG` then returns those entries (images loaded into and unloaded from slots, RFD 2,
 //! P6) a JSON line at a time.
 //!
+//! `OP_QUOTE_FOR`, from the agent only, quotes over SHA-256(nonce || the agent's key) instead:
+//! the agent binds its Noise key for one handshake to an attested boot that way (RFD 2, P7).
+//!
 //! The kernel extends PCR 13 at run time too, so this task holds the TPM lock around each
 //! sequence of TPM commands (RFD 2, determination 8). Holding it over a quote and the PCR reads
 //! after it also keeps the values, the quote and the entry count consistent.
@@ -24,9 +27,9 @@ use ed25519_compact::x25519;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use tpm2::{AttestationKey, Tpm};
-use vanir_user::attest::{OP_QUOTE, OP_RUNTIME_LOG, OP_UNWRAP};
+use vanir_user::attest::{OP_QUOTE, OP_QUOTE_FOR, OP_RUNTIME_LOG, OP_UNWRAP};
 use vanir_user::block::{self, code_name};
-use vanir_user::{RUNTIME_ENTRY_LEN, err, lookup, measurements, println, recv, reply, runtime_log, tpm_lock, tpm_unlock};
+use vanir_user::{RUNTIME_ENTRY_LEN, err, lookup, measurements, println, recv, reply, runtime_log, task_name, tpm_lock, tpm_unlock};
 
 vanir_user::entry!(main);
 
@@ -183,14 +186,14 @@ fn main() -> u64 {
         vanir_user::sleep(100);
         let _ = tpm_unlock();
     }
-    let key = match locked(|| tpm.create_attestation_key()) {
+    let key_ak = match locked(|| tpm.create_attestation_key()) {
         Ok(k) => k,
         Err(e) => {
             println!("attest: cannot create the attestation key: {:?}", e);
             return 1;
         }
     };
-    println!("attest: attestation key ready (P-256, x {}...)", Hex(&key.x[..8]));
+    println!("attest: attestation key ready (P-256, x {}...)", Hex(&key_ak.x[..8]));
     let mut seed = [0u8; 32];
     if let Err(e) = locked(|| tpm.get_random(&mut seed)) {
         println!("attest: no randomness from the TPM: {:?}", e);
@@ -230,12 +233,29 @@ fn main() -> u64 {
             }
             continue;
         }
+        if m.op == OP_QUOTE_FOR && m.len == 64 {
+            let mut name = [0u8; 16];
+            if task_name(m.sender, &mut name) != Ok("agent") {
+                let _ = reply(m.sender, 1, &[]);
+                continue;
+            }
+            let key: [u8; 32] = msg[32..64].try_into().unwrap();
+            let mut line = Line { buf: [0; 4096], len: 0 };
+            match locked(|| quote(&tpm, &key_ak, &key, &log, entries, &msg[..32], &mut line)) {
+                Ok(_) => drop(reply(m.sender, 0, &line.buf[..line.len])),
+                Err(e) => {
+                    println!("attest: quote for the agent failed: {:?}", e);
+                    let _ = reply(m.sender, 2, &[]);
+                }
+            }
+            continue;
+        }
         if m.op != OP_QUOTE || m.len > 32 {
             let _ = reply(m.sender, 1, &[]);
             continue;
         }
         let mut line = Line { buf: [0; 4096], len: 0 };
-        match locked(|| quote(&tpm, &key, &kx_public, &log, entries, &msg[..m.len], &mut line)) {
+        match locked(|| quote(&tpm, &key_ak, &kx_public, &log, entries, &msg[..m.len], &mut line)) {
             Ok(count) => {
                 runtime_count = count;
                 last_nonce[..m.len].copy_from_slice(&msg[..m.len]);

@@ -187,6 +187,7 @@ td code { white-space: nowrap; }
       <li><a href="#deploy-loading">15.2 Loading an image</a></li>
       <li><a href="#deploy-measuring">15.3 Measuring what runs</a></li>
       <li><a href="#deploy-lifecycle">15.4 The lifecycle and the local swap</a></li>
+      <li><a href="#deploy-control">15.5 The agent and the control plane</a></li>
     </ul>
   </li>
   <li><a href="#syscalls">16. Syscalls</a></li>
@@ -1291,6 +1292,64 @@ requesting through the swap (and back) with no failed request; <code>deploy-not-
 leaves the old version live when the new one never says it is ready;
 <code>drain-deadline-cap</code>, <code>deploy-commit</code>, <code>slot-exit-clean</code>.</p>
 
+<h3 id="deploy-control"><span class="num">15.5</span>The agent and the control plane<a class="anchor" href="#deploy-control">#</a></h3>
+
+<p>The agent dials the control plane through the management stack (<code>mgmt-net</code>; it
+has <code>connects = true</code>, and <code>net::OP_CONNECT</code> opens the connection), at the
+address built in (<code>CP_ADDR</code>, by default <code>10.0.2.2:7000</code>: the host, through
+slirp). It reconnects with backoff (100 ms doubling to 10 s) whenever the connection drops;
+deployments go on meanwhile (<code>user/agent/src/control.rs</code>).</p>
+
+<figure>
+<pre class="diagram">
+  agent                                                  control plane (tools/control-plane.py)
+    | -- e, es, s, ss + quote over SHA-256(e || s) -----&gt;  pinned key? quote binds e and s?
+    | &lt;-- e, ee, se ------------------------------------   (Noise IK, X25519, ChaChaPoly, SHA-256)
+    | -- R report: generation, each slot's state -------&gt;
+    | &lt;-- S desired state, Ed25519-signed, generation N -   applied only if N is newer
+    | -- G image &lt;hash&gt; into &lt;slot&gt; ------------------&gt;
+    | &lt;-- C chunks (staged into the slot), E sig + desc -   then the kernel checks and loads it
+    | -- T telemetry lines (pulled from telemetry) -----&gt;
+</pre>
+<figcaption>The agent's connection (every frame after the handshake is encrypted)</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Who it talks to.</strong> The control plane's Noise static key is pinned in the
+    agent at build time (<code>keys/cp-noise.pub</code>), so the agent talks to no one else
+    (<code>agent-wrong-cp-key</code>). The agent's own static and ephemeral keys are fresh for
+    each connection (RDRAND).</li>
+  <li><strong>Who the node is.</strong> The first handshake message carries a TPM quote from
+    <code>attest</code> (<code>OP_QUOTE_FOR</code>) over SHA-256(ephemeral key || static key):
+    the keys of this handshake belong to a measured boot of a known image, and the private keys
+    never leave the agent. The control plane checks it (<code>agent-attested</code>) and refuses
+    a quote that binds another key (<code>agent-unbound-key</code>). A node without a TPM says
+    <code>no-tpm</code>; <code>--require-attestation</code> refuses it.</li>
+  <li><strong>What it wants.</strong> Desired state is a text document signed with a second pinned
+    key (<code>keys/cp-sign.pub</code>), with a generation the agent only lets rise, so a
+    replayed or reordered command does nothing (<code>agent-signed-state</code>). Lines:
+    <code>live &lt;service&gt; &lt;slot&gt; &lt;image hash&gt; [drain &lt;s&gt;]</code>,
+    <code>stop &lt;service&gt; [drain &lt;s&gt;]</code>, <code>commit &lt;service&gt;</code>
+    (and <code>end</code>, for tests). Images are named by the SHA-256 of their signed
+    statement.</li>
+  <li><strong>Reconciliation.</strong> The agent keeps moving towards the last state it applied:
+    fetching an image it lacks straight into the named slot, deploying it, rolling back to a
+    stopped slot that already holds the wanted image, draining, committing. It reports what it
+    has after the handshake, on every change and every 5 s, so a dropped connection costs
+    nothing but time (<code>agent-reconnect</code>, <code>agent-deploy</code>,
+    <code>agent-drain</code>).</li>
+  <li><strong>Telemetry</strong> goes to the control plane through the agent. With no uplink
+    driver, the telemetry task keeps its lines in a 16 KiB ring and the agent pulls them
+    (<code>telemetry::OP_PULL</code>): if telemetry pushed to the agent while the agent sends to
+    <code>net</code> and <code>net</code> to telemetry, the three could deadlock.</li>
+</ul>
+
+<p>The Noise code (<code>user/noise</code>, no heap) and the host's
+(<code>tools/vanir_noise.py</code>, written separately from the spec) are both checked against
+the cacophony test vector in <code>tests/vectors/noise-ik.json</code> (<code>noise-vectors</code>,
+a host check). <code>tools/control-plane.py gen-keys keys</code> makes the dev keys on the first
+build; tests run it with <code>CP=&lt;scenario&gt;</code> (<a href="#build">20</a>).</p>
+
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
 <p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
@@ -1369,6 +1428,8 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Slot images signed with their descriptor; checked, sized and measured at load</td><td>unsigned, changed, rolled-back or oversized services; a service claiming ports or a slot class it wasn't signed for</td><td><code>slot-*</code></td></tr>
 <tr><td>Run-time log and PCR 13 kept by the kernel</td><td>a node hiding what it loaded since boot</td><td><code>slot-measured</code>, <code>slot-attest</code></td></tr>
 <tr><td>Swap and rollback through ready checks and drains</td><td>failed requests during a deployment; traffic sent to an instance that never got ready</td><td><code>deploy-under-load</code>, <code>rollback-under-load</code>, <code>deploy-not-ready</code></td></tr>
+<tr><td>Control plane key pinned; Noise IK; node keys bound to a TPM quote</td><td>a node taking orders from someone else; a control plane trusting an unattested node</td><td><code>agent-wrong-cp-key</code>, <code>agent-attested</code>, <code>agent-unbound-key</code></td></tr>
+<tr><td>Desired state signed, with a generation that only rises</td><td>forged, replayed or reordered commands</td><td><code>agent-signed-state</code></td></tr>
 <tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
@@ -1493,8 +1554,13 @@ make clean                            # remove build outputs (distclean also rem
 (host agent releases <code>keys/master.key</code> if the quote matches), <code>INTERVAL=&lt;ms&gt;</code>
 (host agent sets the snapshot interval), <code>PEER=&lt;scenario&gt;</code> (run
 <code>tools/net-peer.py</code> next to QEMU; its output follows a <code>--- peer ---</code> line),
+<code>ATTEST_DELAY=&lt;s&gt;</code> (wait before the challenge), <code>CP=&lt;scenario&gt;</code>
+(run <code>tools/control-plane.py</code> next to QEMU, with options from
+<code>CP_ARGS=a,b,c</code>; its output follows a <code>--- control plane ---</code> line and the
+node's telemetry lands in <code>build/cp-telemetry.log</code>),
 <code>SLOW=1</code> (skipped with <code>SLOW=0 make test</code>). A <code>BUILD_FAILS</code> list
-before the cases names manifests that must not build, with the error they must give.</p>
+before the cases names manifests that must not build, with the error they must give, and
+<code>HOST_CHECKS</code> runs commands on the host alone (the Noise test vectors).</p>
 
 <h4>Exit status</h4>
 <p>QEMU exits with <code>(code &lt;&lt; 1) | 1</code> through the <code>isa-debug-exit</code>
@@ -1542,6 +1608,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
 <tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
+<tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code></td><td>port 7000; KVM, swtpm for the last two</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>
@@ -1593,7 +1660,8 @@ user/net/                 network stack (smoltcp): sockets, routing, limits, cou
 user/http/                HTTP/1.1 service; exit-on-request, crash and listen-81 test features
 user/mgmt-echo/           TCP echo on the management stack (stands in for the agent)
 user/switcher/            routing scripts for tests (RFD 1)
-user/agent/               the node agent: loads service images into slots; test scripts (features)
+user/agent/               the node agent: control plane connection, reconciliation, lifecycle, slot loading; test scripts (features)
+user/noise/               Noise IK initiator (no heap), checked against tests/vectors/noise-ik.json
 apps/                     app manifests and their format (apps/README.md)
 tests/apps/               manifests the tests boot
 tests/slots/              descriptors of the test slot images (built into build/slots/)
@@ -1604,6 +1672,8 @@ tools/verify-quote.py     verifies a TPM quote against a reference
 tools/expected-pcrs.py    computes PCR 12 (and PCR 13 for given loads) from the build output
 tools/sign-image.py       makes the signing key; signs task images and slot images with descriptors
 tools/check-backoff.py    checks the supervisor's restart backoff from a run's output
+tools/control-plane.py    mock control plane: Noise responder, quote checks, signed desired state, images, scenarios
+tools/vanir_noise.py      Noise IK (both sides) for the host tools
 tools/with-swtpm.sh       runs QEMU with a software TPM
 tools/corrupt-disk.py     flips a byte of a volume's block in the disk image
 tools/check_lines.py      checks numbered lines arrived in order

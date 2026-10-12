@@ -16,6 +16,9 @@ dependencies = [
 name = "agent"
 version = "0.1.0"
 dependencies = [
+ "ed25519-compact",
+ "noise",
+ "sha2",
  "vanir-user",
 ]
 
@@ -371,6 +374,16 @@ name = "nictest"
 version = "0.1.0"
 dependencies = [
  "vanir-user",
+]
+
+[[package]]
+name = "noise"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "ed25519-compact",
+ "hkdf",
+ "sha2",
 ]
 
 [[package]]

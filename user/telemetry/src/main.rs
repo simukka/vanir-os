@@ -3,6 +3,11 @@
 //! events (volume created, locked, unlocked, integrity error), network events (`OP_NET`), other
 //! events such as crashes (`OP_EVENT`) and counter snapshots (`OP_COUNTERS`) from other tasks.
 //!
+//! Without an uplink driver, telemetry goes to the control plane through the node agent (RFD 2,
+//! P7), which *pulls* it (`OP_PULL`): if we pushed to the agent while it sends to `net`, and
+//! `net` to us, the three could deadlock. Lines wait in a 16 KiB ring until pulled; when it is
+//! full the oldest are dropped and counted.
+//!
 //! The snapshot interval is ours to give out: each `OP_COUNTERS` is answered with it, so every
 //! reporter follows when the host changes it (`OP_SET_INTERVAL`, from the control task).
 //!
@@ -14,7 +19,7 @@
 
 use core::fmt::{self, Write};
 use vanir_user::events::{self, Event};
-use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, OP_COUNTERS, OP_EVENT, OP_LOG, OP_NET, OP_SET_INTERVAL};
+use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, OP_COUNTERS, OP_EVENT, OP_LOG, OP_NET, OP_PULL, OP_SET_INTERVAL};
 use vanir_user::{NOTIFY_TIMER, console, err, lookup, println, recv_timeout, reply, sleep, task_index, task_name, uptime};
 
 vanir_user::entry!(main);
@@ -23,26 +28,73 @@ const HEARTBEAT_TICKS: u64 = 100;
 /// Batch output into console writes of at most this many bytes (the IPC limit is 4 KiB).
 const BATCH: usize = 3584;
 
+/// Bytes of lines kept for the agent to pull.
+const RING: usize = 16384;
+
 /// JSON lines waiting to go to the host.
 struct Out {
     buf: [u8; 4096],
     len: usize,
-    console: u64,
+    /// The uplink driver, or None when the agent pulls (`ring`).
+    console: Option<u64>,
     link_name: &'static str,
+    ring: [u8; RING],
+    ring_len: usize,
+    /// Lines dropped from the ring since the agent last pulled.
+    ring_dropped: u64,
 }
 
 impl Out {
+    /// Move whole lines from the ring into `out` (for `OP_PULL`); returns the length.
+    fn pull(&mut self, out: &mut [u8]) -> usize {
+        let mut n = 0;
+        if self.ring_dropped != 0 {
+            let mut line = vanir_user::LineWriter::new();
+            let _ = write!(line, "{{\"t\":{},\"event\":\"dropped\",\"lines\":{}}}\n", uptime(), self.ring_dropped);
+            n = line.as_bytes().len().min(out.len());
+            out[..n].copy_from_slice(&line.as_bytes()[..n]);
+            self.ring_dropped = 0;
+        }
+        // Up to the last newline that fits.
+        let room = (out.len() - n).min(self.ring_len);
+        let take = self.ring[..room].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        out[n..n + take].copy_from_slice(&self.ring[..take]);
+        self.ring.copy_within(take..self.ring_len, 0);
+        self.ring_len -= take;
+        n + take
+    }
+
+    /// Keep `bytes` (whole lines) for the agent, dropping the oldest lines if there is no room.
+    fn keep(&mut self, bytes: &[u8]) {
+        let bytes = &bytes[..bytes.len().min(RING)];
+        while self.ring_len + bytes.len() > RING {
+            let first = self.ring[..self.ring_len].iter().position(|&b| b == b'\n').map_or(self.ring_len, |p| p + 1);
+            self.ring.copy_within(first..self.ring_len, 0);
+            self.ring_len -= first;
+            self.ring_dropped += 1;
+        }
+        self.ring[self.ring_len..self.ring_len + bytes.len()].copy_from_slice(bytes);
+        self.ring_len += bytes.len();
+    }
+
     /// Send what has been collected, waiting out a console-driver restart if need be.
     fn flush(&mut self) {
         if self.len == 0 {
             return;
         }
+        let Some(console) = self.console else {
+            let (buf, len) = (self.buf, self.len);
+            self.keep(&buf[..len]);
+            self.len = 0;
+            return;
+        };
+        let mut console = console;
         loop {
-            match console::write(self.console, &self.buf[..self.len]) {
+            match console::write(console, &self.buf[..self.len]) {
                 Ok(()) => break,
                 Err(e) if console::is_dead(e) => {
-                    let old = self.console;
-                    self.console = loop {
+                    let old = console;
+                    console = loop {
                         match lookup(self.link_name) {
                             Ok(id) if id != old => break id,
                             _ => sleep(1),
@@ -55,6 +107,7 @@ impl Out {
                 }
             }
         }
+        self.console = Some(console);
         self.len = 0;
     }
 
@@ -138,6 +191,7 @@ fn event_line(out: &mut Out, e: &Event) {
         events::IMAGE_REJECTED => write!(out, "\"event\":\"image_rejected\",\"reason\":\"{}\"", events::rejection(e.a)),
         events::IMAGE_LOADED => write!(out, "\"event\":\"image_loaded\",\"version\":{}", e.a),
         events::IMAGE_UNLOADED => write!(out, "\"event\":\"image_unloaded\",\"version\":{}", e.a),
+        events::STOPPED => write!(out, "\"event\":\"stopped\""),
         kind => write!(out, "\"event\":\"unknown\",\"kind\":{}", kind),
     };
     let _ = out.write_str("}");
@@ -233,7 +287,7 @@ fn heartbeat(out: &mut Out, n: u64) {
     );
     let mut first = true;
     for [id, state, ticks] in s.task.iter().copied().filter(|t| t[0] != 0) {
-        let state = ["running", "blocked", "exited", "faulted", "over_budget", "rejected", "empty"].get(state as usize).unwrap_or(&"?");
+        let state = ["running", "blocked", "exited", "faulted", "over_budget", "rejected", "empty", "stopped"].get(state as usize).unwrap_or(&"?");
         let _ = write!(
             out,
             "{}{{\"task\":{},\"id\":{},\"state\":\"{}\",\"ticks\":{}}}",
@@ -251,10 +305,11 @@ fn heartbeat(out: &mut Out, n: u64) {
 
 fn main() -> u64 {
     // The host link is the task named "uplink" (any driver with the console interface), or
-    // else the virtio console.
-    let console = lookup("uplink").or_else(|_| lookup("virtio-console")).expect("no uplink task");
+    // else the virtio console, or else the agent pulls (OP_PULL).
+    let console = lookup("uplink").or_else(|_| lookup("virtio-console")).ok();
+    assert!(console.is_some() || lookup("agent").is_ok(), "no uplink task, console or agent");
     let link_name = if lookup("uplink").is_ok() { "uplink" } else { "virtio-console" };
-    let mut out = Out { buf: [0; 4096], len: 0, console, link_name };
+    let mut out = Out { buf: [0; 4096], len: 0, console, link_name, ring: [0; RING], ring_len: 0, ring_dropped: 0 };
     let mut msg = [0u8; 4096];
     let mut interval = DEFAULT_INTERVAL_TICKS;
     let mut next_heartbeat = uptime() + HEARTBEAT_TICKS;
@@ -283,9 +338,21 @@ fn main() -> u64 {
                 let _ = reply(m.sender, 0, &interval.to_le_bytes());
                 record_line(&mut out, m.sender, "scope", &msg[..m.len]);
             }
+            Ok(m) if m.op == OP_PULL => {
+                let mut name = [0u8; 16];
+                if task_name(m.sender, &mut name) != Ok("agent") {
+                    let _ = reply(m.sender, 2, &[]);
+                    continue;
+                }
+                drain_events(&mut out);
+                out.flush();
+                let mut lines = [0u8; 4096];
+                let n = out.pull(&mut lines);
+                let _ = reply(m.sender, 0, &lines[..n]);
+            }
             Ok(m) if m.op == OP_SET_INTERVAL && m.len == 8 => {
                 let mut name = [0u8; 16];
-                if task_name(m.sender, &mut name) != Ok("control") {
+                if !matches!(task_name(m.sender, &mut name), Ok("control" | "agent")) {
                     let _ = reply(m.sender, 2, &[]);
                     continue;
                 }

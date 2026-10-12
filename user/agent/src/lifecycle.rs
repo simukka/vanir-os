@@ -21,6 +21,9 @@ use vanir_user::{err, events, lookup, println, slot, supervisor, uptime};
 
 /// Most slots the agent tracks.
 pub const MAX_SLOTS: usize = 16;
+/// The names of the slots tracked (`Slot::name` points here).
+static mut NAMES: [[u8; 16]; MAX_SLOTS] = [[0; 16]; MAX_SLOTS];
+
 /// How long a new instance has to say it is ready: 10 s.
 pub const READY_TIMEOUT: u64 = 1000;
 
@@ -78,6 +81,7 @@ impl Slot {
 /// still holds the previous version.
 #[derive(Clone, Copy)]
 pub struct Deploy {
+    /// The slot becoming live (for a drain-only operation, the same as `old`).
     pub new: usize,
     pub old: Option<usize>,
     pub step: Step,
@@ -89,6 +93,8 @@ pub struct Deploy {
 pub enum Step {
     /// Load the image into `new`, or start `new` again from the image it holds.
     Start,
+    /// Drain `old` and stop it, with nothing taking its place (the service is going away).
+    Drain,
     WaitReady { until: u64 },
     Promote,
     WaitDrained,
@@ -103,6 +109,8 @@ pub struct Agent {
     net: u64,
     supervisor: u64,
     telemetry: Option<u64>,
+    /// A slot changed state since this was last cleared (the control plane wants a report).
+    pub changed: bool,
 }
 
 /// The drain deadline in ticks for an instance of `image`: the descriptor's default, or `asked`
@@ -133,18 +141,29 @@ impl Agent {
             net: id("net"),
             supervisor: id("supervisor"),
             telemetry: lookup("telemetry").ok(),
+            changed: false,
         }
     }
 
     /// The index of slot `name`, tracking it from now on.
-    pub fn slot(&mut self, name: &'static str) -> usize {
+    pub fn slot(&mut self, name: &str) -> usize {
+        self.find_slot(name).unwrap_or_else(|| panic!("agent: no slot named {name}"))
+    }
+
+    /// The index of slot `name` if the task table has one, tracking it from now on.
+    pub fn find_slot(&mut self, name: &str) -> Option<usize> {
         if let Some(k) = self.slots.iter().position(|s| s.is_some_and(|s| s.name == name)) {
-            return k;
+            return Some(k);
         }
-        let id = lookup(name).unwrap_or_else(|_| panic!("agent: no slot named {name}"));
-        let k = self.slots.iter().position(Option::is_none).expect("agent: too many slots");
+        let id = lookup(name).ok()?;
+        let k = self.slots.iter().position(Option::is_none)?;
+        // Keep our own copy of the name: names come from the control plane too.
+        let names = unsafe { &mut *(&raw mut NAMES) };
+        let len = name.len().min(16);
+        names[k][..len].copy_from_slice(&name.as_bytes()[..len]);
+        let name = core::str::from_utf8(&names[k][..len]).unwrap_or("?");
         self.slots[k] = Some(Slot { name, id, state: State::Empty, image: None });
-        k
+        Some(k)
     }
 
     pub fn get(&self, k: usize) -> Slot {
@@ -161,6 +180,7 @@ impl Agent {
         let s = self.slots[k].as_mut().unwrap();
         let from = s.state;
         s.state = to;
+        self.changed = true;
         let s = *s;
         let service = core::str::from_utf8(s.service()).unwrap_or("?");
         println!("agent: {} ({} v{}): {} -> {}", s.name, service, s.version(), from.name(), to.name());
@@ -187,9 +207,34 @@ impl Agent {
         let image = self.get(new).image.unwrap();
         let old = self.live(image.service());
         let drain = old.map_or(0, |o| drain_ticks(&self.get(o).image.unwrap(), drain_secs));
-        let Some(d) = self.deploys.iter().position(Option::is_none) else { return false };
+        let Some(d) = self.deploys.iter().position(|d| d.is_none_or(|d| matches!(d.step, Step::Done | Step::Failed))) else {
+            return false;
+        };
         self.deploys[d] = Some(Deploy { new, old, step: Step::Start, drain_ticks: drain });
         true
+    }
+
+    /// Drain the instance in slot `k` and stop it, with nothing taking its place.
+    pub fn drain(&mut self, k: usize, drain_secs: Option<u64>) -> bool {
+        if self.get(k).state != State::Live {
+            return false;
+        }
+        let drain_ticks = drain_ticks(&self.get(k).image.unwrap(), drain_secs);
+        let Some(d) = self.deploys.iter().position(|d| d.is_none_or(|d| matches!(d.step, Step::Done | Step::Failed))) else {
+            return false;
+        };
+        self.deploys[d] = Some(Deploy { new: k, old: Some(k), step: Step::Drain, drain_ticks });
+        true
+    }
+
+    /// Whether a deployment of `service` is under way.
+    pub fn busy(&self, service: &[u8]) -> bool {
+        let holds = |k: usize| self.get(k).service() == service;
+        self.deploys
+            .iter()
+            .flatten()
+            .filter(|d| !matches!(d.step, Step::Done | Step::Failed))
+            .any(|d| holds(d.new) || d.old.is_some_and(holds))
     }
 
     /// Whether every deployment has finished (done or failed).
@@ -226,6 +271,14 @@ impl Agent {
                 self.set(d.new, State::Starting);
                 // RFD 3: a service with a volume isn't ready until it has opened it.
                 Step::WaitReady { until: now + READY_TIMEOUT }
+            }
+            Step::Drain => {
+                let old = d.old.unwrap();
+                if let Err(e) = net::drain_nowait(self.net, self.get(old).id, d.drain_ticks) {
+                    println!("agent: draining {} failed: {}", self.get(old).name, net::code_name(e));
+                }
+                self.set(old, State::Draining);
+                Step::WaitDrained
             }
             Step::WaitReady { until } => match net::status(self.net, new.id) {
                 Ok((STATUS_READY | STATUS_LIVE, _)) => {
@@ -277,7 +330,10 @@ impl Agent {
     fn load(&mut self, k: usize) -> bool {
         let s = self.get(k);
         let image = s.image.unwrap();
-        if let Err(e) = slot::stage_all(s.id, image.elf) {
+        // An image fetched from the control plane was staged as it arrived.
+        if !image.elf.is_empty()
+            && let Err(e) = slot::stage_all(s.id, image.elf)
+        {
             println!("agent: staging into {} failed: {}", s.name, err::name(e));
             return false;
         }

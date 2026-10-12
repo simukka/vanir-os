@@ -130,6 +130,14 @@ CASES=(
   "deploy-not-ready      | deploy                  | supervisor/halt-on-exit http/exit-on-request http/never-ready-v2 agent/script-not-ready|               | NET=user SLOW=1                                                                                                              | 1 | re:small-1 didn't say it was ready in time; stopping it[\s\S]*small-1 \(web v2\): STARTING -> FAILED[\s\S]*after the failed deployment, small-0 is LIVE"
   "drain-deadline-cap    | deploy                  | supervisor/halt-on-exit http/exit-on-request agent/script-drain-cap|               | NET=user                                                                                                                     | 1 | re:drain deadline 100000 s asked; the descriptor allows at most 300 s[\s\S]*net: draining small-0 \(deadline in 30000 ticks\)"
   "deploy-commit         | deploy                  | supervisor/halt-on-exit http/exit-on-request agent/script-commit|               | NET=user                                                                                                                     | 1 | cmd:out=\$(cat); grep -q \"supervisor: task 5 stopped\" <<<\"\$out\" && ! grep -q \"restarting task 5\" <<<\"\$out\" && grep -q \"small-0): unloaded web version 1\" <<<\"\$out\" && grep -q \"agent: web v1 is live again in small-0\" <<<\"\$out\""
+  "agent-connect         | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=connect                                                                                            | 1 | re:agent: connected to the control plane[\s\S]*agent: the control plane says the test is over[\s\S]*control-plane: node connected \(no TPM\)[\s\S]*first report: generation 0[\s\S]*control-plane: PASS"
+  "agent-wrong-cp-key    | agent                   | supervisor/halt-on-exit agent/exit-after-failures           |               | NET=user NET_MGMT=user CP=wrong-key CP_ARGS=--noise-key,build/rogue-cp-noise.key                                             | 1 | re:agent: no control plane after 3 attempts[\s\S]*control-plane: [0-9]+ handshakes failed; reports: 0[\s\S]*control-plane: PASS"
+  "agent-signed-state    | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=signed-state                                                                                       | 1 | re:desired state refused: bad signature[\s\S]*desired state generation 2 applied[\s\S]*desired state refused: stale generation[\s\S]*control-plane: refused: signed with another key[\s\S]*refused: replayed generation 2[\s\S]*refused: older generation 1[\s\S]*control-plane: PASS"
+  "agent-deploy          | agent                   | supervisor/halt-on-exit http/exit-on-request                |               | NET=user NET_MGMT=user CP=deploy PEER=deploy-under-load SLOW=1                                                               | 1 | cmd:out=\$(cat); grep -q \"control-plane: reached: web v1 unloaded\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && grep -q \"followed web v1 on small-0 -> web v2 on small-1: 8/8\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\""
+  "agent-reconnect       | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=reconnect SLOW=1                                                                                   | 1 | cmd:out=\$(cat); grep -q \"dropping the connection after 3 chunks\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && [ \$(grep -c \"run-time log entry .*: load\" <<<\"\$out\") = 2 ]"
+  "agent-drain           | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=drain                                                                                              | 1 | cmd:out=\$(cat); grep -q \"net: draining small-0 (deadline in 200 ticks)\" <<<\"\$out\" && grep -q \"control-plane: reached: web v1 stopped\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && grep -q \\\"event\\\":\\\"instance\\\".*\\\"to\\\":\\\"STOPPED\\\" build/cp-telemetry.log && grep -q \\\"event\\\":\\\"image_loaded\\\" build/cp-telemetry.log && grep -q \\\"event\\\":\\\"stopped\\\" build/cp-telemetry.log"
+  "agent-attested        | agent-tpm               | supervisor/halt-on-exit agent/exit-on-end                   |               | BOOT=uefi-secure ACCEL=kvm TPM=1 NET=user NET_MGMT=user CP=connect CP_ARGS=--require-attestation                             | 1 | re:control-plane: node attested: the quote binds this handshake.s keys to a measured boot[\s\S]*node connected \(attested\)[\s\S]*control-plane: PASS"
+  "agent-unbound-key     | agent-tpm               | supervisor/halt-on-exit agent/exit-after-failures agent/quote-wrong-key|               | BOOT=uefi-secure ACCEL=kvm TPM=1 NET=user NET_MGMT=user CP=wrong-key CP_ARGS=--require-attestation                           | 1 | re:agent: no control plane after 3 attempts[\s\S]*refused: the quote doesn.t bind this handshake.s static key[\s\S]*control-plane: PASS"
 )
 
 # Manifests that must not build: app | text the build error must contain.
@@ -137,9 +145,24 @@ BUILD_FAILS=(
   "http-port-clash | port 80 is declared by web (service web) and other (service other)"
 )
 
+# Checks that run on the host alone: name | command that must succeed.
+HOST_CHECKS=(
+  "noise-vectors | cargo test -q -p noise --target x86_64-unknown-linux-gnu && python3 -c 'import json, sys; sys.path.insert(0, \"tools\"); import vanir_noise; p = vanir_noise.check_vector(json.load(open(\"tests/vectors/noise-ik.json\"))); print(p or \"python: all match\"); sys.exit(bool(p))'"
+)
+
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
 
 failed=0
+for check in "${HOST_CHECKS[@]}"; do
+  IFS='|' read -r name command <<<"$check"
+  name=$(trim "$name"); command=$(trim "$command")
+  [[ "$name" =~ ${ONLY:-.} ]] || continue
+  if check_log=$(bash -c "$command" 2>&1); then
+    echo "PASS $name"
+  else
+    echo "FAIL $name"; tail -10 <<<"$check_log" | sed 's/^/    /'; failed=1
+  fi
+done
 for case in "${BUILD_FAILS[@]}"; do
   IFS='|' read -r app want <<<"$case"
   app=$(trim "$app"); want=$(trim "$want")
@@ -176,6 +199,20 @@ for case in "${CASES[@]}"; do
   qemu=$(make -s qemu-cmd "${vars[@]}")
   peer=""
   for v in $env; do [[ "$v" == PEER=* ]] && peer=${v#PEER=}; done
+  # CP=<scenario> runs the mock control plane next to QEMU (CP_ARGS=a,b,c adds options); its
+  # output is checked with the serial log, after a "--- control plane ---" line.
+  cp=""
+  cp_args=()
+  for v in $env; do
+    [[ "$v" == CP=* ]] && cp=${v#CP=}
+    [[ "$v" == CP_ARGS=* ]] && IFS=, read -r -a cp_args <<<"${v#CP_ARGS=}"
+  done
+  if [ -n "$cp" ]; then
+    rm -f build/cp.log build/cp-telemetry.log
+    tools/control-plane.py "$cp" --timeout "$limit" "${cp_args[@]}" >build/cp.log 2>&1 &
+    cp_pid=$!
+    sleep 0.5
+  fi
   if [ -n "$peer" ]; then
     rm -f build/peer.log
     tools/net-peer.py "$peer" --timeout "$limit" >build/peer.log 2>&1 &
@@ -209,6 +246,11 @@ for case in "${CASES[@]}"; do
     for _ in $(seq 50); do kill -0 $peer_pid 2>/dev/null || break; sleep 0.1; done
     kill $peer_pid 2>/dev/null; wait $peer_pid 2>/dev/null
     out+=$'\n--- peer ---\n'"$(cat build/peer.log)"
+  fi
+  if [ -n "$cp" ]; then
+    for _ in $(seq 30); do kill -0 $cp_pid 2>/dev/null || break; sleep 0.1; done
+    kill $cp_pid 2>/dev/null; wait $cp_pid 2>/dev/null
+    out+=$'\n--- control plane ---\n'"$(cat build/cp.log)"
   fi
   # What reached the host over the virtio console, for the checks below.
   out+=$'\n--- build/telemetry.log ---\n'"$(cat build/telemetry.log 2>/dev/null)"

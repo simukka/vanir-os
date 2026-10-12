@@ -506,6 +506,7 @@ pub mod events {
     pub const IMAGE_REJECTED: u64 = 7;
     pub const IMAGE_LOADED: u64 = 8;
     pub const IMAGE_UNLOADED: u64 = 9;
+    pub const STOPPED: u64 = 10;
 
     /// Why the kernel refused a task image (`IMAGE_REJECTED`'s `a`, a death record's `code`).
     pub fn rejection(reason: u64) -> &'static str {
@@ -587,6 +588,10 @@ pub mod attest {
     /// Message: the first entry wanted (u64). Reply: one JSON line of run-time log entries from
     /// there, up to the count the last quote covered; code 1 when there are none.
     pub const OP_RUNTIME_LOG: u64 = 3;
+    /// From the agent only. Message: a nonce (32 bytes) and the agent's X25519 key (32 bytes).
+    /// Reply: the JSON quote line as for `OP_QUOTE`, over SHA-256(nonce || that key), with
+    /// `kx_pub` the agent's key.
+    pub const OP_QUOTE_FOR: u64 = 4;
 }
 
 /// The key server (the task named "keys", `user/unlocker`): a stand-in for a local key store.
@@ -631,13 +636,16 @@ pub mod telemetry {
     /// A counter snapshot (`Record`: the scope, then the counters, cumulative). Reply: the
     /// snapshot interval in ticks (u64), which the host may change; send the next one then.
     pub const OP_COUNTERS: u64 = 4;
-    /// From the task named "control" only: set the snapshot interval, in milliseconds (u64),
+    /// From the task named "control" or "agent" only: set the snapshot interval, in milliseconds (u64),
     /// bounded to 100 ms..60 s.
     pub const OP_SET_INTERVAL: u64 = 5;
 
     /// Any other event (`Record`: the event's name, then its fields), e.g. a crash reported by
     /// the supervisor.
     pub const OP_EVENT: u64 = 6;
+    /// From the task named "agent", when there is no uplink driver: the JSON lines waiting to
+    /// go to the control plane (whole lines, at most 4 KiB), oldest first.
+    pub const OP_PULL: u64 = 7;
 
     /// Counter snapshots go out this often until the host says otherwise (RFD 1: 1 s).
     pub const DEFAULT_INTERVAL_TICKS: u64 = 100;
@@ -773,6 +781,10 @@ pub mod net {
     /// From a task with `routes = true`. Message: an instance's task id (u64). Reply: its
     /// status (u64, `STATUS_*`) and its `drain_forced` count (u64).
     pub const OP_STATUS: u64 = 13;
+    /// From a task with `connects = true`. Message: IPv4 address (4 bytes) and port (u16).
+    /// Reply: a connection handle (u32), usable at once; `EV_WRITE` comes once it is connected,
+    /// `EV_CLOSED` if it fails. `CODE_NOT_READY` while the stack has no address.
+    pub const OP_CONNECT: u64 = 14;
 
     /// `OP_STATUS` answers. UNKNOWN: not an instance (yet, or any more: it hasn't listened, or
     /// it has gone).
@@ -920,6 +932,16 @@ pub mod net {
         let mut forced = [0u8; 8];
         call(net, OP_DRAIN, &msg, &mut forced)?;
         Ok(u64::from_le_bytes(forced))
+    }
+
+    /// Connect to `addr:port`; returns the connection handle.
+    pub fn connect(net: u64, addr: [u8; 4], port: u16) -> Result<u32, u64> {
+        let mut msg = [0u8; 6];
+        msg[..4].copy_from_slice(&addr);
+        msg[4..].copy_from_slice(&port.to_le_bytes());
+        let mut h = [0u8; 4];
+        call(net, OP_CONNECT, &msg, &mut h)?;
+        Ok(u32::from_le_bytes(h))
     }
 
     /// An instance's status (`STATUS_*`) and how many of its connections a drain reset.

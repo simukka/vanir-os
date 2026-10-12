@@ -34,6 +34,11 @@ TRUSTED_PUB    := $(SIGNING_PUB)
 SIGN_VERSION   := 1
 # Slot images are signed with this key (the rogue-key test changes it).
 SLOT_SIGNING_KEY := $(SIGNING_KEY)
+# The control plane's keys, pinned in the agent (RFD 2, P7): its Noise static key and the key
+# that signs desired state. tools/control-plane.py makes dev keys; CP_ADDR is where the agent
+# dials (the host, through slirp, on the management network).
+CP_KEY         := keys/cp-noise.key
+CP_ADDR        := 10.0.2.2:7000
 # Tests of the signature checks: changed after signing, shipped unsigned, signatures swapped (a:b).
 TAMPER         :=
 UNSIGNED       :=
@@ -131,14 +136,19 @@ $(SLOT_SIGNING_KEY):
 	tools/sign-image.py gen-key $@ $(@:.key=.pub)
 endif
 
-user: $(SIGNING_KEY) $(SLOT_SIGNING_KEY) FORCE
+$(CP_KEY):
+	tools/control-plane.py gen-keys $(dir $@)
+
+user: $(SIGNING_KEY) $(SLOT_SIGNING_KEY) $(CP_KEY) FORCE
 	cargo build $(addprefix -p ,$(BUILD_PROGS)) --$(PROFILE) $(USER_CARGO_FEATURES)
 	@mkdir -p build/slots
 	for p in $(BUILD_PROGS); do objcopy --strip-all $(TARGET_DIR)/$$p build/$$p.elf; done
 	for s in $(SLOT_IMAGES); do set -- $$(echo $$s | tr : ' '); \
 	    cp build/$$2.elf build/slots/$$1.elf; \
 	    tools/sign-image.py sign-slot $(SLOT_SIGNING_KEY) build/slots/$$1.elf $$3 build/slots/$$1 || exit 1; done
-	VANIR_SLOTS="$(abspath build/slots)" cargo build -p agent --$(PROFILE) $(AGENT_CARGO_FEATURES)
+	VANIR_SLOTS="$(abspath build/slots)" VANIR_CP_PUB="$(abspath $(dir $(CP_KEY))cp-noise.pub)" \
+	    VANIR_CP_SIGN_PUB="$(abspath $(dir $(CP_KEY))cp-sign.pub)" VANIR_CP_ADDR="$(CP_ADDR)" \
+	    cargo build -p agent --$(PROFILE) $(AGENT_CARGO_FEATURES)
 	objcopy --strip-all $(TARGET_DIR)/agent build/agent.elf
 	tools/sign-image.py sign-all $(SIGNING_KEY) build $(USER_PROGS) --version $(SIGN_VERSION)
 

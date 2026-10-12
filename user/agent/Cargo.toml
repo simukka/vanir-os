@@ -10,8 +10,17 @@ bench = false
 
 [dependencies]
 vanir-user = { path = "../lib" }
+noise = { path = "../noise" }
+ed25519-compact = { version = "2.6.0", default-features = false, features = ["x25519"] }
+sha2 = { version = "0.11.0", default-features = false }
 
 [features]
+# tests only: exit once the desired state says `end` and nothing is under way
+exit-on-end = []
+# tests only: exit after three failed attempts to reach the control plane
+exit-after-failures = []
+# tests only: get a quote over some other key than the handshake's (the control plane refuses)
+quote-wrong-key = []
 # Test scripts, standing in for the control plane until there is one. Each carries the slot
 # images it needs (built into build/slots by the Makefile).
 test-images = []
