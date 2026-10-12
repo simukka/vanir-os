@@ -514,13 +514,13 @@ def wait_for_instance(name, deadline):
     return False
 
 
-@scenario
-def swap_under_load(args):
-    """Eight keep-alive clients request without pause while the switcher makes web-2 live and
-    drains web-1. No request may fail, and each client must move from web-1 to web-2 for good."""
+def under_load(args, path):
+    """Eight keep-alive clients request without pause while traffic moves through the instances
+    in `path` (the names after "hello from "). No request may fail, and each client must see
+    exactly that sequence of instances, ending with 50 answers from the last."""
     deadline = time.monotonic() + args.timeout - 5
-    if not wait_for_instance("web-1", deadline):
-        say("web-1 never answered")
+    if not wait_for_instance(path[0], deadline):
+        say(f"{path[0]} never answered")
         return finish(False)
     answers = [[] for _ in range(8)]
     failures = []
@@ -534,10 +534,10 @@ def swap_under_load(args):
                     c = Http()
                 status, _, body = c.request("/")
                 if status == 200:
-                    answers[i].append(body.split()[-1])
+                    answers[i].append(body.strip().removeprefix("hello from "))
                 else:
                     failures.append(f"status {status}")
-                if c.closed:  # Connection: close (web-1 draining): reconnect
+                if c.closed:  # Connection: close (the old instance is draining): reconnect
                     c.close()
                     c = None
             except (HttpError, OSError) as e:
@@ -546,22 +546,51 @@ def swap_under_load(args):
                 failures.append(f"{e} (client {i}, request {served + 1} on its connection, last answer from {last})")
                 c = None
 
+    def seen(a):
+        """The instances a client saw, in order, repeats folded."""
+        return [x for k, x in enumerate(a) if k == 0 or a[k - 1] != x]
+
+    def finished(a):
+        return seen(a) == path and len(a) - (max(k for k, x in enumerate(a) if k == 0 or a[k - 1] != x)) >= 50
+
     threads = [threading.Thread(target=client, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
-    while time.monotonic() < deadline and not all(a.count("web-2") >= 50 for a in answers):
+    while time.monotonic() < deadline and not all(finished(list(a)) for a in answers):
         time.sleep(0.1)
     stop.set()
     for t in threads:
         t.join()
-    moved = sum(1 for a in answers if "web-2" in a and "web-1" not in a[a.index("web-2"):])
+    followed = sum(1 for a in answers if seen(a) == path)
     total = sum(len(a) for a in answers)
-    say(f"{total} requests: {sum(a.count('web-1') for a in answers)} from web-1, {sum(a.count('web-2') for a in answers)} from web-2, {len(failures)} failed")
+    counts = ", ".join(f"{sum(a.count(n) for a in answers)} from {n}" for n in dict.fromkeys(path))
+    say(f"{total} requests: {counts}, {len(failures)} failed")
     for f in failures[:5]:
         say(f"failure: {f}")
-    say(f"clients that moved to web-2 for good: {moved}/8")
+    for a in answers:
+        if seen(a) != path:
+            say(f"a client saw {seen(a)}")
+    say(f"clients that followed {' -> '.join(path)}: {followed}/8")
     time.sleep(1)  # let the drain finish
-    return finish(not failures and moved == 8)
+    return finish(not failures and followed == 8)
+
+
+@scenario
+def swap_under_load(args):
+    """The switcher makes web-2 live and drains web-1 (RFD 1)."""
+    return under_load(args, ["web-1", "web-2"])
+
+
+@scenario
+def deploy_under_load(args):
+    """The agent deploys web v2 into small-1 while web v1 serves from small-0 (RFD 2)."""
+    return under_load(args, ["web v1 on small-0", "web v2 on small-1"])
+
+
+@scenario
+def rollback_under_load(args):
+    """The agent deploys web v2, then rolls back to v1 from the image small-0 kept (RFD 2)."""
+    return under_load(args, ["web v1 on small-0", "web v2 on small-1", "web v1 on small-0"])
 
 
 @scenario

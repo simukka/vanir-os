@@ -19,6 +19,8 @@ test-images = []
 script-load = ["test-images"]
 # load hello into small-0 and unload it again after it exits, 200 times, then exit
 script-hello-loop = ["test-images"]
+# load hello into small-0 (it exits 0, and stays down), then wait
+script-hello = ["test-images"]
 # load crasher into small-0 (the supervisor restarts it), then wait
 script-crasher = ["test-images"]
 # load hello, unload, load, unload, ... until the run-time log is full, then exit
@@ -33,4 +35,10 @@ try-boot-sig = ["test-images"]        # a boot image's signature file (VNRSIG01)
 try-floor = ["test-images"]           # version below the descriptor's min_version
 try-large = ["test-images"]           # descriptor asks for another slot class
 try-occupied = ["test-images"]        # load web v1, then stage over it while it runs
-try-web-v1 = ["test-images"]          # web v1 (with a manifest or key that must refuse it)
+try-web-v1 = ["test-images"]
+# deployments with the lifecycle (RFD 2, P3/P4), web v1 live in small-0 first:
+script-deploy = ["test-images"]      # deploy web v2 into small-1, then wait
+script-rollback = ["test-images"]    # deploy web v2, then roll back to v1, then wait
+script-not-ready = ["test-images"]   # deploy a web v2 that never says it is ready, then exit
+script-drain-cap = ["test-images"]   # deploy web v2 asking for a drain longer than allowed, then exit
+script-commit = ["test-images"]      # deploy web v2, commit, deploy web v1 into small-0 again, then exit          # web v1 (with a manifest or key that must refuse it)

@@ -24,6 +24,8 @@ pub const IMAGE_REJECTED: u64 = 7;
 pub const IMAGE_LOADED: u64 = 8;
 /// A slot was emptied: a = the version it held.
 pub const IMAGE_UNLOADED: u64 = 9;
+/// The supervisor stopped a task on purpose.
+pub const STOPPED: u64 = 10;
 
 /// One event, as the reader receives it. Fields `a`, `b`, `c` depend on `kind`:
 /// TASK_START a = signed version; EXIT a = code; FAULT a = vector, b = rip, c = cr2; OVER_BUDGET a = budget;

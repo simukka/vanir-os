@@ -38,6 +38,7 @@ pub const SYS_SLOT_UNLOAD: u64 = 121;
 pub const SYS_TPM_LOCK: u64 = 122;
 pub const SYS_TPM_UNLOCK: u64 = 123;
 pub const SYS_RUNTIME_LOG: u64 = 124;
+pub const SYS_STOP: u64 = 125;
 
 /// The most tasks (fixed tasks and slots) a manifest may declare; size per-task tables with it.
 pub const MAX_TASKS: usize = 64;
@@ -204,6 +205,41 @@ impl DeathRecord {
 pub fn restart(id: u64) -> Result<u64, u64> {
     let (new_id, _, _) = syscall6(SYS_RESTART, [id, 0, 0, 0, 0, 0]);
     if err::is_error(new_id) { Err(new_id) } else { Ok(new_id) }
+}
+
+/// Supervisor only: end live task `id` on purpose; it is reported as stopped (death kind 5).
+pub fn stop(id: u64) -> Result<(), u64> {
+    let (status, _, _) = syscall6(SYS_STOP, [id, 0, 0, 0, 0, 0]);
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
+/// Requests to the supervisor (from the agent, RFD 2, P4). Message: a task id (u64). Reply
+/// code 0 and the new id (u64) on success; otherwise 0x100 | the kernel error's low bits.
+pub mod supervisor {
+    use super::send;
+
+    /// Stop the task: it is reported as stopped and not restarted.
+    pub const OP_STOP: u64 = 1;
+    /// Start a dead task again (e.g. a stopped slot, for a rollback), with its backoff reset.
+    pub const OP_START: u64 = 2;
+
+    fn call(supervisor: u64, op: u64, id: u64) -> Result<u64, u64> {
+        let mut out = [0u8; 8];
+        match send(supervisor, op, &id.to_le_bytes(), &mut out) {
+            Ok((0, 8)) => Ok(u64::from_le_bytes(out)),
+            Ok((code, _)) => Err(code & 0xff | super::err::DEAD),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn stop(supervisor: u64, id: u64) -> Result<(), u64> {
+        call(supervisor, OP_STOP, id).map(|_| ())
+    }
+
+    /// Returns the task's new id.
+    pub fn start(supervisor: u64, id: u64) -> Result<u64, u64> {
+        call(supervisor, OP_START, id)
+    }
 }
 
 /// Supervisor only: stop the system, as if nothing could run any more (tests end this way when
@@ -734,6 +770,24 @@ pub mod net {
     pub const OP_DRAIN: u64 = 11;
     /// Routing: message `Block`. Drop packets from that range until it expires.
     pub const OP_BLOCK: u64 = 12;
+    /// From a task with `routes = true`. Message: an instance's task id (u64). Reply: its
+    /// status (u64, `STATUS_*`) and its `drain_forced` count (u64).
+    pub const OP_STATUS: u64 = 13;
+
+    /// `OP_STATUS` answers. UNKNOWN: not an instance (yet, or any more: it hasn't listened, or
+    /// it has gone).
+    pub const STATUS_UNKNOWN: u64 = 0;
+    pub const STATUS_GONE: u64 = STATUS_UNKNOWN;
+    /// Listening, but hasn't said `OP_READY`.
+    pub const STATUS_STARTING: u64 = 1;
+    pub const STATUS_READY: u64 = 2;
+    pub const STATUS_LIVE: u64 = 3;
+    pub const STATUS_DRAINING: u64 = 4;
+    pub const STATUS_DRAINED: u64 = 5;
+
+    /// `OP_DRAIN` flag (third u64 of the message): answer at once instead of when the drain is
+    /// over; follow it with `OP_STATUS`.
+    pub const DRAIN_NOWAIT: u64 = 1;
 
     pub const CODE_OK: u64 = 0;
     pub const CODE_WOULD_BLOCK: u64 = 1;
@@ -866,6 +920,22 @@ pub mod net {
         let mut forced = [0u8; 8];
         call(net, OP_DRAIN, &msg, &mut forced)?;
         Ok(u64::from_le_bytes(forced))
+    }
+
+    /// An instance's status (`STATUS_*`) and how many of its connections a drain reset.
+    pub fn status(net: u64, instance: u64) -> Result<(u64, u64), u64> {
+        let mut out = [0u8; 16];
+        call(net, OP_STATUS, &instance.to_le_bytes(), &mut out)?;
+        Ok((u64::from_le_bytes(out[..8].try_into().unwrap()), u64::from_le_bytes(out[8..].try_into().unwrap())))
+    }
+
+    /// Start draining `instance` with a deadline in `ticks`, without waiting for it to end.
+    pub fn drain_nowait(net: u64, instance: u64, ticks: u64) -> Result<(), u64> {
+        let mut msg = [0u8; 24];
+        msg[..8].copy_from_slice(&instance.to_le_bytes());
+        msg[8..16].copy_from_slice(&ticks.to_le_bytes());
+        msg[16..].copy_from_slice(&DRAIN_NOWAIT.to_le_bytes());
+        call(net, OP_DRAIN, &msg, &mut []).map(|_| ())
     }
 
     pub fn block(net: u64, entry: &Block) -> Result<(), u64> {

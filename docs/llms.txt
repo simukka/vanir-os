@@ -41,7 +41,7 @@
 - [Boot chain and attestation](index.html#boot-chain): Secure Boot, signatures, PCR 12, quotes (PCRs 0, 4, 7, 12, 13)
 - [Storage](index.html#storage): on-disk format, key hierarchy, attested key release, restarts, storage events
 - [Networking](index.html#networking): virtio-net driver, the net task (smoltcp), socket ops, routing and draining, limits, counters and events, NET/NET_MGMT
-- [Deployment](index.html#deployment): generic slots ([[slot_class]]), signed descriptors (tools/sign-image.py sign-slot, VNRSIG02), slot_stage/slot_load/slot_unload by the agent (loads = true), PCR 13 and the kernel's run-time log, the TPM lock; agent test scripts are features
+- [Deployment](index.html#deployment): generic slots ([[slot_class]]), signed descriptors (tools/sign-image.py sign-slot, VNRSIG02), slot_stage/slot_load/slot_unload by the agent (loads = true), PCR 13 and the kernel's run-time log, the TPM lock; agent test scripts are features; the agent's lifecycle (EMPTY, STARTING, READY, LIVE, DRAINING, DRAINED, STOPPED, FAILED), local swap, rollback, commit; supervisor OP_STOP/OP_START, kernel stop(); net OP_STATUS, DRAIN_NOWAIT
 - [Syscalls](index.html#syscalls): numbers and ABI (int 0x80; rdi, rsi, rdx, r10, r8, r9)
 - [Protections](index.html#protections): each protection and the test proving it
 - [Limitations](index.html#limitations)

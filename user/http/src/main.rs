@@ -235,7 +235,11 @@ impl Server {
                 }
             }
         }
-        let _ = net::ready(self.net);
+        // Test only: version 2 and later never say they are ready (a deployment that fails).
+        let never = cfg!(feature = "never-ready-v2") && task_listen(getpid()).is_ok_and(|i| i.version >= 2);
+        if !never {
+            let _ = net::ready(self.net);
+        }
         println!("{}: serving HTTP on port {}", self.name(), PORT);
     }
 

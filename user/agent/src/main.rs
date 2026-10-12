@@ -8,6 +8,7 @@
 
 #[cfg(feature = "test-images")]
 mod images;
+mod lifecycle;
 
 use vanir_user::{err, events, lookup, println, recv, slot};
 
@@ -20,6 +21,24 @@ pub struct Image {
     pub elf: &'static [u8],
     pub descriptor: &'static [u8],
     pub sig: &'static [u8],
+}
+
+impl Image {
+    /// The service it is an instance of, from its descriptor.
+    pub fn service(&self) -> &'static [u8] {
+        let name = &self.descriptor[8..40];
+        &name[..name.iter().position(|&b| b == 0).unwrap_or(32)]
+    }
+
+    pub fn version(&self) -> u64 {
+        u64::from_le_bytes(self.descriptor[40..48].try_into().unwrap())
+    }
+
+    /// The drain deadline's default and maximum, in seconds.
+    pub fn drain_secs(&self) -> (u64, u64) {
+        let at = |i: usize| u32::from_le_bytes(self.descriptor[i..i + 4].try_into().unwrap()) as u64;
+        (at(72), at(76))
+    }
 }
 
 /// The id of slot `name` (e.g. "small-0").

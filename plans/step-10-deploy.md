@@ -1,6 +1,6 @@
 # Step 10 plan: deployment (RFD 2)
 
-Status: in progress: D1 and D2 done. See "As built" at the end for where the implementation departs from this plan.
+Status: in progress: D1 to D3 done. See "As built" at the end for where the implementation departs from this plan.
 
 ## Goal
 
@@ -279,3 +279,12 @@ Where it departs from the plan so far:
   line) and forwards them. `attest` holds the TPM lock over a whole quote (quote, PCR reads,
   entry count) so the three agree. `host-agent.py` waits for those entries before releasing a
   key, and `--attest-delay` lets `slot-attest` challenge after the load.
+- **D3 test names.** `stop-not-restarted` became `slot-exit-clean` (a service that exits 0 by
+  itself stays down: it needs a run without `halt-on-exit`) plus the checks in `deploy-commit`
+  that the drained, stopped instance is never restarted. `deploy-not-ready` uses `http`'s
+  `never-ready-v2` (only version 2 and later hold back `OP_READY`, so v1 can go live first).
+- **Status, not held replies.** `net::OP_STATUS` answers starting, ready, live, draining or
+  drained; `OP_DRAIN` takes a `DRAIN_NOWAIT` flag. `task_listen` gained a "slot" flag, so `http`
+  names itself `web v1 on small-0` only in a slot.
+- **Supervisor replies.** `OP_STOP`/`OP_START` answer 0 and the new id, or `0x100 | ` the kernel
+  error's low bits (reply codes can't have the top bit set).

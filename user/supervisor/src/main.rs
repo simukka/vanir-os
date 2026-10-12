@@ -5,6 +5,10 @@
 //! to 1 tick once the task has run `RESET_TICKS` since its last restart. Every crash is reported
 //! to telemetry with the restart count and the backoff.
 //!
+//! The agent asks it to stop and start tasks (`supervisor::OP_STOP`, `OP_START`, RFD 2, P4): a
+//! stopped task is reported as stopped and never restarted; starting one again resets its
+//! backoff.
+//!
 //! Test features: `halt-on-exit` stops the system when any task exits (tests whose servers never
 //! go idle); `give-up-after-3` / `give-up-after-3000` stop restarting a task after that many
 //! restarts, so a run whose only work is a crash loop can end; `backoff-fast` restarts at once;
@@ -14,6 +18,7 @@
 #![no_main]
 
 use core::fmt::Write;
+use vanir_user::supervisor::{OP_START, OP_STOP};
 use vanir_user::telemetry::{self, Record};
 use vanir_user::{
     DeathRecord, LineWriter, MAX_TASKS, NOTIFY_DEATH, NOTIFY_TIMER, err, lookup, println, recv, recv_timeout, restart, task_index,
@@ -105,8 +110,13 @@ fn main() -> u64 {
                 Some(d) => on_death(&mut slots, &d, telemetry),
                 None => println!("supervisor: malformed death record"),
             },
+            Ok(m) if (m.op == OP_STOP || m.op == OP_START) && m.len == 8 => {
+                // Only tasks whose `sends` name us get here: in practice, the agent.
+                let id = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let (code, data) = on_request(&mut slots, m.op, id);
+                let _ = vanir_user::reply(m.sender, code, &data.to_le_bytes());
+            }
             Ok(m) => {
-                // Nobody else is meant to talk to the supervisor yet.
                 let _ = vanir_user::reply(m.sender, 1, &[]);
             }
             Err(e) => println!("supervisor: recv failed: {}", err::name(e)),
@@ -119,6 +129,26 @@ fn main() -> u64 {
                 do_restart(&mut slots, task, id, telemetry);
             }
         }
+    }
+}
+
+/// Stop a task, or start a stopped one again. Returns (reply code, new id): code 0 on
+/// success, otherwise the kernel's error.
+fn on_request(slots: &mut [Slot; MAX_TASKS], op: u64, id: u64) -> (u64, u64) {
+    let Some(slot) = slots.get_mut(task_index(id) as usize) else { return (0x100 | (err::BAD_TARGET & 0xff), 0) };
+    slot.pending = None;
+    let result = if op == OP_STOP { vanir_user::stop(id).map(|()| 0) } else { restart(id) };
+    match result {
+        Ok(new) => {
+            if op == OP_START {
+                slot.backoff = 0;
+                slot.restarted_at = uptime();
+                println!("supervisor: started task {} again (id {:#x})", task_index(id), new);
+            }
+            (0, new)
+        }
+        // Reply codes must have the top bit clear; the low bits say which kernel error it was.
+        Err(e) => (0x100 | (e & 0xff), 0),
     }
 }
 
@@ -145,6 +175,11 @@ fn on_death(slots: &mut [Slot; MAX_TASKS], d: &DeathRecord, telemetry: Option<u6
         4 => {
             let why = vanir_user::events::rejection(d.code);
             report(telemetry, format_args!("task {} image rejected ({}): not starting it", task, why));
+            return;
+        }
+        5 => {
+            println!("supervisor: task {} stopped", task);
+            slot.pending = None;
             return;
         }
         _ => {}

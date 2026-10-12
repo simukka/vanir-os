@@ -1,0 +1,29 @@
+# Deployments on one node (RFD 2, P3/P4): the agent loads service images into slots, makes the
+# new instance live through net, drains the old one and has the supervisor stop it.
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic"]
+
+[[task]]
+name = "agent"
+loads = true
+routes = true
+sends = ["net", "supervisor"]
+
+[[slot_class]]
+name = "small"
+count = 3
+memory_pages = 256
+image_pages = 128
+sends = ["net"]

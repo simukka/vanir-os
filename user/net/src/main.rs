@@ -166,6 +166,8 @@ struct Instance {
     generation: u16,
     ready: bool,
     drain: Option<Drain>,
+    /// A drain finished: it gets no connections, and waits to be stopped.
+    drained: bool,
     /// Ports (bit per `ports` entry) it listens on.
     listening: u8,
     /// Its `OP_WAIT`, if one is held: (deadline tick).
@@ -176,7 +178,8 @@ struct Instance {
 /// An instance being drained.
 #[derive(Clone, Copy)]
 struct Drain {
-    /// Who asked; its `OP_DRAIN` is answered when the drain is over.
+    /// Who asked; its `OP_DRAIN` is answered when the drain is over (0: answered already,
+    /// `DRAIN_NOWAIT`).
     by: u64,
     deadline: u64,
     /// `EV_DRAIN` not yet delivered.
@@ -351,6 +354,7 @@ impl Stack {
             ready: false,
             listening: 0,
             drain: None,
+            drained: false,
             waiting: None,
             counters: InstanceCounters::default(),
         });
@@ -385,7 +389,9 @@ impl Stack {
                 self.reset(i, now);
             }
         }
-        if let Some(d) = self.instances[k].unwrap().drain {
+        if let Some(d) = self.instances[k].unwrap().drain
+            && d.by != 0
+        {
             let forced = self.instances[k].unwrap().counters.drain_forced;
             let _ = reply(d.by, CODE_OK, &forced.to_le_bytes()); // gone counts as drained
         }
@@ -687,8 +693,28 @@ impl Stack {
                     }
                     (_, None, _) | (_, _, OP_DRAIN) if ticks.is_none() => Err(CODE_BAD_OP),
                     (_, Some(id), OP_ROUTE) => self.route(id),
-                    (_, Some(id), _) => return self.drain(sender, id, ticks.unwrap(), now),
+                    (_, Some(id), _) => {
+                        let flags = msg.get(16..24).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                        let nowait = flags & DRAIN_NOWAIT != 0;
+                        match self.drain(if nowait { 0 } else { sender }, id, ticks.unwrap(), now) {
+                            None if nowait => Ok(0),
+                            other => return other,
+                        }
+                    }
                     _ => Err(CODE_BAD_OP),
+                }
+            }
+            OP_STATUS => {
+                let routes = task_listen(sender).is_ok_and(|i| i.may_route());
+                match msg.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) {
+                    _ if !routes => Err(CODE_NOT_ALLOWED),
+                    None => Err(CODE_BAD_OP),
+                    Some(id) => {
+                        let (status, forced) = self.status(id);
+                        out[..8].copy_from_slice(&status.to_le_bytes());
+                        out[8..16].copy_from_slice(&forced.to_le_bytes());
+                        Ok(16)
+                    }
                 }
             }
             OP_DONE => match self.instance_of(sender) {
@@ -741,6 +767,21 @@ impl Stack {
             Ok(n) => (CODE_OK, n),
             Err(code) => (code, 0),
         })
+    }
+
+    /// Instance `id`'s `STATUS_*`, and its drain_forced count.
+    fn status(&self, id: u64) -> (u64, u64) {
+        let Some(k) = self.instance_of(id) else { return (STATUS_UNKNOWN, 0) };
+        let i = self.instances[k].unwrap();
+        let live = self.services[i.service as usize].is_some_and(|s| s.live == Some(k as u8));
+        let status = match () {
+            _ if i.drained => STATUS_DRAINED,
+            _ if i.drain.is_some() => STATUS_DRAINING,
+            _ if live => STATUS_LIVE,
+            _ if i.ready => STATUS_READY,
+            _ => STATUS_STARTING,
+        };
+        (status, i.counters.drain_forced)
     }
 
     /// Make instance `id` its service's live instance.
@@ -806,8 +847,11 @@ impl Stack {
             if d.done && !open {
                 let forced = self.instances[k].unwrap().counters.drain_forced;
                 self.instances[k].as_mut().unwrap().drain = None;
+                self.instances[k].as_mut().unwrap().drained = true;
                 self.instances[k].as_mut().unwrap().listening = 0;
-                let _ = reply(d.by, CODE_OK, &forced.to_le_bytes());
+                if d.by != 0 {
+                    let _ = reply(d.by, CODE_OK, &forced.to_le_bytes());
+                }
                 let mut name = [0u8; 32];
                 let instance = task_name(id, &mut name).unwrap_or("?");
                 println!("{}: {} is drained ({} connections reset at the deadline)", self.name, instance, forced);

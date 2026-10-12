@@ -20,3 +20,5 @@ crash-after-50-requests = []
 listen-81 = []
 # At start, try to talk to the management stack (`mgmt-net`), which the manifest doesn't allow.
 try-mgmt-net = []
+# Version 2 and later (signed as a slot image) never say they are ready (deploy-not-ready).
+never-ready-v2 = []

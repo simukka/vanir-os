@@ -151,11 +151,14 @@ enum State {
     Rejected(Rejection),
     /// A generic slot with no image loaded. Not restartable; `slot_load` starts it.
     Empty,
+    /// Stopped by the supervisor (`stop`): ended on purpose, so not to be restarted unless
+    /// asked.
+    Stopped,
 }
 
 impl State {
     fn is_dead(self) -> bool {
-        matches!(self, State::Exited(_) | State::Faulted(_) | State::OverBudget | State::Rejected(_) | State::Empty)
+        matches!(self, State::Exited(_) | State::Faulted(_) | State::OverBudget | State::Rejected(_) | State::Empty | State::Stopped)
     }
 }
 
@@ -173,7 +176,7 @@ struct Death {
 #[repr(C)]
 struct DeathRecord {
     id: u64,
-    /// 1 exited, 2 faulted, 3 over CPU budget.
+    /// 1 exited, 2 faulted, 3 over CPU budget, 4 image rejected, 5 stopped.
     kind: u64,
     /// Exit code, or the fault's vector.
     code: u64,
@@ -579,13 +582,20 @@ pub fn kill(frame: &mut TrapFrame) {
 /// the supervisor, and resume the next process.
 fn end_current(table: &mut Table, frame: &mut TrapFrame, outcome: State) {
     let dead = table.current;
+    end_task(table, dead, outcome);
+    switch_to_next(table, frame);
+}
+
+/// Process `dead` has ended (not necessarily the current one): free its memory, fail every
+/// IPC waiting on it with DEAD, and tell the supervisor.
+fn end_task(table: &mut Table, dead: usize, outcome: State) {
     if table.supervisor == Some(dead) {
         // The supervisor is trusted to keep the system running; without it nothing can.
         println!("[kernel] the supervisor died; stopping");
         crate::halt(3);
     }
     let has_supervisor = table.supervisor.is_some();
-    let p = table.current();
+    let p = table.get(dead);
     if p.task.tpm {
         measure::hold_tpm(false); // a lock nobody can drop would block every load
     }
@@ -613,7 +623,6 @@ fn end_current(table: &mut Table, frame: &mut TrapFrame, outcome: State) {
             sup.state = State::Ready;
         }
     }
-    switch_to_next(table, frame);
 }
 
 /// If a death is waiting to be reported, write its record to the supervisor's buffer and set
@@ -626,6 +635,7 @@ fn report_death(table: &mut Table, sup: usize, buf: u64, cap: u64, regs: &mut Tr
         State::Faulted(vector) => (2, vector),
         State::OverBudget => (3, 0),
         State::Rejected(why) => (4, why as u64),
+        State::Stopped => (5, 0),
         _ => unreachable!("only dead processes have deaths to report"),
     };
     let record = DeathRecord {
@@ -977,6 +987,35 @@ pub fn restart(frame: &mut TrapFrame) {
     events::log(events::RESTART, p.id(), old_id, 0, 0);
 }
 
+/// `stop(id)`: end live task `id` on purpose. It dies like any task (memory freed, IPC waiting
+/// on it fails with DEAD) and is reported as stopped (death kind 5), which the supervisor
+/// doesn't restart. Supervisor only; the agent asks it (RFD 2, P4).
+pub fn stop(frame: &mut TrapFrame) {
+    let mut table = TABLE.lock();
+    let me = table.current;
+    if table.supervisor != Some(me) {
+        frame.rax = err::NOT_ALLOWED;
+        return;
+    }
+    let Some(slot) = table.slot_of(frame.rdi).filter(|&s| s != me) else {
+        frame.rax = err::BAD_TARGET;
+        return;
+    };
+    let p = table.get(slot);
+    if p.id() != frame.rdi || p.state.is_dead() {
+        frame.rax = err::DEAD;
+        return;
+    }
+    println!("[kernel] {} stopped", p.describe());
+    events::log(events::STOPPED, p.id(), 0, 0, 0);
+    p.recv_deadline = None;
+    irq::take(slot);
+    // The task never runs again, so drop what it was waiting on too: a client blocked in
+    // `send` to it, or it in `send`/`recv`, is handled by end_task and the state change.
+    end_task(&mut table, slot, State::Stopped);
+    frame.rax = 0;
+}
+
 /// `halt(code)`: stop the system now, reporting every task's state as when nothing can run.
 /// Supervisor only: it decides when a run is over (e.g. tests whose servers never go idle).
 pub fn halt(frame: &mut TrapFrame) {
@@ -992,7 +1031,7 @@ pub fn halt(frame: &mut TrapFrame) {
 }
 
 /// `task_state(id) -> (state, current id)`: 0 running or ready, 1 blocked in IPC, 2 exited,
-/// 3 faulted, 4 over budget, 5 image rejected, 6 empty slot. Supervisor only.
+/// 3 faulted, 4 over budget, 5 image rejected, 6 empty slot, 7 stopped. Supervisor only.
 pub fn task_state(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     if table.supervisor != Some(table.current) {
@@ -1009,7 +1048,7 @@ pub fn task_state(frame: &mut TrapFrame) {
 }
 
 /// 0 running or ready, 1 blocked (IPC or sleep), 2 exited, 3 faulted, 4 over budget, 5 image
-/// rejected, 6 empty slot.
+/// rejected, 6 empty slot, 7 stopped.
 fn state_code(state: State) -> u64 {
     match state {
         State::Ready | State::Running => 0,
@@ -1019,6 +1058,7 @@ fn state_code(state: State) -> u64 {
         State::OverBudget => 4,
         State::Rejected(_) => 5,
         State::Empty => 6,
+        State::Stopped => 7,
     }
 }
 
@@ -1491,6 +1531,7 @@ fn finish(table: &Table, stopped: bool) -> ! {
                 "image rejected"
             }
             State::Empty => "empty slot",
+            State::Stopped => "stopped",
             State::RecvBlocked => "waiting for messages",
             State::SendBlocked(_) | State::ReplyBlocked(_) if stopped => "waiting in send",
             State::SendBlocked(_) | State::ReplyBlocked(_) => {

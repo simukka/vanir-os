@@ -1,5 +1,7 @@
 //! Test scripts and the signed slot images they carry (build/slots, made by the Makefile).
 
+use crate::lifecycle::Agent;
+#[allow(unused_imports)]
 use crate::{Image, load, load_and_report, slot_id, unload_when_done};
 #[allow(unused_imports)]
 use vanir_user::{err, println, recv, sleep, slot};
@@ -21,6 +23,8 @@ const WEB_V1: Image = image!("web-v1");
 const HELLO: Image = image!("hello");
 #[allow(dead_code)]
 const CRASHER: Image = image!("crasher");
+#[allow(dead_code)]
+const WEB_V2: Image = image!("web-v2");
 
 /// Wait for messages forever (scripts that leave a service running).
 #[allow(dead_code)]
@@ -33,9 +37,17 @@ fn wait() -> ! {
 
 /// Run the script the features pick; returns the exit code, or None if there is none.
 pub fn script() -> Option<u64> {
+    if let Some(code) = deployment_script() {
+        return Some(code);
+    }
     #[cfg(feature = "script-load")]
     {
         let _ = load_and_report("small-0", &WEB_V1);
+        wait();
+    }
+    #[cfg(feature = "script-hello")]
+    {
+        let _ = load_and_report("small-0", &HELLO);
         wait();
     }
     #[cfg(feature = "script-crasher")]
@@ -171,4 +183,84 @@ fn report_refusal(what: &str, result: Result<u64, (u64, u64)>) {
         Err((err::REJECTED, why)) => println!("agent: {}: REJECTED ({})", what, vanir_user::events::rejection(why)),
         Err((e, _)) => println!("agent: {}: {}", what, err::name(e)),
     }
+}
+
+/// Run deployments until they have all finished, then forget them.
+#[allow(dead_code)]
+fn settle(agent: &mut Agent) {
+    loop {
+        agent.advance();
+        if agent.idle() {
+            agent.deploys = [None; 4];
+            return;
+        }
+        sleep(5);
+    }
+}
+
+/// Deployment scripts (RFD 2, P3/P4) on `net`, with the supervisor stopping and starting slots.
+/// Returns the exit code, or None if no deployment script was picked.
+#[allow(unreachable_code, unused_mut, unused_variables)]
+fn deployment_script() -> Option<u64> {
+    if !cfg!(any(
+        feature = "script-deploy",
+        feature = "script-rollback",
+        feature = "script-not-ready",
+        feature = "script-drain-cap",
+        feature = "script-commit"
+    )) {
+        return None;
+    }
+    let mut agent = Agent::new();
+    let (s0, s1) = (agent.slot("small-0"), agent.slot("small-1"));
+    // Every script starts with web v1 live in small-0.
+    agent.deploy(s0, Some(WEB_V1), None);
+    settle(&mut agent);
+
+    #[cfg(feature = "script-deploy")]
+    {
+        sleep(300);
+        agent.deploy(s1, Some(WEB_V2), None);
+        settle(&mut agent);
+        println!("agent: deployed web v2");
+        wait();
+    }
+    #[cfg(feature = "script-rollback")]
+    {
+        sleep(200);
+        agent.deploy(s1, Some(WEB_V2), None);
+        settle(&mut agent);
+        sleep(200);
+        println!("agent: rolling back to web v1");
+        let old = agent.stopped(b"web").expect("v1 is kept until commit");
+        agent.deploy(old, None, None);
+        settle(&mut agent);
+        println!("agent: rolled back to web v1");
+        wait();
+    }
+    #[cfg(feature = "script-not-ready")]
+    {
+        agent.deploy(s1, Some(WEB_V2), None);
+        settle(&mut agent);
+        println!("agent: after the failed deployment, {} is {}", agent.get(s0).name, agent.get(s0).state.name());
+        return Some(0);
+    }
+    #[cfg(feature = "script-drain-cap")]
+    {
+        agent.deploy(s1, Some(WEB_V2), Some(100_000));
+        settle(&mut agent);
+        return Some(0);
+    }
+    #[cfg(feature = "script-commit")]
+    {
+        agent.deploy(s1, Some(WEB_V2), None);
+        settle(&mut agent);
+        agent.commit(b"web");
+        println!("agent: committed web v2; small-0 is {}", agent.get(s0).state.name());
+        agent.deploy(s0, Some(WEB_V1), None);
+        settle(&mut agent);
+        println!("agent: web v1 is live again in {}", agent.get(s0).name);
+        return Some(0);
+    }
+    None
 }

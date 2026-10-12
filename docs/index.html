@@ -186,6 +186,7 @@ td code { white-space: nowrap; }
       <li><a href="#deploy-slots">15.1 Slots and descriptors</a></li>
       <li><a href="#deploy-loading">15.2 Loading an image</a></li>
       <li><a href="#deploy-measuring">15.3 Measuring what runs</a></li>
+      <li><a href="#deploy-lifecycle">15.4 The lifecycle and the local swap</a></li>
     </ul>
   </li>
   <li><a href="#syscalls">16. Syscalls</a></li>
@@ -632,7 +633,10 @@ a service can't take it down for good. Restarts back off so a crash loop can't e
 10 ms after a crash, doubling to at most 30 s, and back to 10 ms once the task has run 60 s
 since its last restart. The supervisor waits with <code>recv</code>'s timeout, so a pending
 restart costs nothing. Each crash goes to telemetry as a <code>crash</code> event with the
-restart count and the backoff (<code>crash-loop</code>, <code>backoff-reset</code>). Test
+restart count and the backoff (<code>crash-loop</code>, <code>backoff-reset</code>). The agent
+asks it to stop a task (<code>supervisor::OP_STOP</code>: the kernel's <code>stop</code>, reported
+as death kind 5, never restarted) or to start a dead one again (<code>OP_START</code>, with its
+backoff reset), for deployments (<a href="#deploy-lifecycle">15.4</a>). Test
 features: <code>give-up-after-3</code> and <code>give-up-after-3000</code> stop restarting so a
 run made only of a crash loop can end, <code>backoff-fast</code> restarts at once,
 <code>reset-after-2s</code> shortens the reset window, and <code>halt-on-exit</code> stops the
@@ -1052,8 +1056,10 @@ and <code>net</code> forgets a restarted instance's connections (<code>http-rest
 connections stay where they are. An instance becomes live only after it has said
 <code>OP_READY</code>. The first ready instance of a service becomes live by itself; after that,
 a task with <code>routes = true</code> changes it with <code>OP_ROUTE</code>
-(<code>route-not-ready</code>, <code>route-not-allowed</code>). In tests that task is
-<code>switcher</code>, standing in for RFD 2's node agent.</p>
+(<code>route-not-ready</code>, <code>route-not-allowed</code>). In the RFD 1 tests that task is
+<code>switcher</code>; RFD 2's agent does it too (<a href="#deploy-lifecycle">15.4</a>), and
+asks an instance's status with <code>OP_STATUS</code> (starting, ready, live, draining, drained)
+instead of waiting for a drain's reply (<code>DRAIN_NOWAIT</code>).</p>
 
 <figure>
 <pre class="diagram">
@@ -1247,6 +1253,44 @@ and slot images, a task that holds the TPM lock forever).</p>
 <dt>remember</dt><dd>A slot's id gets a new generation on every load; look it up by name (<code>small-0</code>). Slots aren't measured at boot, so they don't change PCR 12</dd>
 </dl></div>
 
+<h3 id="deploy-lifecycle"><span class="num">15.4</span>The lifecycle and the local swap<a class="anchor" href="#deploy-lifecycle">#</a></h3>
+
+<p>The agent owns every slot's state (RFD 2, P4) and reports each transition as an
+<code>instance</code> event (slot, service, version, from, to) to telemetry:</p>
+
+<figure>
+<pre class="diagram">
+ EMPTY --load--&gt; STARTING --ready--&gt; READY --promote--&gt; LIVE
+   ^               |                                     |
+   |            timeout (10 s)                         drain
+   |               v                                     v
+   +------------ FAILED                              DRAINING
+   '-- unload &lt;-- STOPPED &lt;-- stop &lt;-- DRAINED &lt;--------'
+</pre>
+<figcaption>An instance's states, kept by the agent (<code>user/agent/src/lifecycle.rs</code>)</figcaption>
+</figure>
+
+<p>A <strong>local swap</strong> deploys a new version of a service into an empty slot while the
+old one serves: the agent loads it, waits until <code>net</code> says it is ready
+(<code>net::OP_STATUS</code>), makes it live (<code>OP_ROUTE</code>), and drains the old
+instance without waiting on <code>net</code> (<code>OP_DRAIN</code> with
+<code>DRAIN_NOWAIT</code>, then <code>OP_STATUS</code> until it is drained). The drain deadline
+is the descriptor's default, or what the deployment asks for capped at the descriptor's maximum.
+Once drained, the agent asks the supervisor to stop it (<code>supervisor::OP_STOP</code>): the
+kernel ends it (<code>stop</code>, death kind 5) and the supervisor never restarts a stopped
+task. Its slot keeps the image, so a <strong>rollback</strong> is the same flow with the roles
+reversed: the supervisor starts the stopped slot again (<code>OP_START</code>, backoff reset)
+and the newer version drains. <strong>Commit</strong> unloads the stopped slots of a service. A
+service that exits 0 by itself is done and isn't restarted. Nothing in the lifecycle blocks:
+each deployment advances a step at a time from the agent's loop. Two places are marked for RFD 3:
+a service with a volume isn't ready until it has opened it, and isn't finished until its handoff
+is.</p>
+
+<p>Tests: <code>deploy-under-load</code> and <code>rollback-under-load</code> keep eight clients
+requesting through the swap (and back) with no failed request; <code>deploy-not-ready</code>
+leaves the old version live when the new one never says it is ready;
+<code>drain-deadline-cap</code>, <code>deploy-commit</code>, <code>slot-exit-clean</code>.</p>
+
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
 <p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
@@ -1282,6 +1326,7 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
 <tr><td><code>slot_unload(slot)</code></td><td>121</td><td>loader only: empty a slot whose service has ended; measured</td></tr>
 <tr><td><code>tpm_lock()</code>, <code>tpm_unlock()</code></td><td>122, 123</td><td>TPM task only: hold the TPM around commands</td></tr>
 <tr><td><code>runtime_log(buf, cap, start)</code></td><td>124</td><td>TPM task only &rarr; <code>(count, total)</code> run-time log entries</td></tr>
+<tr><td><code>stop(id)</code></td><td>125</td><td>supervisor only: end a live task on purpose; reported as stopped (death kind 5)</td></tr>
 </table>
 
 <p><code>recv</code> flags (in <code>rdx</code>): <code>RECV_EXPECT_IRQ</code> (1),
@@ -1323,6 +1368,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
 <tr><td>Slot images signed with their descriptor; checked, sized and measured at load</td><td>unsigned, changed, rolled-back or oversized services; a service claiming ports or a slot class it wasn't signed for</td><td><code>slot-*</code></td></tr>
 <tr><td>Run-time log and PCR 13 kept by the kernel</td><td>a node hiding what it loaded since boot</td><td><code>slot-measured</code>, <code>slot-attest</code></td></tr>
+<tr><td>Swap and rollback through ready checks and drains</td><td>failed requests during a deployment; traffic sent to an instance that never got ready</td><td><code>deploy-under-load</code>, <code>rollback-under-load</code>, <code>deploy-not-ready</code></td></tr>
 <tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
@@ -1494,7 +1540,8 @@ attestation references earlier ones leave behind.</p>
 <tr><td>management network</td><td><code>mgmt-separate</code> <code>mgmt-under-flood</code></td><td>port 8081 too</td></tr>
 <tr><td>network telemetry</td><td><code>net-counters</code> <code>net-interval</code></td><td>vsock for <code>net-interval</code></td></tr>
 <tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
-<tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
+<tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
+<tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>
