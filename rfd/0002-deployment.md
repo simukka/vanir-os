@@ -57,6 +57,12 @@ Decided in discussion (2026-10-11):
    | Drain deadline | the descriptor's default (30 s if it sets none); no override |
    | Restart backoff | 10 ms, doubling to at most 30 s; reset after 60 s without a crash |
 
+8. **The kernel and `attest` share the TPM through a lock the kernel holds** (2026-10-12).
+   `attest` takes it around each TPM command; the kernel extends the run-time PCR under it, so
+   measurement stays in the kernel (P2, P6).
+9. **The kernel keeps the run-time measurement log** (2026-10-12), as it does for boot, so an
+   agent crash can't make a node unattestable (P6).
+
 ## Background
 
 - Today a node runs a fixed set of tasks, declared in a manifest at build time and loaded as
@@ -178,7 +184,9 @@ through a new syscall. The kernel:
 2. checks the version against the descriptor's `min_version` (P6)
 3. checks the descriptor fits the slot's class
 4. resets the slot (memory zeroed, as on restart)
-5. measures the image and descriptor (P6)
+5. measures the image and descriptor (P6); if `attest` holds the TPM lock, the syscall fails
+   with `BUSY` before changing anything, and the agent retries; if the measurement log is
+   full, it fails with `LOG_FULL` (P6)
 6. records the descriptor, and starts the task
 
 A refused image is reported as an event with the reason, as boot images are today.
@@ -254,14 +262,26 @@ with the task, the fault and the restart count. What to do beyond restarting is
 ### P6. Attestation of what runs
 
 - The kernel measures each image loaded at run time, with its descriptor, into a separate PCR
-  (e.g. PCR 13), so a quote shows what runs now, not only what booted. PCRs only grow, so the
-  agent keeps the event log (what was loaded, in order) for the verifier, as the kernel does
-  for boot measurements.
+  (e.g. PCR 13), so a quote shows what runs now, not only what booted.
+- **Sharing the TPM.** Until now the kernel used the TPM only before tasks start, and `attest`
+  sends it commands directly through its mapped CRB page. The TPM runs one command at a time,
+  so the kernel keeps a lock: `attest` takes it with a new `tpm_lock` syscall around each
+  command and drops it with `tpm_unlock`. The kernel extends only while holding it. Extends
+  don't go through `attest`, which could otherwise drop a real measurement and record a fake
+  one. `attest` keeps its mapping, so it can still add entries to PCR 13, but not remove the
+  kernel's: a PCR that doesn't match the kernel's log shows it. PCRs only grow, so the
+  kernel keeps the event log (what was loaded, in order) for the verifier, as it does for boot
+  measurements, and `attest` sends it with each quote. A log kept by the agent would be lost if
+  the agent crashed, leaving the node unattestable until it reboots. The log has a fixed size
+  set in the manifest, so it needs no allocation; when it is full the kernel refuses further
+  loads (`LOG_FULL`), and the control plane evacuates and reboots the node.
 - The control plane checks a node's attestation before giving it traffic.
 - **Conflict: anti-rollback vs. rollback.** Rollback versions (the `sig-rollback` test) refuse
   older images, but a rollback needs the previous version to stay loadable. Proposal: the
   descriptor's `min_version`, not the newest version seen, is what's enforced. The control
-  plane only raises it, in a later release, once a deployment is committed.
+  plane only raises it, in a later release, once a deployment is committed. This stops a
+  replayed command, not a compromised agent or control plane presenting an old release with its
+  own descriptor: see [RFD 8](0008-deployment-threats.md).
 
 ### P7. The node agent and the control-plane interface
 
@@ -312,12 +332,14 @@ RFD 3's phases follow D3 (volumes during a local swap) and D5 (volumes during a 
 
 ## Open questions
 
-None remain. Follow-ups: [RFD 4](0004-slots-sized-at-load.md) (slots sized at load) and
-[RFD 7](0007-crash-policy.md) (crash policy).
+None remain. Follow-ups: [RFD 4](0004-slots-sized-at-load.md) (slots sized at load),
+[RFD 7](0007-crash-policy.md) (crash policy) and [RFD 8](0008-deployment-threats.md) (known
+attack vectors).
 
 ## References
 
 - [RFD 1](0001-network-services.md): network services
 - [RFD 3](0003-service-volumes.md): service volumes
+- [RFD 8](0008-deployment-threats.md): attack vectors in deployment
 - Noise protocol framework, <https://noiseprotocol.org/noise.html>
 - vanir-os manual, `docs/index.html`, in particular Supervisor and Boot chain
