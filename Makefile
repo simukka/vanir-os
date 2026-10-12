@@ -68,8 +68,11 @@ TPM            :=
 # DISK_RESET=1 starts it from zeros.
 DISK           :=
 DISK_RESET     :=
-# DISK_CORRUPT=volume:block flips a byte of that data block before booting (integrity tests).
+# DISK_CORRUPT=volume:block flips a byte of that data block before booting (integrity tests);
+# volume:header flips one in the volume's header.
 DISK_CORRUPT   :=
+# DISK_OLD=1 stamps the superblock of an earlier storage format (VNRSTOR2) on the disk.
+DISK_OLD       :=
 DISK_FLAGS     = $(if $(DISK),-drive file=build/disk.img$(,)if=none$(,)id=d0$(,)format=raw \
                    -device virtio-blk-pci$(,)drive=d0$(,)disable-legacy=on)
 # Networks. NET adds the data NIC and NET_MGMT the management NIC, each a virtio-net device at a
@@ -126,6 +129,7 @@ disk:
 	@mkdir -p build
 	$(if $(DISK_RESET),rm -f build/disk.img)
 	[ -f build/disk.img ] || truncate -s 64M build/disk.img
+	$(if $(DISK_OLD),printf VNRSTOR2 | dd of=build/disk.img conv=notrunc status=none)
 	$(if $(DISK_CORRUPT),tools/corrupt-disk.py build/disk.img $(DISK_CORRUPT))
 
 $(SIGNING_KEY):

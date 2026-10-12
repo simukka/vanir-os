@@ -11,6 +11,13 @@
 //! the wrong counter fails to decrypt (CODE_INTEGRITY). Counters and tags live in each volume's
 //! metadata blocks.
 //!
+//! Each volume starts with a header block, sealed the same way under block number `HEADER`
+//! (its counter and tag sit in plain text at the front of the block): its kind, name and size,
+//! and the writer epoch and lease (RFD 3, P1). It is checked against the volume table on a
+//! volume's first read or write after each unlock. Volumes are of two kinds, kept apart by the
+//! table and by the key's HKDF salt: a fixed task's, found by its task name, and (RFD 3) a
+//! service's.
+//!
 //! The master key is only ever in memory. The task starts locked, answering CODE_LOCKED: it asks
 //! the key server ("keys") for the key if it may send to one, and otherwise waits for OP_UNLOCK
 //! (from "attest", after the host released the key). A restarted storage task starts locked
@@ -20,7 +27,8 @@
 //! storage_locked, storage_unlocked and integrity_error (with the volume and block).
 //!
 //! On disk (4 KiB blocks): block 0 superblock, block 1 the volume table (both in plain text),
-//! then volumes: `META_BLOCKS` metadata blocks followed by `DATA_BLOCKS` data blocks each.
+//! then volumes: a header block, then `meta_blocks(size)` metadata blocks, then the data blocks.
+//! A disk in an older format is reformatted.
 
 #![no_std]
 #![no_main]
@@ -38,28 +46,60 @@ use vanir_user::{err, lookup, println, recv, reply, send, sleep, task_name};
 
 vanir_user::entry!(main);
 
-const MAGIC: &[u8; 8] = b"VNRSTOR2";
+const MAGIC: &[u8; 8] = b"VNRSTOR3";
+/// What every format's magic starts with, to tell an older format from a blank disk.
+const MAGIC_FAMILY: &[u8; 7] = b"VNRSTOR";
 const SUPERBLOCK: u64 = 0;
 const TABLE: u64 = 1;
 const FIRST_DATA: u64 = 2;
-/// Every volume's data: 1 MiB.
-const DATA_BLOCKS: u64 = 256;
+/// A fixed task's volume: 1 MiB of data.
+const TASK_BLOCKS: u64 = 256;
 /// Per data block: write counter (8 bytes) and tag (16 bytes).
 const META_ENTRY: usize = 24;
 const META_PER_BLOCK: u64 = (BLOCK_SIZE / META_ENTRY) as u64;
-const META_BLOCKS: u64 = DATA_BLOCKS.div_ceil(META_PER_BLOCK);
-const VOLUME_BLOCKS: u64 = META_BLOCKS + DATA_BLOCKS;
+/// The block number the header is sealed under (no data block has it).
+const HEADER: u64 = u64::MAX;
+const HEADER_MAGIC: &[u8; 8] = b"VNRVOL01";
+/// The header's sealed fields: magic, kind, name, size, epoch, lease (after counter and tag).
+const HEADER_FIELDS: usize = 72;
+/// Volume kinds, in the table and the header.
+const KIND_TASK: u8 = 1;
+#[allow(dead_code)] // RFD 3, V1b
+const KIND_SERVICE: u8 = 2;
 /// Tasks that may hand over the master key.
 const UNLOCKERS: [&[u8]; 2] = [b"keys", b"attest"];
 const MAX_VOLUMES: usize = BLOCK_SIZE / ENTRY;
-/// Volume table entry: name (32 bytes, zero padded), start block, size in blocks.
+/// Volume table entry: name (32 bytes, zero padded), start block, size in data blocks, kind.
 const ENTRY: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Volume {
     name: [u8; 32],
+    kind: u8,
     start: u64,
+    /// Data blocks.
     blocks: u64,
+    /// The header has been checked since the last unlock.
+    checked: bool,
+    /// Writer epoch and lease from the header (RFD 3, P1); read, not yet used.
+    epoch: u64,
+    lease_until: u64,
+}
+
+/// Metadata blocks for `blocks` data blocks.
+fn meta_blocks(blocks: u64) -> u64 {
+    blocks.div_ceil(META_PER_BLOCK)
+}
+
+impl Volume {
+    /// Blocks the volume takes on the disk: header, metadata and data.
+    fn footprint(&self) -> u64 {
+        1 + meta_blocks(self.blocks) + self.blocks
+    }
+
+    fn data_start(&self) -> u64 {
+        self.start + 1 + meta_blocks(self.blocks)
+    }
 }
 
 struct Storage {
@@ -118,7 +158,11 @@ impl Storage {
         let mut buf = [0u8; BLOCK_SIZE];
         self.read(SUPERBLOCK, &mut buf)?;
         if &buf[..8] != MAGIC {
-            println!("storage: no volume table on the disk; formatting");
+            if &buf[..7] == MAGIC_FAMILY {
+                println!("storage: the disk has an older format ({}); formatting", core::str::from_utf8(&buf[..8]).unwrap_or("?"));
+            } else {
+                println!("storage: no volume table on the disk; formatting");
+            }
             self.next_free = FIRST_DATA;
             return self.save();
         }
@@ -131,6 +175,10 @@ impl Storage {
                     name: e[..32].try_into().unwrap(),
                     start: u64::from_le_bytes(e[32..40].try_into().unwrap()),
                     blocks: u64::from_le_bytes(e[40..48].try_into().unwrap()),
+                    kind: e[48],
+                    checked: false,
+                    epoch: 0,
+                    lease_until: 0,
                 });
             }
         }
@@ -148,6 +196,7 @@ impl Storage {
                 e[..32].copy_from_slice(&v.name);
                 e[32..40].copy_from_slice(&v.start.to_le_bytes());
                 e[40..48].copy_from_slice(&v.blocks.to_le_bytes());
+                e[48] = v.kind;
             }
         }
         self.write(TABLE, &buf)?;
@@ -158,41 +207,96 @@ impl Storage {
         self.flush()
     }
 
-    /// The volume of the task named `name`, created on first use.
-    fn volume(&mut self, name: &[u8]) -> Result<Volume, u64> {
+    /// The index of the volume of kind `kind` called `name`, created with `blocks` data blocks on
+    /// first use.
+    fn volume(&mut self, kind: u8, name: &[u8], blocks: u64) -> Result<usize, u64> {
         let mut key = [0u8; 32];
         key[..name.len().min(32)].copy_from_slice(&name[..name.len().min(32)]);
-        if let Some(v) = self.volumes.iter().flatten().find(|v| v.name == key) {
-            return Ok(*v);
+        if let Some(i) = self.volumes.iter().position(|v| v.is_some_and(|v| v.kind == kind && v.name == key)) {
+            return Ok(i);
         }
         let Some(slot) = self.volumes.iter().position(Option::is_none) else { return Err(CODE_OUT_OF_RANGE) };
-        if self.next_free + VOLUME_BLOCKS > self.capacity {
+        let mut v = Volume { name: key, kind, start: self.next_free, blocks, checked: true, epoch: 0, lease_until: 0 };
+        if self.next_free + v.footprint() > self.capacity {
             return Err(CODE_OUT_OF_RANGE);
         }
-        let v = Volume { name: key, start: self.next_free, blocks: DATA_BLOCKS };
-        self.volumes[slot] = Some(v);
-        self.next_free += VOLUME_BLOCKS;
-        // Fresh metadata: every block unwritten (counter 0).
+        // Fresh metadata (every block unwritten: counter 0), then the header, then the table.
         let zero = [0u8; BLOCK_SIZE];
-        for m in 0..META_BLOCKS {
-            self.write(v.start + m, &zero)?;
+        for m in 0..meta_blocks(blocks) {
+            self.write(v.start + 1 + m, &zero)?;
         }
+        self.write(v.start, &zero)?;
+        self.write_header(&mut v)?;
+        self.volumes[slot] = Some(v);
+        self.next_free += v.footprint();
         self.save()?;
         self.event(VOLUME_CREATED, v.start, name);
         println!(
             "storage: new volume for {}: blocks {}..{}",
             core::str::from_utf8(name).unwrap_or("?"),
             v.start,
-            v.start + v.blocks
+            v.start + v.footprint()
         );
-        Ok(v)
+        Ok(slot)
+    }
+
+    /// Check volume `i`'s header against the table, once after each unlock, and load its epoch.
+    fn check_header(&mut self, i: usize) -> Result<(), u64> {
+        let mut v = self.volumes[i].unwrap();
+        if v.checked {
+            return Ok(());
+        }
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.read(v.start, &mut buf)?;
+        let counter = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let tag = Tag::try_from(&buf[8..24]).unwrap();
+        let (nonce, aad) = Self::binding(&v, HEADER, counter);
+        let fields = &mut buf[24..24 + HEADER_FIELDS];
+        let opened = self.cipher(&v).decrypt_inout_detached(&nonce, &aad, fields.into(), &tag).is_ok();
+        if !opened
+            || &fields[..8] != HEADER_MAGIC
+            || fields[8] != v.kind
+            || fields[16..48] != v.name
+            || u64::from_le_bytes(fields[48..56].try_into().unwrap()) != v.blocks
+        {
+            println!("storage: {}: the volume header does not open or does not match", core::str::from_utf8(name_of(&v)).unwrap_or("?"));
+            self.event(INTEGRITY_ERROR, HEADER, name_of(&v));
+            return Err(CODE_INTEGRITY);
+        }
+        v.epoch = u64::from_le_bytes(fields[56..64].try_into().unwrap());
+        v.lease_until = u64::from_le_bytes(fields[64..72].try_into().unwrap());
+        v.checked = true;
+        self.volumes[i] = Some(v);
+        Ok(())
+    }
+
+    /// Seal `v`'s header with the next counter and write it (not flushed).
+    fn write_header(&mut self, v: &mut Volume) -> Result<(), u64> {
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.read(v.start, &mut buf)?;
+        let counter = u64::from_le_bytes(buf[..8].try_into().unwrap()) + 1;
+        let mut fields = [0u8; HEADER_FIELDS];
+        fields[..8].copy_from_slice(HEADER_MAGIC);
+        fields[8] = v.kind;
+        fields[16..48].copy_from_slice(&v.name);
+        fields[48..56].copy_from_slice(&v.blocks.to_le_bytes());
+        fields[56..64].copy_from_slice(&v.epoch.to_le_bytes());
+        fields[64..72].copy_from_slice(&v.lease_until.to_le_bytes());
+        let (nonce, aad) = Self::binding(v, HEADER, counter);
+        let tag = self.cipher(v).encrypt_inout_detached(&nonce, &aad, fields.as_mut_slice().into()).map_err(|_| CODE_IO_ERROR)?;
+        let mut out = [0u8; BLOCK_SIZE];
+        out[..8].copy_from_slice(&counter.to_le_bytes());
+        out[8..24].copy_from_slice(&tag);
+        out[24..24 + HEADER_FIELDS].copy_from_slice(&fields);
+        self.write(v.start, &out)
     }
 }
 
 impl Storage {
     fn cipher(&self, v: &Volume) -> XChaCha20Poly1305 {
         let mut key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(b"vanir-storage-v1"), self.master.as_ref().unwrap())
+        let salt: &[u8] = if v.kind == KIND_TASK { b"vanir-storage-v1" } else { b"vanir-service-v1" };
+        Hkdf::<Sha256>::new(Some(salt), self.master.as_ref().unwrap())
             .expand(&v.name, &mut key)
             .expect("32 bytes is a valid HKDF output length");
         XChaCha20Poly1305::new(&key.into())
@@ -200,7 +304,7 @@ impl Storage {
 
     /// Where data block `b` of `v` keeps its counter and tag: (metadata block, byte offset).
     fn meta(v: &Volume, b: u64) -> (u64, usize) {
-        (v.start + b / META_PER_BLOCK, (b % META_PER_BLOCK) as usize * META_ENTRY)
+        (v.start + 1 + b / META_PER_BLOCK, (b % META_PER_BLOCK) as usize * META_ENTRY)
     }
 
     /// Nonce and associated data for data block `b` of `v` at write `counter`.
@@ -225,7 +329,7 @@ impl Storage {
             return Ok(());
         }
         let tag = Tag::try_from(&meta[at + 8..at + 24]).unwrap();
-        self.read(v.start + META_BLOCKS + b, out)?;
+        self.read(v.data_start() + b, out)?;
         let (nonce, aad) = Self::binding(v, b, counter);
         if self.cipher(v).decrypt_inout_detached(&nonce, &aad, out.as_mut_slice().into(), &tag).is_err() {
             self.event(INTEGRITY_ERROR, b, name_of(v));
@@ -241,7 +345,7 @@ impl Storage {
         let counter = u64::from_le_bytes(meta[at..at + 8].try_into().unwrap()) + 1;
         let (nonce, aad) = Self::binding(v, b, counter);
         let tag = self.cipher(v).encrypt_inout_detached(&nonce, &aad, data.as_mut_slice().into()).map_err(|_| CODE_IO_ERROR)?;
-        self.write(v.start + META_BLOCKS + b, data)?;
+        self.write(v.data_start() + b, data)?;
         meta[at..at + 8].copy_from_slice(&counter.to_le_bytes());
         meta[at + 8..at + 24].copy_from_slice(&tag);
         self.write(mb, &meta)
@@ -326,6 +430,8 @@ fn main() -> u64 {
                 CODE_BAD_OP
             } else {
                 s.master = Some(msg[..32].try_into().unwrap());
+                // A new key: every header has to open under it again.
+                s.volumes.iter_mut().flatten().for_each(|v| v.checked = false);
                 println!("storage: unlocked by {}", core::str::from_utf8(name).unwrap_or("?"));
                 s.event(STORAGE_UNLOCKED, 0, name);
                 CODE_OK
@@ -337,13 +443,20 @@ fn main() -> u64 {
             let _ = reply(m.sender, CODE_LOCKED, &[]);
             continue;
         }
-        let v = match s.volume(name) {
-            Ok(v) => v,
+        let i = match s.volume(KIND_TASK, name, TASK_BLOCKS) {
+            Ok(i) => i,
             Err(code) => {
                 let _ = reply(m.sender, code, &[]);
                 continue;
             }
         };
+        if matches!(op, OP_READ | OP_WRITE)
+            && let Err(e) = s.check_header(i)
+        {
+            let _ = reply(m.sender, if err::is_error(e) { CODE_IO_ERROR } else { e }, &[]);
+            continue;
+        }
+        let v = s.volumes[i].unwrap();
         let result = match op {
             OP_INFO => {
                 let _ = reply(m.sender, CODE_OK, &v.blocks.to_le_bytes());

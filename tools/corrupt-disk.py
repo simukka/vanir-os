@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Flip one byte of a volume's data block in a storage-task disk image (tests of the integrity
-check): corrupt-disk.py build/disk.img client-a:0"""
+"""Flip one byte of a volume's data block, or of its header, in a storage-task disk image (tests
+of the integrity check): corrupt-disk.py build/disk.img client-a:0 (or client-a:header)"""
 import sys
 
 BLOCK = 4096
-META_BLOCKS = 2  # user/storage: per-volume metadata blocks before the data
+META_PER_BLOCK = BLOCK // 24  # user/storage: counter and tag per data block
+
+
+def meta_blocks(blocks):
+    return -(-blocks // META_PER_BLOCK)
+
 
 image, target = sys.argv[1], sys.argv[2]
 volume, _, block = target.partition(":")
 with open(image, "r+b") as f:
-    if f.read(8) != b"VNRSTOR2":
+    if f.read(8) != b"VNRSTOR3":
         sys.exit(f"{image}: not a storage-task disk")
     f.seek(BLOCK)
     table = f.read(BLOCK)
@@ -17,7 +22,11 @@ with open(image, "r+b") as f:
         name = table[i:i + 32].rstrip(b"\0").decode()
         if name == volume:
             start = int.from_bytes(table[i + 32:i + 40], "little")
-            at = (start + META_BLOCKS + int(block)) * BLOCK + 100
+            blocks = int.from_bytes(table[i + 40:i + 48], "little")
+            if block == "header":
+                at = start * BLOCK + 40  # inside the sealed fields, after counter and tag
+            else:
+                at = (start + 1 + meta_blocks(blocks) + int(block)) * BLOCK + 100
             f.seek(at)
             byte = f.read(1)
             f.seek(at)

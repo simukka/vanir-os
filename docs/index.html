@@ -868,12 +868,14 @@ neither name nor reach another task's volume. A task's first request creates its
 
 <figure>
 <pre class="diagram">
- block 0        superblock: "VNRSTOR2", next free block                 plain text
- block 1        volume table: 64 x {name[32], start, size}              plain text
- blocks 2..259  volume "client-a"
+ block 0        superblock: "VNRSTOR3", next free block                 plain text
+ block 1        volume table: 64 x {name[32], start, size, kind}        plain text
+ blocks 2..260  volume "client-a"
+                  +-- header block:      {counter u64, tag[16]} in plain text, then sealed
+                  |                      {"VNRVOL01", kind, name, size, epoch, lease}
                   +-- 2 metadata blocks: per data block {counter u64, tag[16]}
                   '-- 256 data blocks:   XChaCha20-Poly1305 ciphertext
- blocks 260..   volume "client-b" (same layout), in creation order ...
+ blocks 261..   volume "client-b" (same layout), in creation order ...
 </pre>
 <figcaption>Disk layout (4 KiB blocks)</figcaption>
 </figure>
@@ -883,7 +885,16 @@ neither name nor reach another task's volume. A task's first request creates its
 counter goes up on every write, so a nonce is never reused. Ciphertext that was changed, moved
 to another block or volume, or paired with another counter fails to decrypt: the client gets
 <code>INTEGRITY</code> and telemetry an <code>integrity_error</code>. A block never written
-(counter 0) reads as zeros. A disk without the magic is formatted on first use.</p>
+(counter 0) reads as zeros. A disk without the magic is formatted on first use, and so is a
+disk in an older format (<code>VNRSTOR2</code>), with a message saying so.</p>
+
+<p>The header is sealed the same way, as block number 2<sup>64</sup>&minus;1, and holds the
+volume's kind, name and size, and its writer epoch and lease (RFD 3; recorded, not yet used).
+On a volume's first read or write after each unlock, <code>disk</code> opens the header and
+checks it against the table; if it doesn't open or doesn't match, every read and write of that
+volume gets <code>INTEGRITY</code>. Volumes are of two kinds: a fixed task's, and (from RFD 3)
+a service's. The kind is in the table, so a task and a service with the same name get different
+volumes, and in the key's salt (below), so their ciphertext never opens in each other's.</p>
 
 <h3 id="storage-keys"><span class="num">13.2</span>Keys<a class="anchor" href="#storage-keys">#</a></h3>
 
@@ -893,6 +904,7 @@ to another block or volume, or paired with another counter fails to decrypt: the
      |
      +-- HKDF-SHA256(salt "vanir-storage-v1", info "client-a") --&gt; volume key A
      +-- HKDF-SHA256(salt "vanir-storage-v1", info "client-b") --&gt; volume key B
+     +-- HKDF-SHA256(salt "vanir-service-v1", info service)     --&gt; a service's (RFD 3)
                                                                      |
                      per block: XChaCha20-Poly1305(key, nonce = block || counter,
                                                    aad = name || block || counter)
@@ -1449,7 +1461,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Only the storage task may use the block driver</td><td>tasks reading the raw disk</td><td><code>storage-no-driver</code></td></tr>
 <tr><td>A volume per task, chosen by kernel-checked name</td><td>tasks reading or writing each other's data</td><td><code>storage-isolation</code></td></tr>
 <tr><td>Encryption at rest (XChaCha20-Poly1305)</td><td>plain text on the disk image</td><td><code>storage-at-rest</code></td></tr>
-<tr><td>Authenticated blocks, bound to volume, block and counter</td><td>changed or moved ciphertext read as data</td><td><code>storage-tampered</code>, <code>storage-bad-block</code></td></tr>
+<tr><td>Authenticated blocks, bound to volume, block and counter</td><td>changed or moved ciphertext read as data</td><td><code>storage-tampered</code>, <code>storage-bad-block</code>, <code>storage-header-tampered</code></td></tr>
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
 <tr><td>Key released only to an attested boot</td><td>a modified system getting the key</td><td><code>attest-unlock-refused</code></td></tr>
 <tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
@@ -1586,7 +1598,8 @@ make clean                            # remove build outputs (distclean also rem
 <tr><td><code>TRANSPORT</code></td><td><code>console</code></td><td><code>vsock</code> adds vhost-vsock (guest CID 3)</td></tr>
 <tr><td><code>DISK</code></td><td></td><td><code>1</code>: attach <code>build/disk.img</code> (64 MiB, persistent)</td></tr>
 <tr><td><code>DISK_RESET</code></td><td></td><td><code>1</code>: recreate the disk image from zeros</td></tr>
-<tr><td><code>DISK_CORRUPT</code></td><td></td><td><code>volume:block</code>: flip a byte of that data block before boot</td></tr>
+<tr><td><code>DISK_CORRUPT</code></td><td></td><td><code>volume:block</code>: flip a byte of that data block before boot; <code>volume:header</code>: of its header</td></tr>
+<tr><td><code>DISK_OLD</code></td><td></td><td><code>1</code>: stamp an older format's superblock (<code>VNRSTOR2</code>) on the disk before boot</td></tr>
 <tr><td><code>SIGN_VERSION</code></td><td><code>1</code></td><td>version signed into every task image</td></tr>
 <tr><td><code>SIGNING_KEY</code>, <code>TRUSTED_PUB</code></td><td><code>keys/dev-signing.*</code></td><td>key images are signed with / key compiled into the kernel</td></tr>
 <tr><td><code>TAMPER</code>, <code>UNSIGNED</code>, <code>SWAP_SIGS</code></td><td></td><td>signature tests: modify after signing, ship unsigned, swap <code>a:b</code></td></tr>
@@ -1646,7 +1659,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>Secure Boot</td><td><code>sb-boot</code> <code>sb-tampered-kernel</code> <code>sb-edited-config</code> <code>sb-unsigned-loader</code></td><td>KVM, OVMF</td></tr>
 <tr><td>measured boot, attestation</td><td><code>measured-boot</code> <code>measured-rejected</code> <code>no-tpm</code> <code>attest-record</code> <code>attest-verify</code> <code>attest-replay</code> <code>attest-tampered</code> <code>attest-other-version</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>block</td><td><code>blk-rw</code> <code>blk-persist</code> <code>blk-persist-negative</code> <code>blk-restart</code></td><td></td></tr>
-<tr><td>storage</td><td><code>storage-isolation</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
+<tr><td>storage</td><td><code>storage-isolation</code> <code>storage-old-format</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-header-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
 <tr><td>key release</td><td><code>attest-storage-record</code> <code>attest-unlock</code> <code>attest-unlock-persist</code> <code>attest-unlock-refused</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>NIC</td><td><code>nic-arp-ping</code> <code>nic-restart</code> <code>nic-no-grant</code></td><td>free UDP ports 18090-18091</td></tr>
 <tr><td>sockets, HTTP</td><td><code>build-http-port-clash</code> <code>http-get</code> <code>http-undeclared-port</code> <code>net-restart</code> <code>http-restart</code></td><td>free TCP port 8080</td></tr>
