@@ -56,6 +56,7 @@ Decided in discussion (2026-10-11):
    | Channel security | Noise `IK` handshake (X25519, ChaCha20-Poly1305, SHA-256); the node's key bound to its attestation (P6) |
    | Drain deadline | the descriptor's default (30 s if it sets none); no override |
    | Restart backoff | 10 ms, doubling to at most 30 s; reset after 60 s without a crash |
+   | Run-time measurement log | 1024 entries (about 80 KB of kernel memory); the manifest may change it (P6) |
 
 8. **The kernel and `attest` share the TPM through a lock the kernel holds** (2026-10-12).
    `attest` takes it around each TPM command; the kernel extends the run-time PCR under it, so
@@ -273,8 +274,9 @@ with the task, the fault and the restart count. What to do beyond restarting is
   kernel keeps the event log (what was loaded, in order) for the verifier, as it does for boot
   measurements, and `attest` sends it with each quote. A log kept by the agent would be lost if
   the agent crashed, leaving the node unattestable until it reboots. The log has a fixed size
-  set in the manifest, so it needs no allocation; when it is full the kernel refuses further
-  loads (`LOG_FULL`), and the control plane evacuates and reboots the node.
+  set in the manifest (1024 entries by default, determination 7), so it needs no allocation;
+  when it is full the kernel refuses further loads (`LOG_FULL`), and the control plane
+  evacuates and reboots the node.
 - The control plane checks a node's attestation before giving it traffic.
 - **Conflict: anti-rollback vs. rollback.** Rollback versions (the `sig-rollback` test) refuse
   older images, but a rollback needs the previous version to stay loadable. Proposal: the
