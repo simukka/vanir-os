@@ -33,6 +33,9 @@ pub const SYS_NOTIFY: u64 = 116;
 pub const SYS_HALT: u64 = 117;
 pub const SYS_TASK_LISTEN: u64 = 118;
 
+/// The most tasks (fixed tasks and slots) a manifest may declare; size per-task tables with it.
+pub const MAX_TASKS: usize = 64;
+
 /// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
 pub const ERROR: u64 = u64::MAX;
 
@@ -570,6 +573,10 @@ pub mod telemetry {
     /// bounded to 100 ms..60 s.
     pub const OP_SET_INTERVAL: u64 = 5;
 
+    /// Any other event (`Record`: the event's name, then its fields), e.g. a crash reported by
+    /// the supervisor.
+    pub const OP_EVENT: u64 = 6;
+
     /// Counter snapshots go out this often until the host says otherwise (RFD 1: 1 s).
     pub const DEFAULT_INTERVAL_TICKS: u64 = 100;
 
@@ -637,6 +644,11 @@ pub mod telemetry {
     /// Report a network event to telemetry task `id`.
     pub fn net_event(id: u64, record: &Record) -> Result<(), u64> {
         send(id, OP_NET, record.as_bytes(), &mut []).map(|_| ())
+    }
+
+    /// Report any other event to telemetry task `id`.
+    pub fn event(id: u64, record: &Record) -> Result<(), u64> {
+        send(id, OP_EVENT, record.as_bytes(), &mut []).map(|_| ())
     }
 
     /// Send a counter snapshot to telemetry task `id`; returns the interval for the next one.

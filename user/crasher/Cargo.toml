@@ -10,3 +10,7 @@ bench = false
 
 [dependencies]
 vanir-user = { path = "../lib" }
+
+[features]
+# fault at once 3 times, then after 2.5 s, then at once, then exit 0 (backoff reset test)
+crash-3-then-wait = []

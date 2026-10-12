@@ -10,3 +10,7 @@ bench = false
 
 [dependencies]
 vanir-user = { path = "../lib" }
+
+[features]
+# spin for 2 s of uptime instead of 10 rounds
+spin-2s = []

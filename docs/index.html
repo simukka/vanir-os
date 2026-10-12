@@ -608,13 +608,25 @@ do and may call <code>restart(id)</code>, which reloads the task's ELF into fres
 new generation. The policy lives in the supervisor, not the kernel. If the supervisor itself
 dies, the kernel halts.</p>
 
+<p>The policy (RFD 2, P5): a task that exits 0 is done. A task that faults, exits non-zero or
+uses up its CPU budget is always restarted, however often it crashes, so a request that crashes
+a service can't take it down for good. Restarts back off so a crash loop can't eat the CPU:
+10 ms after a crash, doubling to at most 30 s, and back to 10 ms once the task has run 60 s
+since its last restart. The supervisor waits with <code>recv</code>'s timeout, so a pending
+restart costs nothing. Each crash goes to telemetry as a <code>crash</code> event with the
+restart count and the backoff (<code>crash-loop</code>, <code>backoff-reset</code>). Test
+features: <code>give-up-after-3</code> and <code>give-up-after-3000</code> stop restarting so a
+run made only of a crash loop can end, <code>backoff-fast</code> restarts at once,
+<code>reset-after-2s</code> shortens the reset window, and <code>halt-on-exit</code> stops the
+system when any task exits.</p>
+
 <figure>
 <pre class="diagram">
   task faults ---&gt; kernel: free its memory, mark Faulted, log "fault" event
                      |
                      '--&gt; NOTIFY_DEATH {kind, code, rip, cr2, ...} --&gt; supervisor
                                                                           |
-       exited 0: done   |   fault / non-zero exit / over budget: restart (max 3)
+       exited 0: done   |   fault / non-zero exit / over budget: restart after a backoff
                                                                           |
   new generation &lt;--- kernel: reload ELF, fresh page tables, id' = id + (1 &lt;&lt; 16)
   clients holding the old id get DEAD; they lookup() the name again
@@ -699,7 +711,7 @@ counter snapshots (<a href="#net-telemetry">14.5</a>).</p>
 
 <pre><code>{"seq":5,"t":1,"task":"crasher","id":"2","event":"fault","vector":14,"rip":"0x400182","cr2":"0x10"}
 {"seq":6,"t":2,"task":"crasher","id":"2.1","event":"restart","previous":"2"}
-{"t":3,"event":"log","from":"supervisor","msg":"giving up on task 2 after 3 restarts"}
+{"t":2,"task":"supervisor","id":"1","event":"crash","of":"crasher","index":2,"kind":"fault","code":14,"restarts":1,"backoff_ms":20}
 {"t":5,"event":"dropped","count":37}
 {"t":102,"event":"heartbeat","n":1,"frames":89,"irqs":3,"events":11,"tasks":[...]}</code></pre>
 
@@ -1194,6 +1206,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
 <tr><td>Key released only to an attested boot</td><td>a modified system getting the key</td><td><code>attest-unlock-refused</code></td></tr>
 <tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
+<tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
 <tr><td>CPU budget for received frames in <code>net</code></td><td>a packet flood starving every other task</td><td><code>mgmt-under-flood</code></td></tr>
@@ -1234,8 +1247,9 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
     aren't written yet (<a href="#net-limits">14.4</a>).</li>
   <li><strong>TCP over IPv4 only</strong>, no TLS, no SYN cookies (smoltcp has none), 10 ms TCP
     timer resolution, and no retransmit counter.</li>
-  <li><strong>Restarts are capped.</strong> The supervisor gives up after three restarts, so a
-    request that crashes a service can take it down for good (RFD 2 and 7).</li>
+  <li><strong>Restarting is the only crash policy.</strong> A service that crashes on every
+    request is restarted forever, at most every 30 s; rolling back or blocking the client that
+    triggers it is RFD 7.</li>
 </ul>
 
 <!-- ============================================================ WORKING ON IT -->
@@ -1348,7 +1362,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>isolation, faults</td><td><code>normal</code> <code>bad-pointer</code> <code>poke-kernel</code> <code>exec-stack</code> <code>write-code</code> <code>smap</code></td><td></td></tr>
 <tr><td>scheduling</td><td><code>timer-ticks</code> <code>preemption</code> <code>address-spaces</code> <code>cpu-budget</code> <code>no-leak</code> <code>fault-isolated</code></td><td></td></tr>
 <tr><td>IPC</td><td><code>ipc-echo</code> <code>ipc-queued</code> <code>ipc-bad-buffer</code> <code>ipc-not-allowed</code> <code>ipc-server-dies</code> <code>ipc-deadlock</code></td><td></td></tr>
-<tr><td>supervisor, sleep</td><td><code>supervisor-restart</code> <code>restart-no-leak</code> <code>stale-id</code> <code>sleep-idle</code> <code>sleep-busy</code></td><td></td></tr>
+<tr><td>supervisor, sleep</td><td><code>supervisor-restart</code> <code>restart-no-leak</code> <code>crash-loop</code> <code>backoff-reset</code> <code>stale-id</code> <code>sleep-idle</code> <code>sleep-busy</code></td><td></td></tr>
 <tr><td>devices</td><td><code>device-grant</code> <code>device-no-grant</code> <code>device-msix</code> <code>dma-region</code> <code>dma-none</code> <code>console-write</code> <code>console-restart</code></td><td></td></tr>
 <tr><td>telemetry</td><td><code>telemetry</code> <code>telemetry-flood</code> <code>telemetry-vsock</code></td><td>vsock: KVM + kvm group</td></tr>
 <tr><td>signatures</td><td><code>sig-tamper</code> <code>sig-unsigned</code> <code>sig-swapped</code> <code>sig-rogue-key</code> <code>sig-rollback</code> <code>sig-supervised</code></td><td></td></tr>

@@ -35,7 +35,7 @@
 - [Tasks and scheduling](index.html#tasks): states, preemption, budgets, outcomes
 - [App manifests](index.html#manifests): keys name, program, budget, supervisor, sends, devices, dma_pages, events, min_version, tpm, listen, service, routes; task names with meaning (uplink, telemetry, blockdev, disk, keys, attest, net, nic, mgmt-net, nic-mgmt, control)
 - [IPC](index.html#ipc): send/recv/reply, generations, error codes
-- [Supervisor](index.html#supervisor): death records, restart(id)
+- [Supervisor](index.html#supervisor): death records, restart(id); restarts forever with backoff (10 ms doubling to 30 s, reset after 60 s), crash events; test features give-up-after-3/3000, backoff-fast, reset-after-2s, halt-on-exit
 - [Drivers](index.html#drivers): BARs, DMA regions, IRQ notifications
 - [Telemetry](index.html#telemetry): event ring, JSON line format, host-agent.py
 - [Boot chain and attestation](index.html#boot-chain): Secure Boot, signatures, PCR 12, quotes

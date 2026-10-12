@@ -1,7 +1,7 @@
 //! Telemetry: forwards the kernel event log to the host as newline-delimited JSON through the
 //! console driver, adds a heartbeat every second, and forwards `OP_LOG` text, `OP_STORAGE`
-//! events (volume created, locked, unlocked, integrity error), network events (`OP_NET`) and
-//! counter snapshots (`OP_COUNTERS`) from other tasks.
+//! events (volume created, locked, unlocked, integrity error), network events (`OP_NET`), other
+//! events such as crashes (`OP_EVENT`) and counter snapshots (`OP_COUNTERS`) from other tasks.
 //!
 //! The snapshot interval is ours to give out: each `OP_COUNTERS` is answered with it, so every
 //! reporter follows when the host changes it (`OP_SET_INTERVAL`, from the control task).
@@ -14,7 +14,7 @@
 
 use core::fmt::{self, Write};
 use vanir_user::events::{self, Event};
-use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, OP_COUNTERS, OP_LOG, OP_NET, OP_SET_INTERVAL};
+use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, OP_COUNTERS, OP_EVENT, OP_LOG, OP_NET, OP_SET_INTERVAL};
 use vanir_user::{NOTIFY_TIMER, console, err, lookup, println, recv_timeout, reply, sleep, task_index, task_name, uptime};
 
 vanir_user::entry!(main);
@@ -272,7 +272,7 @@ fn main() -> u64 {
                 drain_events(&mut out);
                 storage_line(&mut out, m.sender, &msg[..m.len]);
             }
-            Ok(m) if m.op == OP_NET => {
+            Ok(m) if m.op == OP_NET || m.op == OP_EVENT => {
                 let _ = reply(m.sender, 0, &[]);
                 drain_events(&mut out);
                 record_line(&mut out, m.sender, "event", &msg[..m.len]);

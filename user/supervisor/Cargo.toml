@@ -12,7 +12,12 @@ bench = false
 vanir-user = { path = "../lib" }
 
 [features]
-# restart a failing task up to 3000 times (memory-leak stress test)
-restart-3000 = []
+# tests only: stop restarting a task after that many restarts, so a crash loop can end the run
+give-up-after-3 = []
+give-up-after-3000 = []
+# tests only: restart at once instead of backing off
+backoff-fast = []
+# tests only: back off from the start again after 2 s without a crash, not 60 s
+reset-after-2s = []
 # stop the system when any task exits (tests whose servers never go idle)
 halt-on-exit = []
