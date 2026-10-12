@@ -351,6 +351,35 @@ pub mod block {
         call(storage, OP_EPOCH, &msg, &mut []).map(|_| ())
     }
 
+    /// Storage task (RFD 3, P2): message is a service name (32 bytes, zero padded) and that
+    /// service's 32-byte key. Only "keys" and "attest" may send it. A service's volume answers
+    /// CODE_LOCKED until its key is here (a storage task that may send to "keys" asks it too).
+    /// The key it already has again is a no-op.
+    pub const OP_SERVICE_KEY: u64 = 7;
+    /// Storage task (RFD 3, P2): message is a service name (32 bytes, zero padded). Forget that
+    /// service's key, once no instance of it is left on the node. Only the task with
+    /// `loads = true` may send it.
+    pub const OP_FORGET_KEY: u64 = 8;
+
+    /// A service name zero padded to 32 bytes, as `OP_SERVICE_KEY` and `OP_FORGET_KEY` carry it.
+    pub fn service_name(service: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let n = service.len().min(32);
+        out[..n].copy_from_slice(&service[..n]);
+        out
+    }
+
+    pub fn service_key(storage: u64, service: &[u8], key: &[u8; 32]) -> Result<(), u64> {
+        let mut msg = [0u8; 64];
+        msg[..32].copy_from_slice(&service_name(service));
+        msg[32..].copy_from_slice(key);
+        call(storage, OP_SERVICE_KEY, &msg, &mut []).map(|_| ())
+    }
+
+    pub fn forget_key(storage: u64, service: &[u8]) -> Result<(), u64> {
+        call(storage, OP_FORGET_KEY, &service_name(service), &mut []).map(|_| ())
+    }
+
     pub fn op(code: u64, block: u64) -> u64 {
         code | block << 8
     }
@@ -632,6 +661,9 @@ pub mod attest {
 pub mod keys {
     /// Reply: the 32-byte storage master key. Only the task named "disk" gets it.
     pub const OP_MASTER_KEY: u64 = 1;
+    /// Message: a service name (up to 32 bytes). Reply: that service's 32-byte volume key (RFD 3,
+    /// P2). Only the task named "disk" gets it.
+    pub const OP_SERVICE_KEY: u64 = 2;
 }
 
 /// Client side of the telemetry task (`user/telemetry`).

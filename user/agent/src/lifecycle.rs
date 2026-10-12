@@ -476,8 +476,24 @@ impl Agent {
     }
 
     /// Commit `service`: empty every stopped slot that holds it (RFD 2, P3: the old version is
-    /// kept until then, for a rollback).
+    /// kept until then, for a rollback). If that leaves no instance of a service with a volume,
+    /// `storage` forgets its key (RFD 3, P2).
     pub fn commit(&mut self, service: &[u8]) {
+        let volume = self.slots.iter().flatten().any(|s| s.service() == service && s.image.is_some_and(|i| i.volume_blocks() > 0));
+        self.unload_stopped(service);
+        if volume
+            && !self.slots.iter().flatten().any(|s| s.service() == service)
+            && let Some(disk) = self.disk
+        {
+            let shown = core::str::from_utf8(service).unwrap_or("?");
+            match block::forget_key(disk, service) {
+                Ok(()) => println!("agent: no instance of {} left; storage forgot its key", shown),
+                Err(e) => println!("agent: forgetting {}'s key: {}", shown, block::code_name(e)),
+            }
+        }
+    }
+
+    fn unload_stopped(&mut self, service: &[u8]) {
         for k in 0..MAX_SLOTS {
             let Some(s) = self.slots[k] else { continue };
             if !(s.service() == service && matches!(s.state, State::Stopped | State::Failed)) {

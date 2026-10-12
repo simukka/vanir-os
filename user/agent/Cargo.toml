@@ -57,3 +57,4 @@ script-volume-fence = ["test-images"]    # v1 with epoch 1, v2 with epoch 2, v1 
 script-volume-persist = ["test-images"]  # (a second boot) v2 with epoch 2 again, then epoch 1; exit
 script-volume-resize = ["test-images"]   # v1 with epoch 1, then v3 (another volume size); exit
 script-volume-none = ["test-images"]     # web v1 (no volume) in small-0; exit
+script-volume-forget = ["test-images"]   # v1 with epoch 1, drained and committed (key forgotten), then v1 again; exit

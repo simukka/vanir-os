@@ -42,6 +42,11 @@ impl Image {
         Sha256::digest(&self.sig[..self.sig.len().min(112)]).into()
     }
 
+    /// Data blocks of the service's volume (RFD 3), 0 for none.
+    pub fn volume_blocks(&self) -> u64 {
+        self.descriptor.get(152..160).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
     /// The drain deadline's default and maximum, in seconds.
     pub fn drain_secs(&self) -> (u64, u64) {
         let at = |i: usize| u32::from_le_bytes(self.descriptor[i..i + 4].try_into().unwrap()) as u64;

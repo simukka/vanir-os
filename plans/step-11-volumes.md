@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1 implemented (V1a–V1c); V2 planned. V3 and V4 will be added here.
+Status: V1 implemented (V1a–V1c); V2a implemented, V2b in progress. V3 and V4 will be added here.
 
 ## Goal
 
@@ -294,3 +294,11 @@ Where it departs from the plan so far:
   `count-under-deploy`: every count answered 200 must be new (833 counts, none repeated, 5
   FENCED during the handoff in the run that was checked). `words()` in the agent's
   desired-state parser takes ten words, since `live` with `drain` and `epoch` has nine.
+- **V2a: a service volume needs only its service's key.** Task volumes need the master key,
+  service volumes their service's key, so a node whose master key is never released (the
+  attested agent app) still opens service volumes. `disk` asks `keys` for a missing service key
+  on each request until it has one, so `keys` prints a refusal only once.
+- **V2a: `volume-forget` uses `keys/service-keys-once`.** A slot is unloaded at commit, so no
+  stray read can come from it; instead `keys` hands each service's key over once, and counter
+  deployed again after the commit can't open its volume (LOCKED, FAILED). `volume-wrong-key`
+  runs after `volume-persist`, on the disk `volume-fence` leaves.

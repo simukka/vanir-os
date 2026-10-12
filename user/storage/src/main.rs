@@ -5,7 +5,8 @@
 //! address anything outside it.
 //!
 //! Every block is encrypted at rest with XChaCha20-Poly1305 under its volume's key,
-//! HKDF-SHA256(master key, volume name). The nonce is the block number and a per-block write
+//! HKDF-SHA256(master key, volume name) for a fixed task's volume, and HKDF-SHA256(service key,
+//! service name) for a service's (RFD 3, P2). The nonce is the block number and a per-block write
 //! counter (so it never repeats), and the block's volume name, number and counter are bound in
 //! as associated data, so ciphertext changed, moved between blocks or volumes, or paired with
 //! the wrong counter fails to decrypt (CODE_INTEGRITY). Counters and tags live in each volume's
@@ -27,10 +28,17 @@
 //! a restarted writer stays the writer, and after this task restarts nobody is until the agent
 //! says again. Epochs only go up, across reboots (they are in the header).
 //!
-//! The master key is only ever in memory. The task starts locked, answering CODE_LOCKED: it asks
-//! the key server ("keys") for the key if it may send to one, and otherwise waits for OP_UNLOCK
+//! Keys are only ever in memory. The task starts locked, answering CODE_LOCKED: it asks the key
+//! server ("keys") for the master key if it may send to one, and otherwise waits for OP_UNLOCK
 //! (from "attest", after the host released the key). A restarted storage task starts locked
 //! again, and has to get the key again.
+//!
+//! **Service keys (RFD 3, P2).** Each service's volume has its own key, which the control plane
+//! keeps and releases only to an attested node that runs the service: it reaches us from
+//! "attest" (OP_SERVICE_KEY), or from "keys", which we ask when we need one. A service volume
+//! needs only its service's key, and answers CODE_LOCKED without it; task volumes need only the
+//! master key. The agent has us forget a service's key (OP_FORGET_KEY) once no instance of the
+//! service is left on the node.
 //!
 //! Storage events go to the telemetry task if it may send to one: volume_created,
 //! storage_locked, storage_unlocked and integrity_error (with the volume and block).
@@ -47,9 +55,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use vanir_user::block::{
     self, BLOCK_SIZE, CODE_BAD_OP, CODE_FENCED, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE,
-    OP_EPOCH, OP_FLUSH, OP_INFO, OP_READ, OP_UNLOCK, OP_WRITE, split,
+    OP_EPOCH, OP_FLUSH, OP_FORGET_KEY, OP_INFO, OP_READ, OP_SERVICE_KEY, OP_UNLOCK, OP_WRITE, split,
 };
-use vanir_user::keys::OP_MASTER_KEY;
+use vanir_user::keys::{self, OP_MASTER_KEY};
 use vanir_user::telemetry::{self, INTEGRITY_ERROR, Record, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
 use vanir_user::{err, lookup, println, recv, reply, send, sleep, task_index, task_listen, task_name, uptime};
 
@@ -114,9 +122,18 @@ impl Volume {
     }
 }
 
+/// A service's key (RFD 3, P2), by service name (zero padded).
+#[derive(Clone, Copy)]
+struct ServiceKey {
+    service: [u8; 32],
+    key: [u8; 32],
+}
+
 struct Storage {
     driver: u64,
     master: Option<[u8; 32]>,
+    /// The keys of the services whose volumes we may open now.
+    service_keys: [Option<ServiceKey>; MAX_VOLUMES],
     capacity: u64,
     next_free: u64,
     volumes: [Option<Volume>; MAX_VOLUMES],
@@ -274,6 +291,62 @@ impl Storage {
         Ok(slot)
     }
 
+    /// The key of service `name`, asking "keys" for it if we don't have it.
+    fn service_key(&mut self, name: &[u8; 32]) -> Option<[u8; 32]> {
+        if let Some(k) = self.service_keys.iter().flatten().find(|k| k.service == *name) {
+            return Some(k.key);
+        }
+        let key = fetch_service_key(name)?;
+        self.set_service_key(name, &key, "keys");
+        Some(key)
+    }
+
+    /// Whether we have the key for volumes of kind `kind` called `name` (CODE_LOCKED if not).
+    fn has_key(&mut self, kind: u8, name: &[u8]) -> Result<(), u64> {
+        let have = match kind {
+            KIND_TASK => self.master.is_some(),
+            _ => self.service_key(&block::service_name(name)).is_some(),
+        };
+        if have { Ok(()) } else { Err(CODE_LOCKED) }
+    }
+
+    /// OP_SERVICE_KEY: keep `key` for service `name`. A changed key has the volume's header
+    /// checked again.
+    fn set_service_key(&mut self, name: &[u8; 32], key: &[u8; 32], from: &str) -> u64 {
+        let held = self.service_keys.iter().position(|k| k.is_some_and(|k| k.service == *name));
+        if held.is_some_and(|i| self.service_keys[i].unwrap().key == *key) {
+            return CODE_OK;
+        }
+        let Some(i) = held.or_else(|| self.service_keys.iter().position(Option::is_none)) else { return CODE_OUT_OF_RANGE };
+        self.service_keys[i] = Some(ServiceKey { service: *name, key: *key });
+        self.uncheck(name);
+        println!("storage: {}: key from {}", core::str::from_utf8(trim(name)).unwrap_or("?"), from);
+        CODE_OK
+    }
+
+    /// OP_FORGET_KEY: drop service `name`'s key.
+    fn forget_service_key(&mut self, name: &[u8; 32]) {
+        let mut had = false;
+        for k in self.service_keys.iter_mut() {
+            if k.is_some_and(|k| k.service == *name) {
+                *k = None;
+                had = true;
+            }
+        }
+        self.uncheck(name);
+        let name = core::str::from_utf8(trim(name)).unwrap_or("?");
+        println!("storage: {}: key forgotten{}", name, if had { "" } else { " (had none)" });
+    }
+
+    /// Have service `name`'s volume header checked again before its next use.
+    fn uncheck(&mut self, name: &[u8; 32]) {
+        for v in self.volumes.iter_mut().flatten() {
+            if v.kind == KIND_SERVICE && v.name == *name {
+                v.checked = false;
+            }
+        }
+    }
+
     /// Check volume `i`'s header against the table, once after each unlock, and load its epoch.
     fn check_header(&mut self, i: usize) -> Result<(), u64> {
         let mut v = self.volumes[i].unwrap();
@@ -310,6 +383,7 @@ impl Storage {
         if !info.is_slot() || info.volume_blocks == 0 {
             return Err(CODE_BAD_OP);
         }
+        self.has_key(KIND_SERVICE, info.service())?;
         let i = self.volume(KIND_SERVICE, info.service(), info.volume_blocks)?;
         self.check_header(i)?;
         let mut v = self.volumes[i].unwrap();
@@ -386,8 +460,12 @@ impl Storage {
 impl Storage {
     fn cipher(&self, v: &Volume) -> XChaCha20Poly1305 {
         let mut key = [0u8; 32];
-        let salt: &[u8] = if v.kind == KIND_TASK { b"vanir-storage-v1" } else { b"vanir-service-v1" };
-        Hkdf::<Sha256>::new(Some(salt), self.master.as_ref().unwrap())
+        // The caller checked we have the key (`has_key`).
+        let (salt, ikm): (&[u8], [u8; 32]) = match v.kind {
+            KIND_TASK => (b"vanir-storage-v1", self.master.unwrap()),
+            _ => (b"vanir-service-v2", self.service_keys.iter().flatten().find(|k| k.service == v.name).unwrap().key),
+        };
+        Hkdf::<Sha256>::new(Some(salt), &ikm)
             .expand(&v.name, &mut key)
             .expect("32 bytes is a valid HKDF output length");
         XChaCha20Poly1305::new(&key.into())
@@ -445,7 +523,21 @@ impl Storage {
 
 /// A volume's name without its zero padding.
 fn name_of(v: &Volume) -> &[u8] {
-    &v.name[..v.name.iter().position(|&c| c == 0).unwrap_or(32)]
+    trim(&v.name)
+}
+
+fn trim(name: &[u8; 32]) -> &[u8] {
+    &name[..name.iter().position(|&c| c == 0).unwrap_or(32)]
+}
+
+/// Ask the key server for service `name`'s key, if there is one we may ask.
+fn fetch_service_key(name: &[u8; 32]) -> Option<[u8; 32]> {
+    let keys = lookup("keys").ok()?;
+    let mut key = [0u8; 32];
+    match send(keys, keys::OP_SERVICE_KEY, trim(name), &mut key) {
+        Ok((CODE_OK, 32)) => Some(key),
+        _ => None,
+    }
 }
 
 /// Ask the key server for the master key, if there is one we may ask.
@@ -463,6 +555,7 @@ fn main() -> u64 {
     let mut s = Storage {
         driver,
         master: None,
+        service_keys: [None; MAX_VOLUMES],
         capacity: 0,
         next_free: FIRST_DATA,
         volumes: [None; MAX_VOLUMES],
@@ -521,8 +614,8 @@ fn main() -> u64 {
                 CODE_BAD_OP
             } else {
                 s.master = Some(msg[..32].try_into().unwrap());
-                // A new key: every header has to open under it again.
-                s.volumes.iter_mut().flatten().for_each(|v| v.checked = false);
+                // A new key: every task volume's header has to open under it again.
+                s.volumes.iter_mut().flatten().filter(|v| v.kind == KIND_TASK).for_each(|v| v.checked = false);
                 println!("storage: unlocked by {}", core::str::from_utf8(name).unwrap_or("?"));
                 s.event(STORAGE_UNLOCKED, 0, name);
                 CODE_OK
@@ -530,8 +623,28 @@ fn main() -> u64 {
             let _ = reply(m.sender, code, &[]);
             continue;
         }
-        if s.master.is_none() {
-            let _ = reply(m.sender, CODE_LOCKED, &[]);
+        if op == OP_SERVICE_KEY {
+            let code = if !UNLOCKERS.contains(&name) {
+                CODE_NOT_ALLOWED
+            } else if m.len != 64 {
+                CODE_BAD_OP
+            } else {
+                let from = core::str::from_utf8(name).unwrap_or("?");
+                s.set_service_key(&msg[..32].try_into().unwrap(), &msg[32..64].try_into().unwrap(), from)
+            };
+            let _ = reply(m.sender, code, &[]);
+            continue;
+        }
+        if op == OP_FORGET_KEY {
+            let code = if !task_listen(m.sender).is_ok_and(|i| i.may_load()) {
+                CODE_NOT_ALLOWED
+            } else if m.len != 32 {
+                CODE_BAD_OP
+            } else {
+                s.forget_service_key(&msg[..32].try_into().unwrap());
+                CODE_OK
+            };
+            let _ = reply(m.sender, code, &[]);
             continue;
         }
         let code_of = |e: u64| if err::is_error(e) { CODE_IO_ERROR } else { e };
@@ -554,8 +667,8 @@ fn main() -> u64 {
         let info = task_listen(m.sender).ok().filter(|i| i.is_slot());
         let found = match &info {
             Some(i) if i.volume_blocks == 0 => Err(CODE_NOT_ALLOWED),
-            Some(i) => s.volume(KIND_SERVICE, i.service(), i.volume_blocks),
-            None => s.volume(KIND_TASK, name, TASK_BLOCKS),
+            Some(i) => s.has_key(KIND_SERVICE, i.service()).and_then(|()| s.volume(KIND_SERVICE, i.service(), i.volume_blocks)),
+            None => s.has_key(KIND_TASK, name).and_then(|()| s.volume(KIND_TASK, name, TASK_BLOCKS)),
         };
         let i = match found {
             Ok(i) => i,

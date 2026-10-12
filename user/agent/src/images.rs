@@ -294,7 +294,8 @@ fn volume_script() -> Option<u64> {
         feature = "script-volume-fence",
         feature = "script-volume-persist",
         feature = "script-volume-resize",
-        feature = "script-volume-none"
+        feature = "script-volume-none",
+        feature = "script-volume-forget"
     )) {
         return None;
     }
@@ -340,6 +341,19 @@ fn volume_script() -> Option<u64> {
         sleep(30);
         let _ = agent.assign_epoch(s0, (1, 0));
         sleep(10);
+        return Some(0);
+    }
+    #[cfg(feature = "script-volume-forget")]
+    {
+        // Run with `unlocker/service-keys-once`: once storage forgets counter's key, it can't
+        // get it again, so counter can't come back.
+        run_for(&mut agent, 200);
+        agent.drain(s0, Some(0));
+        settle(&mut agent);
+        agent.commit(b"counter");
+        agent.deploy(s1, Some(COUNTER_V1), None, Some((2, 0)));
+        settle(&mut agent);
+        println!("agent: after the key was forgotten, small-1 is {}", agent.get(s1).state.name());
         return Some(0);
     }
     #[cfg(feature = "script-volume-resize")]

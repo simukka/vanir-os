@@ -9,8 +9,14 @@ test = false
 bench = false
 
 [dependencies]
+hkdf = "0.13.0"
+sha2 = { version = "0.11.0", default-features = false }
 vanir-user = { path = "../lib" }
 
 [features]
-# Hand over a different key (wrong-key test).
+# Hand over different keys, master and service keys alike (wrong-key test).
 wrong-key = []
+# Refuse service keys: service volumes stay locked (volume-no-key test).
+no-service-keys = []
+# Hand over each service's key once only, so a forgotten key stays forgotten (volume-forget).
+service-keys-once = []
