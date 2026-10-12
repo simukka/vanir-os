@@ -1503,6 +1503,21 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
   <li><strong>Restarting is the only crash policy.</strong> A service that crashes on every
     request is restarted forever, at most every 30 s; rolling back or blocking the client that
     triggers it is RFD 7.</li>
+  <li><strong>Known gaps in deployment</strong> (RFD 8): the version floor is each image's own
+    descriptor, so the control plane or a compromised agent can load an old release with its old
+    descriptor; boot and slot images are signed with one key, so a signature doesn't say which
+    kind of image it is for; <code>attest</code> keeps its raw TPM mapping, so a compromised
+    <code>attest</code> can hold the TPM lock forever and block every load; anything that can
+    trigger loads can fill the run-time log, after which the node refuses loads until it
+    reboots; a service that can be made to exit 0 stays down; the control plane's keys are in
+    the image, so rotating them means updating every node.</li>
+  <li><strong>A mock control plane.</strong> <code>tools/control-plane.py</code> stands in for
+    the real one (scheduling, load balancers, the fleet view are a later RFD). Nodes are named by
+    a name built into the agent (<code>NODE</code>), not by their TPM's key, and the two-node
+    tests boot an updated node from a new ISO rather than writing it to an A/B boot disk.</li>
+  <li><strong>Fixed slot classes, stateless services.</strong> Slots come in classes fixed by the
+    manifest (sizing them per service is RFD 4), and services have no volumes yet, so the hooks
+    where deployments will wait for storage (RFD 3) do nothing.</li>
 </ul>
 
 <!-- ============================================================ WORKING ON IT -->
@@ -1541,6 +1556,9 @@ repository root.</p>
 <tr><td>storage format or crypto</td><td><code>user/storage</code>, <code>tools/corrupt-disk.py</code></td><td><code>ONLY='^(storage|blk|attest-)'</code></td></tr>
 <tr><td>host tooling</td><td><code>tools/*.py</code> (Python 3.11+, <code>cryptography</code>)</td><td>vsock/attest cases need KVM + kvm group</td></tr>
 <tr><td>networking</td><td><code>user/net</code>, <code>user/virtio-net</code>, <code>user/http</code>, <code>tools/net-peer.py</code></td><td><code>ONLY='^(nic|http|net|mgmt|swap|drain|route|build)'</code></td></tr>
+<tr><td>the agent's lifecycle, deployments</td><td><code>user/agent/src/lifecycle.rs</code>, <code>user/supervisor</code> (<code>OP_STOP</code>/<code>OP_START</code>), <code>net</code> <code>OP_STATUS</code>, <code>tools/net-peer.py</code> <code>under_load</code></td><td><code>ONLY='^(deploy|rollback|drain-deadline-cap|slot-exit)'</code></td></tr>
+<tr><td>the agent's connection, the control plane</td><td><code>user/agent/src/control.rs</code>, <code>user/noise</code>, <code>tools/control-plane.py</code>, <code>tools/vanir_noise.py</code> (keep the frame types and desired-state format in sync)</td><td><code>ONLY='^(noise|agent-)'</code></td></tr>
+<tr><td>moves, two nodes</td><td><code>tests/two-nodes.sh</code>, <code>tools/control-plane.py</code> (scenarios, load balancer)</td><td><code>ONLY='^(move|evacuate)'</code>, slow</td></tr>
 <tr><td>slots, loading, PCR 13</td><td><code>kernel/src/process.rs</code> (slot syscalls), <code>kernel/src/verify.rs</code>, <code>kernel/src/measure.rs</code>, <code>tools/expected-pcrs.py</code>, <code>user/agent</code></td><td><code>ONLY='^slot-'</code></td></tr>
 </table>
 
@@ -1875,18 +1893,29 @@ rustup target add x86_64-unknown-none</code></pre>
 <tr><td>BAR</td><td>base address register: where a PCI device's registers appear in memory</td></tr>
 <tr><td>CR3</td><td>the register holding the current page-table root</td></tr>
 <tr><td>DMA</td><td>a device reading or writing main memory by itself</td></tr>
+<tr><td>Agent</td><td>the node's task that loads service images into slots, keeps each instance's lifecycle, and answers to the control plane (<code>user/agent</code>)</td></tr>
+<tr><td>Candidate</td><td>an instance holding the version being deployed, before it is made live</td></tr>
+<tr><td>Commit</td><td>the control plane declaring a deployment or move final; the old version's slot is then unloaded</td></tr>
+<tr><td>Control plane</td><td>the off-node system that decides what runs where; in tests, <code>tools/control-plane.py</code></td></tr>
+<tr><td>Descriptor</td><td>what a service may do (name, version, floor, slot class, ports, drain deadlines), signed with its image</td></tr>
+<tr><td>Desired state</td><td>a signed document from the control plane saying which version of each service should be live where; applied only if its generation is newer</td></tr>
 <tr><td>Drain</td><td>stop giving an instance new connections and let it finish its current ones, up to a deadline</td></tr>
 <tr><td>Generation</td><td>restart counter in a task id's upper bits; stale ids get <code>DEAD</code></td></tr>
+<tr><td>Evacuate</td><td>move every instance off a node, so it can be updated</td></tr>
 <tr><td>HHDM</td><td>Limine's higher-half direct map of physical memory</td></tr>
 <tr><td>HKDF</td><td>key derivation: turns one key into many independent keys</td></tr>
 <tr><td>Instance</td><td>a task running a network service; the <strong>live</strong> instance gets the service's new connections</td></tr>
 <tr><td>IOMMU</td><td>hardware that restricts which memory each device can DMA to (Intel VT-d)</td></tr>
 <tr><td>Manifest</td><td>the TOML file that fixes the task set at build time</td></tr>
+<tr><td>Move</td><td>a service changing nodes: live on the new one, then drained and stopped on the old one</td></tr>
 <tr><td>MSI-X</td><td>interrupts delivered as memory writes, routed by the kernel</td></tr>
+<tr><td>Noise IK</td><td>the handshake pattern of the agent's connection: the agent already knows the control plane's static key and sends its own in the first message</td></tr>
 <tr><td>PCR</td><td>TPM platform configuration register: a hash chain of measurements</td></tr>
 <tr><td>Quote</td><td>TPM-signed statement of PCR values over a caller's nonce</td></tr>
 <tr><td>Ring 0 / ring 3</td><td>x86 privilege levels: kernel / user</td></tr>
+<tr><td>Run-time log</td><td>the kernel's record of images loaded into and unloaded from slots, replayed by verifiers to PCR 13</td></tr>
 <tr><td>slirp</td><td>QEMU's user-mode NAT (<code>-netdev user</code>): DHCP and port forwarding, TCP ended on the host</td></tr>
+<tr><td>Slot</td><td>a generic task table entry of a fixed class that runs whatever signed service image the agent loads into it</td></tr>
 <tr><td>smoltcp</td><td>the TCP/IP stack in <code>net</code>: no heap, sockets in fixed buffers</td></tr>
 <tr><td>SMAP / SMEP</td><td>CPU features stopping the kernel accessing / executing user pages</td></tr>
 <tr><td>TCG</td><td>QEMU's software CPU emulator (no KVM)</td></tr>

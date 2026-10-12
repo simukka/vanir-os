@@ -1,7 +1,7 @@
 ---
 rfd: 2
 title: Deployment, blue-green swaps and moves
-state: discussion
+state: committed
 authors: simukka
 date: 2026-10-11
 labels: deployment, control-plane, supervisor, attestation
