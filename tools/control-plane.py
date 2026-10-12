@@ -11,6 +11,12 @@ keys for this handshake (unless the node has no TPM: `no-tpm`), then exchange fr
 signed desired state (S) and images (C chunks, E end) when asked (G); the agent sends reports
 (R) and telemetry lines (T, written to --telemetry). See user/agent/src/control.rs.
 
+Service volumes (RFD 3): `live` lines for an image with a volume carry a writer epoch, and we
+keep a key per service (--volume-keys, made on first use). An attested node gets each key it
+needs sealed to its attest task's per-boot key (`seal_pub`, bound into the handshake's quote)
+in a K frame, with each desired state and when it connects again; a node without a TPM gets
+none.
+
 Nodes are named by their reports ("node a"). With --lb PORT and --backend NAME=PORT, we also
 run a TCP load balancer: each new client connection goes to the first node in the backend list,
 which scenarios change to move a service between nodes (tests/two-nodes.sh runs two).
@@ -34,7 +40,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vanir_attest import check, compare  # noqa: E402
+from vanir_attest import check, compare, seal_volume_key  # noqa: E402
 from vanir_noise import Responder, public  # noqa: E402
 
 PROLOGUE = b"vanir-agent 1"
@@ -91,6 +97,8 @@ class Node:
         self.lock = threading.Lock()
         self.alive = True
         self.handshaken = False
+        self.seal_pub = None
+        self.said_no_keys = False
 
     def recv_exact(self, n):
         data = b""
@@ -119,7 +127,7 @@ class Node:
         except Exception as e:  # noqa: BLE001 - any failure here is a failed handshake
             raise ConnectionError(f"handshake failed ({type(e).__name__}): not a node that knows our key")
         self.static, self.ephemeral = responder.rs, responder.re
-        self.attested = self.cp.check_quote(payload, responder.re, responder.rs)
+        self.attested, self.seal_pub = self.cp.check_quote(payload, responder.re, responder.rs)
         msg, self.send, self.recv = responder.write(b"")
         self.send_message(msg)
 
@@ -152,6 +160,7 @@ class ControlPlane:
         self.reports = 0
         self.generations = {}  # name -> last generation sent
         self.epochs = {}  # service -> (epoch, slot, image) last asked for (RFD 3)
+        self.volume_services = {}  # node name -> services with a volume its desired state runs
         self.backends = {}  # name -> data port, for the load balancer
         self.lb = []  # names new client connections go to (the first one)
         self.handshake_failures = 0
@@ -219,12 +228,13 @@ class ControlPlane:
             threading.Thread(target=Node(self, sock).run, daemon=True).start()
 
     def check_quote(self, payload, ephemeral, static):
-        """Whether the node proved an attested boot holds this handshake's keys. Raises
-        ConnectionError if we require that and it didn't."""
+        """Whether the node proved an attested boot holds this handshake's keys, and attest's key
+        to seal volume keys to (None without one). Raises ConnectionError if we require
+        attestation and it didn't."""
         if payload == b"no-tpm":
             if self.args.require_attestation:
                 raise ConnectionError("refused: the node has no TPM and we require attestation")
-            return False
+            return False, None
         quote = json.loads(payload)
         problems = check(quote, ephemeral.hex(), runtime=None)
         if quote.get("kx_pub") != static.hex():
@@ -234,7 +244,7 @@ class ControlPlane:
         if problems:
             raise ConnectionError("refused: " + "; ".join(problems))
         say("node attested: the quote binds this handshake's keys to a measured boot")
-        return True
+        return True, quote.get("seal_pub")
 
     def connected(self, node):
         with self.changed:
@@ -256,10 +266,13 @@ class ControlPlane:
         if kind == b"R":
             report = parse_report(body.decode())
             name = report["node"]
+            if self.nodes.get(name) is not node and self.volume_services.get(name):
+                self.send_keys(node, self.volume_services[name])  # a new connection
             with self.changed:
                 if report != self.latest.get(name):
                     head = f"node {name} image {report['image']} generation {report['generation']}"
                     head += f" update refused ({report['update_refused']} instances)" if report["update_refused"] else ""
+                    head += f" key refused for {report['key_refused']}" if report["key_refused"] else ""
                     head += f" refused {report['refused']}" if report["refused"] else ""
                     slots = [f"{s} {v['service']} v{v['version']} {v['state']}" for s, v in report["slots"].items()]
                     say("report: " + "; ".join([head] + slots))
@@ -296,6 +309,34 @@ class ControlPlane:
         except OSError as e:
             say(f"sending {name} failed: {e}")
 
+    # ---- volume keys (RFD 3, P2) ----
+
+    def volume_key(self, service):
+        """Service `service`'s volume key, made on first use and kept (mode 0600)."""
+        os.makedirs(self.args.volume_keys, exist_ok=True)
+        path = os.path.join(self.args.volume_keys, service)
+        if not os.path.exists(path):
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+                f.write(os.urandom(32))
+            say(f"made a volume key for {service}")
+        return open(path, "rb").read()
+
+    def send_keys(self, node, services):
+        """Send `node` the keys of `services`, each sealed to its attest task; none to a node
+        that didn't attest."""
+        if not node.attested or not node.seal_pub:
+            if not node.said_no_keys:
+                say(f"the node did not attest: no volume keys for {', '.join(sorted(services))}")
+                node.said_no_keys = True
+            return
+        for service in sorted(services):
+            key = self.volume_key(service)
+            sealed_for = self.args.seal_for or service  # --seal-for: a blob for another service
+            blob = seal_volume_key(key, node.seal_pub, sealed_for)
+            note = f" (sealed for {sealed_for})" if sealed_for != service else ""
+            say(f"{service}'s key (sha256 {hashlib.sha256(key).hexdigest()[:16]}) sealed to the node{note}")
+            node.send_frame(b"K", service.encode().ljust(32, b"\0") + blob)
+
     # ---- the scenario side ----
 
     def send_desired(self, generation, lines, key=None, node="a"):
@@ -304,6 +345,14 @@ class ControlPlane:
         self.wait(lambda: node in self.nodes, f"connection from node {node}")
         say(f"desired state {generation} for node {node}: " + "; ".join(lines))
         self.generations[node] = generation
+        services = set()
+        for line in lines:
+            w = line.split()
+            if w[:1] == ["live"] and any(volume_blocks(d) for h, _, _, d in self.images.values() if h.hex() == w[3]):
+                services.add(w[1])
+        self.volume_services[node] = services
+        if services:
+            self.send_keys(self.nodes[node], services)
         self.nodes[node].send_frame(b"S", struct.pack("<I", len(doc)) + doc + signature)
         return doc, signature
 
@@ -364,14 +413,18 @@ def volume_blocks(desc):
 
 def parse_report(text):
     """report <generation> node <name> image <version> [update-refused <n>] [refused <why>],
-    then a line per slot: slot <name> <service> <version> <hash> <state> [epoch <n>]
+    [key-refused <service>], then a line per slot: slot <name> <service> <version> <hash> <state> [epoch <n>]
     [epoch-refused <n>]"""
     lines = text.strip().split("\n")
     head = lines[0].split()
-    report = {"generation": int(head[1]), "node": head[3], "image": int(head[5]), "update_refused": None, "refused": None, "slots": {}}
+    report = {"generation": int(head[1]), "node": head[3], "image": int(head[5]), "update_refused": None, "key_refused": None,
+              "refused": None, "slots": {}}
     rest = head[6:]
     if rest[:1] == ["update-refused"]:
         report["update_refused"] = int(rest[1])
+        rest = rest[2:]
+    if rest[:1] == ["key-refused"]:
+        report["key_refused"] = rest[1]
         rest = rest[2:]
     if rest[:1] == ["refused"]:
         report["refused"] = " ".join(rest[1:])
@@ -531,6 +584,45 @@ def epoch_stale(cp):
     return True
 
 
+@scenario
+def volume_key(cp):
+    """counter v1 deployed to an attested node: its volume key goes to the node sealed to attest,
+    and counter opens its volume and goes live (RFD 3, V2)."""
+    cp.wait(lambda: cp.report is not None, "report")
+    cp.send_desired(1, [cp.live("counter", "small-0", "counter-v1")])
+    cp.wait_slots("counter v1 live in small-0", small_0=("counter", 1, "LIVE"))
+    cp.wait(lambda: slot_epoch(cp, "small-0") == (1, None), "epoch 1 in small-0")
+    say("reached: small-0 holds epoch 1")
+    cp.send_desired(2, [cp.live("counter", "small-0", "counter-v1"), "end"])
+    cp.wait(lambda: cp.report["generation"] == 2, "report of generation 2")
+    return True
+
+
+@scenario
+def volume_no_key(cp):
+    """counter v1 deployed where its key can't be opened (--seal-for another service) or isn't
+    sent (no TPM): its volume stays locked, and the deployment fails (RFD 3, V2)."""
+    cp.wait(lambda: cp.report is not None, "report")
+    cp.send_desired(1, [cp.live("counter", "small-0", "counter-v1")])
+    # The agent commits a failed slot and tries again in the same turn, so FAILED may never be
+    # reported: wait for an instance that started and then went away.
+    started = []
+
+    def failed():
+        state = cp.report["slots"].get("small-0", {}).get("state")
+        if state == "STARTING":
+            started.append(True)
+        return bool(started) and state in ("FAILED", "EMPTY")
+    cp.wait(failed, "counter v1 failing in small-0")
+    say("reached: counter v1 never got ready in small-0")
+    if cp.args.seal_for:
+        cp.wait(lambda: cp.report["key_refused"] == "counter", "the key refused")
+        say("reached: the node refused counter's key")
+    cp.send_desired(2, ["end"])
+    cp.wait(lambda: cp.report["generation"] == 2, "report of generation 2")
+    return True
+
+
 def move_web(cp, src, src_slot, dst, dst_slot):
     """Move web from node `src` to node `dst` (RFD 2, P3: a move): start it on `dst`, wait until
     it is live there, send new connections to `dst`, then drain and stop it on `src`, and commit."""
@@ -597,6 +689,8 @@ def main():
     p.add_argument("--require-attestation", action="store_true")
     p.add_argument("--reference", help="also compare quotes with this reference (verify-quote.py --record)")
     p.add_argument("--timeout", type=float, default=60)
+    p.add_argument("--volume-keys", default="build/cp-volume-keys", metavar="DIR", help="where service volume keys are kept")
+    p.add_argument("--seal-for", metavar="SERVICE", help="test: seal every volume key for this service instead")
     p.add_argument("--lb", type=int, metavar="PORT", help="run a load balancer on this port")
     p.add_argument("--linger", type=float, default=1, metavar="SECONDS",
                    help="keep serving (the load balancer too) this long after the scenario")

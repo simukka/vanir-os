@@ -652,9 +652,16 @@ pub mod attest {
     /// there, up to the count the last quote covered; code 1 when there are none.
     pub const OP_RUNTIME_LOG: u64 = 3;
     /// From the agent only. Message: a nonce (32 bytes) and the agent's X25519 key (32 bytes).
-    /// Reply: the JSON quote line as for `OP_QUOTE`, over SHA-256(nonce || that key), with
-    /// `kx_pub` the agent's key.
+    /// Reply: the JSON quote line as for `OP_QUOTE`, with `kx_pub` the agent's key and
+    /// `seal_pub` the attest task's own key for this boot, over SHA-256(nonce || kx_pub ||
+    /// seal_pub): the control plane seals service keys to `seal_pub` (RFD 3, P2).
     pub const OP_QUOTE_FOR: u64 = 4;
+    /// From the agent only (RFD 3, P2). Message: a service name (32 bytes, zero padded) and a
+    /// blob the control plane sealed to `seal_pub` (80 bytes: its X25519 public key, the sealed
+    /// key, the tag). The attest task opens it and gives the key to the storage task. Reply
+    /// code 0 when storage has it, 3 when the blob doesn't open (for this service), 4 or 5 when
+    /// storage isn't there or refused (try again).
+    pub const OP_UNWRAP_VOLUME: u64 = 5;
 }
 
 /// The key server (the task named "keys", `user/unlocker`): a stand-in for a local key store.

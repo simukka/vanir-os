@@ -855,7 +855,7 @@ virtio block device. Three tasks share the work:</p>
 <tr><th>Task</th><th>Program</th><th>Role</th></tr>
 <tr><td><code>blockdev</code></td><td><code>virtio-blk</code></td><td>the driver: reads and writes raw 4 KiB blocks; only <code>disk</code> may send to it</td></tr>
 <tr><td><code>disk</code></td><td><code>storage</code></td><td>gives every client its own encrypted volume</td></tr>
-<tr><td><code>keys</code> or <code>attest</code></td><td><code>unlocker</code>, <code>attest</code></td><td>hands <code>disk</code> the master key</td></tr>
+<tr><td><code>keys</code> or <code>attest</code></td><td><code>unlocker</code>, <code>attest</code></td><td>hands <code>disk</code> the master key, and services' volume keys (<a href="#storage-service-keys">13.6</a>)</td></tr>
 </table>
 
 <p>Clients send <code>disk</code> block requests (<code>vanir_user::block</code>: read, write,
@@ -904,7 +904,8 @@ volumes, and in the key's salt (below), so their ciphertext never opens in each 
      |
      +-- HKDF-SHA256(salt "vanir-storage-v1", info "client-a") --&gt; volume key A
      +-- HKDF-SHA256(salt "vanir-storage-v1", info "client-b") --&gt; volume key B
-     +-- HKDF-SHA256(salt "vanir-service-v1", info service)     --&gt; a service's (RFD 3)
+  service key (32 bytes, one per service; from the control plane, RFD 3, P2; 13.6)
+     +-- HKDF-SHA256(salt "vanir-service-v2", info service)     --&gt; the service's volume key
                                                                      |
                      per block: XChaCha20-Poly1305(key, nonce = block || counter,
                                                    aad = name || block || counter)
@@ -913,7 +914,9 @@ volumes, and in the key's salt (below), so their ciphertext never opens in each 
 </figure>
 
 <p>The storage task starts <strong>locked</strong>, answering <code>LOCKED</code> to every
-request until it has the master key. It gets it from one of two places:</p>
+request for a task's volume until it has the master key, and to every request for a service's
+volume until it has that service's key (<a href="#storage-service-keys">13.6</a>). The master
+key comes from one of two places:</p>
 <ul>
   <li><strong>The key server</strong> (<code>keys</code>, <code>user/unlocker</code>): a test
     stand-in for a local key store, with the key compiled in. If <code>disk</code> may send to
@@ -1014,10 +1017,59 @@ volume's kind, and their keys use different salts (<code>volume-kinds</code>).</
 <p>Events: <code>epoch_changed</code> (volume, epoch, writer slot) and <code>write_fenced</code>
 (volume, slot, epoch; the first refusal per slot and epoch).</p>
 
+<h3 id="storage-service-keys"><span class="num">13.6</span>Service keys<a class="anchor" href="#storage-service-keys">#</a></h3>
+
+<p>Each service's volume has its own key (RFD 3, P2). The control plane makes it on first use,
+keeps it (<code>build/cp-volume-keys/&lt;service&gt;</code> for the mock), and sends it only to an
+attested node that runs the service. The agent forwards it but can't read it: the key is sealed
+to <code>attest</code>'s per-boot X25519 key, which the handshake's quote binds along with the
+agent's own keys. The agent can dial out and load images, so a compromised agent shouldn't also
+be able to read every volume on the node.</p>
+
+<figure>
+<pre class="diagram">
+  control plane                          agent                attest                    disk
+       | &lt;-- handshake: quote over SHA-256(e || s || seal_pub) ---|  (OP_QUOTE_FOR)          |
+  check quote; for each service with a volume it runs here:      |                          |
+  seal: X25519(fresh, seal_pub)                                  |                          |
+    -&gt; HKDF(salt = fresh pub, "vanir-volume-key-v1")             |                          |
+    -&gt; ChaCha20-Poly1305(key, aad = service name)                |                          |
+       | -- K: service, fresh pub || ct || tag --&gt;|               |                          |
+       |                                          |-- OP_UNWRAP_VOLUME --&gt;| open             |
+       |                                          |               |-- OP_SERVICE_KEY --------&gt;| service volume opens
+       |                                          | keeps the blob for a restarted disk      |
+       |    commit, no instance left here:        |-- OP_FORGET_KEY --------------------------&gt;| locked again
+</pre>
+<figcaption>Releasing a service's key</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Only for that service.</strong> The service name is the seal's associated data, so
+    a blob moved to another service doesn't open (<code>agent-volume-key-swap</code>); the agent
+    reports <code>key-refused &lt;service&gt;</code>.</li>
+  <li><strong>Only to attested nodes.</strong> A node that said <code>no-tpm</code> gets no keys,
+    so a service with a volume never gets ready there (<code>agent-volume-unattested</code>).</li>
+  <li><strong>Without its key</strong> a service's volume answers <code>LOCKED</code>; task
+    volumes and other services are unaffected, and so is <code>OP_EPOCH</code> for other
+    services. The instance never says it is ready, and the deployment fails
+    (<code>volume-no-key</code>).</li>
+  <li><strong>Forgotten.</strong> Once a commit leaves no instance of a service on the node, the
+    agent has <code>disk</code> forget its key and drops the blob (<code>volume-forget</code>).
+    A node only holds the keys of what it runs.</li>
+  <li><strong>The stand-in.</strong> <code>keys</code> serves a test key per service as well
+    (HKDF of a fixed seed and the name), and <code>disk</code> asks it when it needs one, so the
+    one-node tests run without a TPM or a control plane. An app with <code>keys</code> accepts
+    either source; the attested app (<code>agent-volumes-tpm.toml</code>) has none.</li>
+</ul>
+
+<p><code>OP_SERVICE_KEY</code> is accepted only from <code>keys</code> and <code>attest</code>,
+<code>OP_FORGET_KEY</code> only from the task with <code>loads = true</code>. A volume written
+under V1's keys (salt <code>vanir-service-v1</code>, from the master key) no longer opens.</p>
+
 <div class="agent"><span class="label">For agents</span><dl>
 <dt>files</dt><dd><code>user/storage/src/main.rs</code>, <code>user/virtio-blk/</code>, <code>user/unlocker/</code>, <code>user/blktest/</code>, <code>block</code>/<code>keys</code>/<code>telemetry</code> modules in <code>user/lib/src/lib.rs</code>, <code>tools/corrupt-disk.py</code></dd>
-<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7</dd>
-<dt>constants</dt><dd><code>MAGIC "VNRSTOR2"</code>, <code>DATA_BLOCKS 256</code>, <code>META_BLOCKS 2</code>, <code>META_ENTRY 24</code>; changing the format needs a new magic and an update to <code>tools/corrupt-disk.py</code></dd>
+<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5, EPOCH 6, SERVICE_KEY 7, FORGET_KEY 8; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7, FENCED 8</dd>
+<dt>constants</dt><dd><code>MAGIC "VNRSTOR3"</code>, <code>TASK_BLOCKS 256</code>, <code>META_ENTRY 24</code>, header sealed as block <code>u64::MAX</code>; changing the format needs a new magic and an update to <code>tools/corrupt-disk.py</code></dd>
 <dt>gotcha</dt><dd><code>storage-*</code> cases depend on the disk image the previous case left; <code>DISK_RESET=1</code> starts clean</dd>
 </dl></div>
 
@@ -1367,6 +1419,7 @@ deployments go on meanwhile (<code>user/agent/src/control.rs</code>).</p>
     | -- G image &lt;hash&gt; into &lt;slot&gt; ------------------&gt;
     | &lt;-- C chunks (staged into the slot), E sig + desc -   then the kernel checks and loads it
     | -- T telemetry lines (pulled from telemetry) -----&gt;
+    | &lt;-- K a service's volume key, sealed to attest ---   attested nodes only (13.6)
 </pre>
 <figcaption>The agent's connection (every frame after the handshake is encrypted)</figcaption>
 </figure>
@@ -1377,7 +1430,9 @@ deployments go on meanwhile (<code>user/agent/src/control.rs</code>).</p>
     (<code>agent-wrong-cp-key</code>). The agent's own static and ephemeral keys are fresh for
     each connection (RDRAND).</li>
   <li><strong>Who the node is.</strong> The first handshake message carries a TPM quote from
-    <code>attest</code> (<code>OP_QUOTE_FOR</code>) over SHA-256(ephemeral key || static key):
+    <code>attest</code> (<code>OP_QUOTE_FOR</code>) over SHA-256(ephemeral key || static key ||
+    <code>seal_pub</code>), where <code>seal_pub</code> is <code>attest</code>'s own per-boot key
+    that service keys are sealed to (<a href="#storage-service-keys">13.6</a>):
     the keys of this handshake belong to a measured boot of a known image, and the private keys
     never leave the agent. The control plane checks it (<code>agent-attested</code>) and refuses
     a quote that binds another key (<code>agent-unbound-key</code>). A node without a TPM says
@@ -1516,6 +1571,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Authenticated blocks, bound to volume, block and counter</td><td>changed or moved ciphertext read as data</td><td><code>storage-tampered</code>, <code>storage-bad-block</code>, <code>storage-header-tampered</code></td></tr>
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
 <tr><td>Key released only to an attested boot</td><td>a modified system getting the key</td><td><code>attest-unlock-refused</code></td></tr>
+<tr><td>A key per service, sealed to <code>attest</code> for one service, sent only to attested nodes that run it, forgotten when they stop</td><td>the agent (or anything but <code>attest</code> and <code>disk</code>) reading a volume key; a key opening another service's volume; nodes holding keys of services they don't run</td><td><code>agent-volume-key</code>, <code>agent-volume-key-swap</code>, <code>agent-volume-unattested</code>, <code>volume-no-key</code>, <code>volume-forget</code></td></tr>
 <tr><td>Frames freed on death</td><td>memory exhaustion from restart loops</td><td><code>restart-no-leak</code></td></tr>
 <tr><td>Slot images signed with their descriptor; checked, sized and measured at load</td><td>unsigned, changed, rolled-back or oversized services; a service claiming ports or a slot class it wasn't signed for</td><td><code>slot-*</code></td></tr>
 <tr><td>Run-time log and PCR 13 kept by the kernel</td><td>a node hiding what it loaded since boot</td><td><code>slot-measured</code>, <code>slot-attest</code></td></tr>
@@ -1556,8 +1612,9 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
     A service's volume is sized by its descriptor, and that size can't change.</li>
   <li><strong>Writes are refused during a handoff</strong> of a service with a volume, from the
     routing change until the old instance has drained (RFD 3, V3 makes them wait). Writer leases
-    are recorded, not enforced, and volume keys still come from the node's master key (V2 makes
-    them per service).</li>
+    are recorded, not enforced.</li>
+  <li><strong>The control plane holds every service's key</strong> (RFD 8, vector 7), in plain
+    files for the mock (<code>build/cp-volume-keys/</code>). Keys are never rotated.</li>
   <li><strong>One key release per boot.</strong> In the attested flow the host says
     <code>bye</code> after releasing the key, so a <code>disk</code> restarted later stays
     locked until the next boot.</li>
@@ -1700,7 +1757,7 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>123 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>129 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -1715,7 +1772,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>measured boot, attestation</td><td><code>measured-boot</code> <code>measured-rejected</code> <code>no-tpm</code> <code>attest-record</code> <code>attest-verify</code> <code>attest-replay</code> <code>attest-tampered</code> <code>attest-other-version</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>block</td><td><code>blk-rw</code> <code>blk-persist</code> <code>blk-persist-negative</code> <code>blk-restart</code></td><td></td></tr>
 <tr><td>storage</td><td><code>storage-isolation</code> <code>storage-old-format</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-header-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
-<tr><td>service volumes</td><td><code>volume-fence</code> <code>volume-persist</code> <code>volume-size-fixed</code> <code>volume-none</code> <code>volume-kinds</code> <code>volume-storage-restart</code> <code>volume-writer-restart</code></td><td><code>volume-persist</code> uses the disk <code>volume-fence</code> leaves</td></tr>
+<tr><td>service volumes</td><td><code>volume-fence</code> <code>volume-persist</code> <code>volume-wrong-key</code> <code>volume-size-fixed</code> <code>volume-none</code> <code>volume-no-key</code> <code>volume-forget</code> <code>volume-kinds</code> <code>volume-storage-restart</code> <code>volume-writer-restart</code></td><td><code>volume-persist</code> and <code>volume-wrong-key</code> use the disk <code>volume-fence</code> leaves</td></tr>
 <tr><td>key release</td><td><code>attest-storage-record</code> <code>attest-unlock</code> <code>attest-unlock-persist</code> <code>attest-unlock-refused</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>NIC</td><td><code>nic-arp-ping</code> <code>nic-restart</code> <code>nic-no-grant</code></td><td>free UDP ports 18090-18091</td></tr>
 <tr><td>sockets, HTTP</td><td><code>build-http-port-clash</code> <code>http-get</code> <code>http-undeclared-port</code> <code>net-restart</code> <code>http-restart</code></td><td>free TCP port 8080</td></tr>
@@ -1724,7 +1781,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
 <tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
-<tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-volume</code> <code>agent-epoch-stale</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code></td><td>port 7000; KVM, swtpm for the last two</td></tr>
+<tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-volume</code> <code>agent-epoch-stale</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code> <code>agent-volume-key</code> <code>agent-volume-key-swap</code> <code>agent-volume-unattested</code></td><td>port 7000; KVM, swtpm for <code>agent-attested</code> to <code>agent-volume-key-swap</code></td></tr>
 <tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>

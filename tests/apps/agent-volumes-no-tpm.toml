@@ -1,0 +1,58 @@
+# agent-volumes-tpm.toml without attest (and without the "keys" stand-in): a node that can't
+# attest, so the control plane sends it no volume keys (RFD 3, V2).
+[[task]]
+name = "supervisor"
+supervisor = true
+sends = ["telemetry"]
+
+[[task]]
+name = "telemetry"
+events = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic", "telemetry"]
+
+[[task]]
+name = "nic-mgmt"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["mgmt-net"]
+
+[[task]]
+name = "mgmt-net"
+program = "net"
+sends = ["nic-mgmt"]
+
+[[task]]
+name = "blockdev"
+program = "virtio-blk"
+devices = ["virtio-blk"]
+dma_pages = 16
+
+[[task]]
+name = "disk"
+program = "storage"
+sends = ["blockdev", "telemetry"]
+
+[[task]]
+name = "agent"
+loads = true
+routes = true
+connects = true
+sends = ["net", "mgmt-net", "supervisor", "telemetry", "disk"]
+
+[[slot_class]]
+name = "small"
+count = 2
+memory_pages = 256
+image_pages = 128
+sends = ["net", "disk"]

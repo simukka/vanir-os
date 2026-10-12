@@ -19,6 +19,7 @@
 //!   | `R` | agent | report (text) |
 //!   | `G` | agent | get image: hash (32), slot name |
 //!   | `T` | agent | telemetry JSON lines, pulled from the telemetry task |
+//!   | `K` | control plane | a service's volume key (RFD 3, P2): service (32, zero padded), the key sealed to `attest` (80) |
 //!
 //! - **Desired state** is a text document signed with a second pinned key
 //!   (`VANIR_CP_SIGN_PUB`), applied only if its generation is higher than the last one applied,
@@ -43,6 +44,11 @@
 //!   signed version (the node image), each slot's service, version, image hash and state, and
 //!   for a volume's writer `epoch <n>`, and `epoch-refused <n>` while `storage` refuses one. Sent
 //!   after the handshake, on every change, and every 5 s.
+//! - **Volume keys** (RFD 3, P2). The control plane sends an attested node the key of each
+//!   service with a volume it runs, sealed to `attest`'s per-boot key (`seal_pub` in the quote).
+//!   We can't open it: we pass it to `attest` (`OP_UNWRAP_VOLUME`), which gives it to `storage`.
+//!   We keep the sealed blob, to pass on again to a restarted `storage`, until no instance of
+//!   the service is left here. One `attest` can't open is reported (`key-refused <service>`).
 //! - **Update** (RFD 2, P3, determination 1): a node with instances refuses, and says how many in
 //!   its report; an empty one asks the supervisor to reboot it into the image installed now.
 
@@ -50,7 +56,7 @@ use crate::Image;
 use crate::lifecycle::{Agent, MAX_SLOTS, State};
 use ed25519_compact::{PublicKey, Signature};
 use noise::{Initiator, Transport};
-use vanir_user::attest::OP_QUOTE_FOR;
+use vanir_user::attest::{OP_QUOTE_FOR, OP_UNWRAP_VOLUME};
 use vanir_user::net::{self, CODE_WOULD_BLOCK, EV_CLOSED, EV_READ, EV_WRITE, Event};
 use vanir_user::{LineWriter, err, getpid, lookup, println, send, slot, supervisor, task_listen, telemetry, uptime};
 
@@ -124,6 +130,17 @@ struct Fetch {
     asked: bool,
 }
 
+/// A service's volume key sealed to `attest` (RFD 3, P2), as the control plane sent it.
+#[derive(Clone, Copy)]
+struct VolumeKey {
+    service: [u8; 32],
+    blob: [u8; 80],
+    /// The storage task (id) that has it, once `attest` gave it.
+    delivered: Option<u64>,
+    /// `attest` couldn't open it.
+    refused: bool,
+}
+
 /// Signature file and descriptor of images fetched into each slot (they outlive the frames
 /// they came in, as `Image` borrows them).
 static mut FETCHED: [([u8; 176], [u8; 256]); MAX_SLOTS] = [([0; 176], [0; 256]); MAX_SLOTS];
@@ -151,6 +168,9 @@ pub struct Control {
     pub end: bool,
     /// An `update` refused because the node runs instances: how many.
     update_refused: Option<usize>,
+    /// Sealed volume keys (RFD 3, P2), and the service of the last one `attest` refused.
+    keys: [Option<VolumeKey>; MAX_SLOTS],
+    key_refused: Option<[u8; 32]>,
 }
 
 impl Control {
@@ -177,6 +197,8 @@ impl Control {
             failures: 0,
             end: false,
             update_refused: None,
+            keys: [None; MAX_SLOTS],
+            key_refused: None,
         }
     }
 
@@ -206,6 +228,7 @@ impl Control {
         } else {
             vanir_user::sleep(2);
         }
+        self.deliver_keys(agent);
         agent.advance();
         self.reconcile(agent);
         if self.connected() {
@@ -412,7 +435,66 @@ impl Control {
                 self.fetch = None;
                 agent.deploy(f.slot, Some(image), self.drain_for(image.service()), self.epoch_for(image.service()));
             }
+            b'K' if body.len() == 112 => {
+                let service: [u8; 32] = body[..32].try_into().unwrap();
+                let at = self.keys.iter().position(|k| k.is_some_and(|k| k.service == service));
+                let Some(at) = at.or_else(|| self.keys.iter().position(Option::is_none)) else { return };
+                if self.keys[at].is_some_and(|k| k.blob == body[32..112]) {
+                    return;
+                }
+                let blob = body[32..112].try_into().unwrap();
+                self.keys[at] = Some(VolumeKey { service, blob, delivered: None, refused: false });
+            }
             kind => println!("agent: unknown frame type {}", kind),
+        }
+    }
+
+    /// Pass each sealed volume key `storage` doesn't have yet to `attest`.
+    fn deliver_keys(&mut self, agent: &Agent) {
+        let Some(disk) = agent.disk() else { return };
+        for k in self.keys.iter_mut().flatten() {
+            if k.refused || k.delivered == Some(disk) {
+                continue;
+            }
+            let shown = core::str::from_utf8(&k.service[..k.service.iter().position(|&b| b == 0).unwrap_or(32)]).unwrap_or("?");
+            let Some(attest) = self.attest else {
+                println!("agent: {}'s volume key arrived, but there is no attest task to open it", shown);
+                k.refused = true;
+                continue;
+            };
+            let mut msg = [0u8; 112];
+            msg[..32].copy_from_slice(&k.service);
+            msg[32..].copy_from_slice(&k.blob);
+            match send(attest, OP_UNWRAP_VOLUME, &msg, &mut []) {
+                Ok((0, _)) => {
+                    println!("agent: passed {}'s volume key to attest; storage has it", shown);
+                    k.delivered = Some(disk);
+                    if self.key_refused == Some(k.service) {
+                        self.key_refused = None;
+                        self.next_report = 0;
+                    }
+                }
+                Ok((3, _)) => {
+                    println!("agent: attest could not open {}'s volume key", shown);
+                    k.refused = true;
+                    self.key_refused = Some(k.service);
+                    self.next_report = 0;
+                }
+                _ => {} // storage restarting: next turn
+            }
+        }
+    }
+
+    /// Commit `service`, and drop its volume key once no instance of it is left.
+    fn commit(&mut self, agent: &mut Agent, service: &[u8]) {
+        agent.commit(service);
+        if !agent.holds(service) {
+            let name = vanir_user::block::service_name(service);
+            for k in self.keys.iter_mut() {
+                if k.is_some_and(|k| k.service == name) {
+                    *k = None;
+                }
+            }
         }
     }
 
@@ -515,7 +597,10 @@ impl Control {
                         State::Empty if self.fetch.is_none() => {
                             self.fetch = Some(Fetch { slot: k, hash, asked: false });
                         }
-                        State::Stopped | State::Failed => agent.commit(agent.get(k).service()),
+                        State::Stopped | State::Failed => {
+                            let service = agent.get(k).service();
+                            self.commit(agent, service);
+                        }
                         _ => {}
                     }
                 }
@@ -548,7 +633,7 @@ impl Control {
                     // this node or (after a move) another.
                     let service = w[1];
                     if !agent.busy(service) {
-                        agent.commit(service);
+                        self.commit(agent, service);
                     }
                 }
                 _ => {}
@@ -584,6 +669,10 @@ impl Control {
         let _ = write!(line, "report {} node {} image {}", self.generation, env!("VANIR_NODE"), image);
         if let Some(n) = self.update_refused {
             let _ = write!(line, " update-refused {}", n);
+        }
+        if let Some(service) = self.key_refused {
+            let name = &service[..service.iter().position(|&b| b == 0).unwrap_or(32)];
+            let _ = write!(line, " key-refused {}", core::str::from_utf8(name).unwrap_or("?"));
         }
         if let Some(why) = self.refused {
             let _ = write!(line, " refused {}", why);

@@ -187,6 +187,16 @@ impl Agent {
         Some(k)
     }
 
+    /// The storage task, as last looked up (a restarted one has a new id).
+    pub fn disk(&self) -> Option<u64> {
+        self.disk
+    }
+
+    /// Whether any slot holds an instance of `service`.
+    pub fn holds(&self, service: &[u8]) -> bool {
+        self.slots.iter().flatten().any(|s| s.service() == service)
+    }
+
     pub fn supervisor(&self) -> u64 {
         self.supervisor
     }

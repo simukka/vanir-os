@@ -76,7 +76,9 @@ def replay_runtime(entries):
 
 def check(quote, nonce, tamper=False, runtime=()):
     """Return the problems with `quote` as a quote over `nonce` (empty if none). A quote that
-    carries a key-exchange public key (`kx_pub`) must be over SHA-256(nonce || kx_pub).
+    carries a key-exchange public key (`kx_pub`) must be over SHA-256(nonce || kx_pub), and one
+    that also carries attest's key to seal volume keys to (`seal_pub`, RFD 3, P2) over
+    SHA-256(nonce || kx_pub || seal_pub).
     `runtime` holds the run-time log entries sent after the quote; they must replay to PCR 13.
     With `runtime=None` PCR 13 isn't checked (the caller didn't get the log)."""
     problems = []
@@ -89,7 +91,7 @@ def check(quote, nonce, tamper=False, runtime=()):
         return [str(e)]
     expected = bytes.fromhex(nonce)
     if "kx_pub" in quote:
-        expected = hashlib.sha256(expected + bytes.fromhex(quote["kx_pub"])).digest()
+        expected = hashlib.sha256(expected + bytes.fromhex(quote["kx_pub"]) + bytes.fromhex(quote.get("seal_pub", ""))).digest()
     if extra != expected:
         problems.append("the quote is not over this challenge's nonce (replayed?)")
     key = ec.EllipticCurvePublicNumbers(int(quote["ak_x"], 16), int(quote["ak_y"], 16), ec.SECP256R1()).public_key()
@@ -144,3 +146,14 @@ def seal_key(master_key, kx_pub_hex, nonce_hex):
     sealed = ChaCha20Poly1305(key).encrypt(bytes(12), master_key, nonce)
     public = ours.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return (public + sealed).hex()
+
+
+def seal_volume_key(key, seal_pub_hex, service):
+    """Seal a service's volume key (32 bytes) to attest's per-boot X25519 key `seal_pub` (RFD 3,
+    P2): returns the 80-byte blob attest's OP_UNWRAP_VOLUME opens (our fresh public key,
+    ciphertext, tag). The service name is the associated data, so the blob opens for no other."""
+    ours = X25519PrivateKey.generate()
+    shared = ours.exchange(X25519PublicKey.from_public_bytes(bytes.fromhex(seal_pub_hex)))
+    public = ours.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    k = HKDF(algorithm=hashes.SHA256(), length=32, salt=public, info=b"vanir-volume-key-v1").derive(shared)
+    return public + ChaCha20Poly1305(k).encrypt(bytes(12), key, service.encode())

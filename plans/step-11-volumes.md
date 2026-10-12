@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1 implemented (V1a–V1c); V2a implemented, V2b in progress. V3 and V4 will be added here.
+Status: V1 and V2 implemented (V1a–V1c, V2a–V2b). V3 and V4 will be added here.
 
 ## Goal
 
@@ -302,3 +302,16 @@ Where it departs from the plan so far:
   stray read can come from it; instead `keys` hands each service's key over once, and counter
   deployed again after the commit can't open its volume (LOCKED, FAILED). `volume-wrong-key`
   runs after `volume-persist`, on the disk `volume-fence` leaves.
+- **V2b: `seal_pub` is `attest`'s existing per-boot key** (the one the master key is sealed
+  to), named `seal_pub` in `OP_QUOTE_FOR`'s line; `OP_QUOTE` for the host is unchanged.
+- **V2b: no `--no-keys` option.** `agent-volume-unattested` covers a node that gets no keys:
+  its app (`agent-volumes-no-tpm.toml`) has neither `attest` nor `keys`, since `attest` without
+  a TPM exits and `halt-on-exit` would stop the run.
+- **V2b: the agent keeps each sealed blob** and passes it on again when `disk` has a new id (a
+  restarted `disk` has no keys), until a commit leaves no instance of the service. No test
+  restarts `disk` under the attested app yet. The control plane sends a node its keys with each
+  desired state, and again on the first report of a new connection.
+- **V2b: a failed deployment may never be reported as FAILED.** The agent commits a failed slot
+  and fetches the image again in the same turn, so `volume-no-key` (the mock control plane's
+  scenario for the swap and unattested cases) waits for an instance that started and went away.
+  The retry loop itself is older behaviour.

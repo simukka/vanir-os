@@ -5,8 +5,11 @@
 //! `OP_RUNTIME_LOG` then returns those entries (images loaded into and unloaded from slots, RFD 2,
 //! P6) a JSON line at a time.
 //!
-//! `OP_QUOTE_FOR`, from the agent only, quotes over SHA-256(nonce || the agent's key) instead:
-//! the agent binds its Noise key for one handshake to an attested boot that way (RFD 2, P7).
+//! `OP_QUOTE_FOR`, from the agent only, quotes over SHA-256(nonce || the agent's key || our
+//! key-exchange key) instead: the agent binds its Noise key for one handshake to an attested boot
+//! that way (RFD 2, P7), and the control plane learns the key to seal service keys to (RFD 3,
+//! P2). The agent passes on each sealed service key (`OP_UNWRAP_VOLUME`); we open it and hand it
+//! to the storage task, so the agent never sees one.
 //!
 //! The kernel extends PCR 13 at run time too, so this task holds the TPM lock around each
 //! sequence of TPM commands (RFD 2, determination 8). Holding it over a quote and the PCR reads
@@ -27,7 +30,7 @@ use ed25519_compact::x25519;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use tpm2::{AttestationKey, Tpm};
-use vanir_user::attest::{OP_QUOTE, OP_QUOTE_FOR, OP_RUNTIME_LOG, OP_UNWRAP};
+use vanir_user::attest::{OP_QUOTE, OP_QUOTE_FOR, OP_RUNTIME_LOG, OP_UNWRAP, OP_UNWRAP_VOLUME};
 use vanir_user::block::{self, code_name};
 use vanir_user::{RUNTIME_ENTRY_LEN, err, lookup, measurements, println, recv, reply, runtime_log, task_name, tpm_lock, tpm_unlock};
 
@@ -73,26 +76,35 @@ impl Write for Line {
     }
 }
 
+/// A quote over SHA-256(nonce || kx_public), or with `seal` (our key, for the agent's
+/// handshake) SHA-256(nonce || kx_public || seal), as a JSON line in `out`.
+#[allow(clippy::too_many_arguments)]
 fn quote(
     tpm: &Tpm,
     key: &AttestationKey,
     kx_public: &[u8; 32],
+    seal: Option<&[u8; 32]>,
     log: &[u8],
     entries: usize,
     nonce: &[u8],
     out: &mut Line,
 ) -> Result<usize, tpm2::Error> {
     // Binding the key-exchange public key into the quote.
-    let qualifying: [u8; 32] = Sha256::new().chain_update(nonce).chain_update(kx_public).finalize().into();
+    let mut hash = Sha256::new().chain_update(nonce).chain_update(kx_public);
+    if let Some(seal) = seal {
+        hash.update(seal);
+    }
+    let qualifying: [u8; 32] = hash.finalize().into();
     let mut buf = [0u8; tpm2::BUF];
     let q = tpm.quote(&mut buf, key, &qualifying, &PCRS)?;
     // Under the lock no load can happen between the quote and this count.
     let (_, runtime_count) = runtime_log(&mut [], 0).unwrap_or((0, 0));
     let _ = write!(
         out,
-        "{{\"event\":\"quote\",\"nonce\":\"{}\",\"kx_pub\":\"{}\",\"attest\":\"{}\",\"sig_r\":\"{}\",\"sig_s\":\"{}\",\"ak_x\":\"{}\",\"ak_y\":\"{}\",\"pcrs\":{{",
+        "{{\"event\":\"quote\",\"nonce\":\"{}\",\"kx_pub\":\"{}\",{}\"attest\":\"{}\",\"sig_r\":\"{}\",\"sig_s\":\"{}\",\"ak_x\":\"{}\",\"ak_y\":\"{}\",\"pcrs\":{{",
         Hex(nonce),
         Hex(kx_public),
+        SealPub(seal),
         Hex(q.attest),
         Hex(q.r),
         Hex(q.s),
@@ -112,6 +124,47 @@ fn quote(
     }
     let _ = write!(out, "],\"runtime_count\":{}}}\n", runtime_count);
     Ok(runtime_count)
+}
+
+/// `"seal_pub":"<hex>",` when there is one.
+struct SealPub<'a>(Option<&'a [u8; 32]>);
+
+impl fmt::Display for SealPub<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0 {
+            Some(k) => write!(f, "\"seal_pub\":\"{}\",", Hex(k)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Open a service key the control plane sealed to our key-exchange key (RFD 3, P2: its public
+/// key, the sealed key and tag, with the service name as associated data) and give it to the
+/// storage task. Returns a reply code (0 = storage has it).
+fn unwrap_volume_key(secret: &x25519::SecretKey, service: &[u8; 32], blob: &[u8]) -> u64 {
+    let name = &service[..service.iter().position(|&b| b == 0).unwrap_or(32)];
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    let Ok(sender) = x25519::PublicKey::from_slice(&blob[..32]) else { return 3 };
+    let Ok(shared) = sender.dh(secret) else { return 3 };
+    let mut k = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(&blob[..32]), &*shared).expand(b"vanir-volume-key-v1", &mut k).unwrap();
+    let mut key: [u8; 32] = blob[32..64].try_into().unwrap();
+    let tag = Tag::try_from(&blob[64..80]).unwrap();
+    if ChaCha20Poly1305::new(&k.into()).decrypt_inout_detached(&Nonce::default(), name, key.as_mut_slice().into(), &tag).is_err() {
+        println!("attest: {}'s sealed key does not open", shown);
+        return 3;
+    }
+    let Ok(storage) = lookup("disk") else { return 4 };
+    match block::service_key(storage, name, &key) {
+        Ok(()) => {
+            println!("attest: {}'s volume key handed to storage", shown);
+            0
+        }
+        Err(e) => {
+            println!("attest: storage refused {}'s key: {}", shown, code_name(e));
+            5
+        }
+    }
 }
 
 /// Run-time log entries `start..` (up to `count`, the number the last quote covered) as one
@@ -224,6 +277,16 @@ fn main() -> u64 {
             let _ = reply(m.sender, code, &[]);
             continue;
         }
+        if m.op == OP_UNWRAP_VOLUME {
+            let mut name = [0u8; 16];
+            let code = if task_name(m.sender, &mut name) != Ok("agent") || m.len != 112 {
+                1
+            } else {
+                unwrap_volume_key(&kx_secret, &msg[..32].try_into().unwrap(), &msg[32..112])
+            };
+            let _ = reply(m.sender, code, &[]);
+            continue;
+        }
         if m.op == OP_RUNTIME_LOG && m.len == 8 {
             let start = u64::from_le_bytes(msg[..8].try_into().unwrap()) as usize;
             let mut line = Line { buf: [0; 4096], len: 0 };
@@ -241,7 +304,7 @@ fn main() -> u64 {
             }
             let key: [u8; 32] = msg[32..64].try_into().unwrap();
             let mut line = Line { buf: [0; 4096], len: 0 };
-            match locked(|| quote(&tpm, &key_ak, &key, &log, entries, &msg[..32], &mut line)) {
+            match locked(|| quote(&tpm, &key_ak, &key, Some(&kx_public), &log, entries, &msg[..32], &mut line)) {
                 Ok(_) => drop(reply(m.sender, 0, &line.buf[..line.len])),
                 Err(e) => {
                     println!("attest: quote for the agent failed: {:?}", e);
@@ -255,7 +318,7 @@ fn main() -> u64 {
             continue;
         }
         let mut line = Line { buf: [0; 4096], len: 0 };
-        match locked(|| quote(&tpm, &key_ak, &kx_public, &log, entries, &msg[..m.len], &mut line)) {
+        match locked(|| quote(&tpm, &key_ak, &kx_public, None, &log, entries, &msg[..m.len], &mut line)) {
             Ok(count) => {
                 runtime_count = count;
                 last_nonce[..m.len].copy_from_slice(&msg[..m.len]);
