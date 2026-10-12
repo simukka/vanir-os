@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1 implemented (V1a–V1c). V2–V4 will be added here.
+Status: V1 implemented (V1a–V1c); V2 planned. V3 and V4 will be added here.
 
 ## Goal
 
@@ -154,6 +154,112 @@ KVM-only, as today).
   `agent-volume` may be slow. If it is, it keeps a short load and runs with `SLOW=1`.
 - **The format change** reformats any disk left from before; `storage-persist` and
   `attest-unlock-persist` use disks made earlier in the same run, so they are unaffected.
+
+## V2: keys per service (RFD 3, P2)
+
+### Goal
+
+A service's volume is keyed from a key that belongs to the service, held by the control plane,
+and released only to an attested node that runs the service. After V2:
+
+- a service volume's key is HKDF-SHA256(service key, salt `vanir-service-v2`, info = name);
+  the node's master key keys only fixed tasks' volumes
+- the control plane makes one key per service, keeps it, and sends it only to a node that
+  attested in its handshake, **sealed to `attest`'s per-boot key**: the agent forwards a blob it
+  can't open, and `attest` opens it and hands the key to `disk`
+- a seal names its service, so a blob for one service can't unlock another's volume
+- without its service's key, a service volume answers `CODE_LOCKED` (task volumes and other
+  services are unaffected), so the instance never says it is ready and the deployment fails
+- once no instance of a service is left on the node (commit), the agent tells `disk` to forget
+  its key: a node only holds keys for the services it runs
+- one-node tests without a control plane keep working: the `keys` stand-in serves service keys
+  as it serves the master key
+
+Out of scope: V3 (handoff), V4 (moves, where the target gets the same key the same way), keeping
+the control plane's keys in an HSM or TPM (RFD 8, vector 7), rotating a service's key.
+
+### What we have
+
+- **Master-key release** (`user/attest`): at boot `attest` makes an X25519 key from TPM
+  randomness; `OP_QUOTE` quotes over SHA-256(nonce || that key); the host seals the master key
+  to it (`vanir_attest.seal_key`: X25519, HKDF-SHA256 salted with the nonce, ChaCha20-Poly1305);
+  `OP_UNWRAP` opens it and sends `disk` `OP_UNLOCK`. `disk` accepts that only from `keys` or
+  `attest`.
+- **The agent's handshake** carries a quote from `OP_QUOTE_FOR` over SHA-256(ephemeral || the
+  agent's static key), with `kx_pub` = the agent's key; `control-plane.py` checks it
+  (`check_quote`), and `--require-attestation` refuses `no-tpm`. Attested runs need KVM and
+  swtpm (`agent-attested`, `agent-tpm.toml`).
+- **`keys`** (`user/unlocker`) is a test stand-in that serves the master key to `disk`.
+- **V1**: service volumes keyed from the master key with salt `vanir-service-v1`.
+
+### Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Who sees a service key in plain text | the control plane, `attest` and `disk` only. The control plane seals each key to `attest`'s per-boot X25519 key; the agent carries the sealed blob | the agent can dial out (`connects = true`) and loads images; if it is compromised, it shouldn't be able to read every volume on the node as well. The alternative, sending the key inside the Noise channel to the agent, is simpler but makes the agent a key holder |
+| How the control plane knows `attest`'s key | `OP_QUOTE_FOR` quotes over SHA-256(nonce ‖ agent key ‖ attest's key) and adds `seal_pub` to the JSON line; `vanir_attest.check` hashes `seal_pub` in when present | one quote binds both: the handshake's keys and the key to seal to belong to the same measured boot |
+| The seal | X25519 (a fresh control-plane key per seal) with `seal_pub`, HKDF-SHA256 (salt = the fresh public key, info `vanir-volume-key-v1`), ChaCha20-Poly1305 with associated data = service name. Blob: fresh public key (32), sealed key (32), tag (16) | as the master key's seal, plus the service name, so a blob moved to another service doesn't open |
+| Delivery | new frame `K` (control plane → agent): service name (32, zero padded), blob (80). Sent after the handshake for every service the desired state puts on the node, and with each desired state that adds one. The agent forwards it to `attest` (`OP_UNWRAP_VOLUME`), which sends `disk` `OP_SERVICE_KEY` (service, key) | the control plane already decides what runs where; the key goes where the service goes |
+| Who may give `disk` a service key | `attest`, and `keys` (the stand-in). `disk` asks `keys` itself, as for the master key, when it needs a service's key and may send to `keys` | one-node tests keep running under TCG with no TPM or control plane |
+| Without a key | requests to that service's volume get `CODE_LOCKED`, and so does `OP_EPOCH` for it (the agent retries that already). Task volumes still need only the master key | a missing key costs only that service |
+| Unattested nodes | the control plane sends no `K` frame to a node that said `no-tpm`, and says so | P2: keys only to attested nodes |
+| Forgetting | `OP_FORGET_KEY(service)` from the `loads = true` task; the agent sends it after committing a service of which no instance is left. `disk` drops the key and marks the volume's header unchecked | P2: a node only holds keys for the volumes it runs |
+| Where the control plane keeps keys | `build/cp-volume-keys/<service>`, 32 random bytes made on first use, mode 0600 | survives across runs, as `volume-persist` needs; an HSM is RFD 8, vector 7 |
+| Key changes | the salt changes to `vanir-service-v2`, so volumes written under V1 don't open (`INTEGRITY`). Every test that reuses a disk makes it in the same run | nothing holds real data |
+
+### Sub-steps
+
+#### V2a: service keys in storage, from the stand-in
+
+- `vanir_user::block`: `OP_SERVICE_KEY` (service, key), `OP_FORGET_KEY` (service).
+  `vanir_user::keys`: `OP_SERVICE_KEY` (service → key).
+- `disk`: a table of service keys (as many as volumes); service volumes keyed from them; asks
+  `keys` for a missing one; `CODE_LOCKED` without one; `OP_FORGET_KEY` from the agent.
+- `keys`: serves a per-service test key (HKDF of its fixed seed and the name); feature
+  `no-service-keys` refuses them; `wrong-key` changes them too.
+- Agent: `OP_FORGET_KEY` after a commit leaves no instance of a service.
+- Tests (`DISK=1`):
+  - every `volume-*` test passes unchanged (`keys` is in `volumes.toml`).
+  - `volume-no-key` (`keys/no-service-keys`): counter v1 can't open its volume (LOCKED), never
+    says it is ready, and the deployment fails.
+  - `volume-wrong-key` (after `volume-fence`, `keys/wrong-key`): counter's header doesn't open
+    (INTEGRITY).
+  - `volume-forget` (`script-volume-forget`): deploy, stop, commit; `disk` forgets counter's key,
+    and a stray read from counter's slot afterwards is LOCKED.
+
+#### V2b: sealed keys from the control plane
+
+- `attest`: `OP_QUOTE_FOR` binds `seal_pub`; `OP_UNWRAP_VOLUME` (service, blob) from the agent
+  only, which opens it and sends `disk` `OP_SERVICE_KEY`.
+- `vanir_attest.py`: `check` hashes `seal_pub` in; `seal_volume_key(key, seal_pub, service)`.
+- Agent: forwards `K` frames to `attest`; reports `key-refused <service>` if `attest` can't open
+  one.
+- `control-plane.py`: per-service keys; sends `K` to attested nodes for the services desired
+  there; options `--seal-for <other service>` (a blob sealed for the wrong service) and
+  `--no-keys`.
+- Test app `agent-volumes-tpm.toml`: `agent-volumes.toml` with `attest` and without `keys`.
+- Tests (`TPM=1 ACCEL=kvm`, `NET=user NET_MGMT=user DISK=1`):
+  - `agent-volume-key`: counter v1 is deployed; the control plane seals counter's key to the
+    node; `attest` opens it and `disk` has it; counter opens its volume and goes live. The serial
+    log never shows the key (the control plane prints its SHA-256 only).
+  - `agent-volume-key-swap` (`--seal-for web`): `attest` refuses the blob, counter's volume stays
+    LOCKED, and the report says `key-refused counter`.
+  - `agent-volume-unattested` (no TPM, TCG): the control plane sends no key; the deployment
+    fails with counter's volume LOCKED.
+- Manual: Storage (service keys), the key-release diagram with both paths, the desired-state
+  section (`K` frames), RFD 8 vector 7 in the limitations.
+
+### Risks and how we'll know
+
+- **Changing the handshake quote** breaks every attested agent test if the two sides disagree.
+  `agent-attested` and `agent-unbound-key` run in V2b before any new test is added.
+- **Order at start.** `K` may arrive before `disk` is up, or before the instance asks; `attest`
+  keeps no keys, so the agent re-forwards a `K` frame it couldn't deliver on its next turn, and
+  `disk` treats a key it already has as a no-op.
+- **`keys` as a second source of service keys** is a test stand-in. An app with both `attest`
+  and `keys` would accept either; the attested test app has no `keys`.
+- **`disk` forgetting a key while an instance still reads.** The agent only forgets after a
+  commit leaves no instance; `volume-forget` checks a read afterwards is LOCKED, not served.
 
 ## As built
 
