@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1 and V2 implemented (V1a–V1c, V2a–V2b). V3 and V4 will be added here.
+Status: V1 and V2 implemented (V1a–V1c, V2a–V2b); V3 planned. V4 will be added here.
 
 ## Goal
 
@@ -260,6 +260,96 @@ the control plane's keys in an HSM or TPM (RFD 8, vector 7), rotating a service'
   and `keys` would accept either; the attested test app has no `keys`.
 - **`disk` forgetting a key while an instance still reads.** The agent only forgets after a
   commit leaves no instance; `volume-forget` checks a read afterwards is LOCKED, not served.
+
+## V3: handoff without refusing writes (RFD 3, P3)
+
+### Goal
+
+During a local swap, the new instance's requests wait instead of failing. After V3:
+
+- from the routing change until the epoch moves, `storage` holds the candidate's reads, writes
+  and flushes, and answers them in order once the candidate holds the epoch (determinations 2
+  and 5)
+- when an instance becomes the writer, `storage` posts it a notify bit before it answers any
+  held request, so a service knows when its cache can be trusted (determination 9)
+- if the handoff is called off (the epoch is refused), the held requests are answered as if
+  they had just arrived: reads succeed, writes get `CODE_FENCED`
+- `agent-volume` no longer allows `FENCED` during the swap: every count is answered, none
+  repeats, and none is skipped
+
+Out of scope: moves (V4), where the same holding starts on the target before the control plane
+routes to it.
+
+### What we have
+
+- **Deferred replies.** `reply` (`kernel/src/process.rs:861`) answers any caller that is
+  blocked waiting for this server, at any time, so `storage` can keep a request and answer it
+  later. A caller that died or restarted in between makes the reply fail with `DEAD`.
+- **Notify bits** (`notify`, `:902`) need the sender to be allowed to *send* to the target. No
+  task may send to a slot (`kernel/build.rs` resolves `sends` among tasks only), so `storage`
+  can't notify an instance today. A slot's `sends` names `disk`.
+- **The agent's swap** (`user/agent/src/lifecycle.rs`): `Promote` routes to the new instance
+  and drains the old; `WaitDrained` gives the new instance its epoch once the old has drained,
+  then stops the old. A refused epoch leaves the new instance live without it.
+- **`storage`** answers every request at once, from one loop in `main`. `may_write` fences
+  everything but the writer's slot.
+- **`http`** with a volume reads and writes block 0 for each `/count`, and caches nothing. It
+  waits in `net::wait`, not `recv`, so it doesn't see notify bits yet.
+- **`count-under-deploy`** (`tools/net-peer.py`) checks that no count repeats and allows 503
+  `FENCED`.
+
+### Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Starting the hold | new `block::OP_HANDOFF(candidate id)` from the `loads = true` task, sent by the agent in `Promote` just before `net::route`; `storage` finds the volume from the candidate's descriptor. Candidate 0 calls the handoff off | the agent knows the moment routing changes; nobody else does |
+| What is held | the candidate's `OP_READ`, `OP_WRITE` and `OP_FLUSH`, with their data. `OP_INFO` is answered at once | reads wait too (determination 5); `OP_INFO` reveals nothing that changes |
+| Where | a table of held requests in `storage` (sender, op, length, 4 KiB of data, when it arrived), 8 entries, in a static (the stack is 64 KiB). If full, `CODE_BUSY`, which `block`'s callers already retry | each instance has at most one request outstanding, so one entry per slot is enough (RFD 3, P8) |
+| Releasing | when `OP_EPOCH` makes the candidate the writer: post the bit, then run each held request through the normal path, in arrival order, and answer it | the same checks as any request; nothing special to get wrong |
+| Calling it off | `OP_HANDOFF(0)` or a handoff to another candidate: the held requests run through the normal path at once (reads succeed, writes FENCED). The agent calls it off when the epoch is refused after the drain | a refusal must not leave the candidate blocked forever |
+| The writer bit | `block::NOTIFY_WRITER` (bit 0), posted to the new writer's id whenever `OP_EPOCH` raises the epoch | determination 9 |
+| Notify to a slot | the kernel lets a task notify any task that may **send to it** (a server telling its client), as well as those it may send to | `notify` exists for exactly this case, its doc comment says so; it carries only bits and never blocks |
+| Seeing the bit | `vanir_user::posted()`: `recv` with a zero timeout, for tasks nobody sends to; `http` calls it after each `net::wait` and prints "now the writer of its volume" once | `http` never calls `recv`; polling costs one syscall per turn |
+| `storage` restarting during a handoff | the held requests are lost and their callers get `DEAD` (as `http` already handles); the agent sends the handoff again with the epochs it resends (`keep_epochs`) | same as any `storage` restart |
+| Telemetry | event `handoff` (volume, requests held, longest wait in ticks) when held requests are released or called off | RFD 3, P7 |
+
+### Sub-steps
+
+V3 is one sub-step.
+
+- Kernel: `notify` also allowed to a task whose `sends` names the caller.
+- `vanir_user`: `block::OP_HANDOFF`, `block::handoff(storage, candidate)`,
+  `block::NOTIFY_WRITER`; `posted()`.
+- `storage`: the request path moves out of `main` into `Storage::serve`; per volume, the
+  candidate's slot; the held table; release and call-off; the bit; prints "counter: holding
+  small-1's requests (handoff)" and "counter: released N held request(s) to small-1, longest
+  wait T ticks" / "handoff to small-1 called off; N held request(s) answered".
+- Agent: `OP_HANDOFF` before routing when there is an old instance and an epoch; calls it off
+  when the epoch is refused; sends it again after a `storage` restart.
+- `http`: polls `posted()`; prints the bit once.
+- Peer: `count-under-deploy` no longer allows FENCED, and checks the counts are 1..N with none
+  missing.
+- Tests:
+  - `agent-volume` (changed): 0 FENCED, counts 1..N, "small-1: now the writer of its volume",
+    and storage's release line.
+  - `volume-fence` (changed): storage holds small-1's requests, releases them after epoch 2,
+    and counter v2 prints the writer bit.
+  - `volume-handoff-off` (new, `script-volume-handoff-off`): counter v2 is deployed over v1
+    with epoch 1, which is refused after the drain; the handoff is called off, its held probe
+    write is answered FENCED, and v2 never writes.
+- Manual: Storage (holding during a handoff, `OP_HANDOFF`, the writer bit), notify's rule, the
+  limitations (writes are no longer refused during a swap), the test catalogue.
+
+### Risks and how we'll know
+
+- **A candidate held forever.** If the old instance never drains, the drain deadline still ends
+  it, and the epoch moves. If the epoch is refused, the agent calls the handoff off;
+  `volume-handoff-off` checks it.
+- **The probe timing in `volume-fence`.** With no traffic, the old instance drains in a few
+  ticks and the probe (every 100 ms) may not land in the window, so the release line may say 0
+  requests; the test checks the line, not the number.
+- **Widening `notify`.** A server may now post bits to its clients. Bits carry no data and
+  can't block, and a client already trusts the servers it sends to.
 
 ## As built
 
