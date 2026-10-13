@@ -189,6 +189,7 @@ td code { white-space: nowrap; }
       <li><a href="#deploy-lifecycle">15.4 The lifecycle and the local swap</a></li>
       <li><a href="#deploy-control">15.5 The agent and the control plane</a></li>
       <li><a href="#deploy-moves">15.6 Moves, evacuation and updates</a></li>
+      <li><a href="#deploy-volume-moves">15.7 Moving a volume</a></li>
     </ul>
   </li>
   <li><a href="#syscalls">16. Syscalls</a></li>
@@ -1444,8 +1445,10 @@ deployments go on meanwhile (<code>user/agent/src/control.rs</code>).</p>
 <ul>
   <li><strong>Who it talks to.</strong> The control plane's Noise static key is pinned in the
     agent at build time (<code>keys/cp-noise.pub</code>), so the agent talks to no one else
-    (<code>agent-wrong-cp-key</code>). The agent's own static and ephemeral keys are fresh for
-    each connection (RDRAND).</li>
+    (<code>agent-wrong-cp-key</code>). The agent's static key is made once per boot and its
+    ephemeral key for each connection (RDRAND). The static key is also how another node's agent
+    knows this one when a volume moves (<a href="#deploy-volume-moves">15.7</a>), so it stays
+    the same across reconnections.</li>
   <li><strong>Who the node is.</strong> The first handshake message carries a TPM quote from
     <code>attest</code> (<code>OP_QUOTE_FOR</code>) over SHA-256(ephemeral key || static key ||
     <code>seal_pub</code>), where <code>seal_pub</code> is <code>attest</code>'s own per-boot key
@@ -1511,7 +1514,50 @@ into an image signed as version 2, rejoins, and the service moves back, all unde
 load balancer on port 8000, and the peer through it. QEMU runs with <code>-no-reboot</code>, so a
 reboot ends it with status 0, and the harness boots node a again from the updated image, standing
 in for an A/B update of its disk. Staging that image on a real disk is out of scope (RFD 2's
-plan).</p>
+plan). With <code>DISK=1</code> each node gets its own copy of the disk the build made
+(<code>build/disk-a.img</code>, <code>build/disk-b.img</code>).</p>
+
+<h3 id="deploy-volume-moves"><span class="num">15.7</span>Moving a volume<a class="anchor" href="#deploy-volume-moves">#</a></h3>
+
+<p>A service with a volume takes its volume along when it moves (RFD 3, P4 and P5). The volume
+goes directly from the source node to the target node, not through the control plane, which
+only sets the transfer up (<code>user/agent/src/transfer.rs</code>).</p>
+
+<figure>
+<pre class="diagram">
+                     control plane
+     transfer counter send b &lt;b's key&gt;     transfer counter receive a 10.0.2.2:8081 &lt;a's key&gt;
+        epoch 2 expires 60  \                /  epoch 2 expires 60
+                             v              v
+   node a (source) agent, listening on       node b (target) agent
+   mgmt port 7 while it has the ticket  &lt;--  dials; Noise IK, prologue "vanir-transfer 1",
+                                             its first message names the service
+</pre>
+<figcaption>Setting up a transfer</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Tickets</strong> are lines in each node's signed desired state:
+    <code>transfer &lt;service&gt; send &lt;peer&gt; &lt;peer key&gt; epoch &lt;n&gt; expires &lt;s&gt;</code>
+    for the source, and <code>transfer &lt;service&gt; receive &lt;peer&gt; &lt;address:port&gt;
+    &lt;peer key&gt; epoch &lt;n&gt; expires &lt;s&gt;</code> for the target. The peer's key is
+    the static key of its agent's handshake with the control plane, which its quote binds; the
+    expiry counts from when the agent applied the document. A ticket missing from a later
+    document is withdrawn, and the connection closes. One transfer at a time per node.</li>
+  <li><strong>The target dials the source</strong> at the address in its ticket (the mock
+    control plane is told each node's with <code>--node-addr</code>; in the tests, node a's
+    management port 7 is the host's 8081, reached as <code>10.0.2.2</code>). The source listens
+    only while it holds a <code>send</code> ticket, and accepts one connection
+    (<code>listen = [{ port = 7 }]</code> for the agent in <code>agent-volumes.toml</code>).</li>
+  <li><strong>Both check the other.</strong> The target knows the source's key from its ticket
+    (Noise IK), and the source closes the connection unless the target's key and the service in
+    its first message are the ones its ticket names (<code>transfer-connect</code>,
+    <code>transfer-wrong-peer</code>). The control plane already holds the volume keys, so trusting
+    its ticket for the peer adds no trust.</li>
+  <li><strong>Reports</strong> carry a line for the transfer: <code>transfer &lt;service&gt;
+    send|receive &lt;phase&gt; [why]</code>, with phases <code>waiting</code>,
+    <code>connected</code> and <code>aborted</code>.</li>
+</ul>
 
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
@@ -1597,6 +1643,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Control plane key pinned; Noise IK; node keys bound to a TPM quote</td><td>a node taking orders from someone else; a control plane trusting an unattested node</td><td><code>agent-wrong-cp-key</code>, <code>agent-attested</code>, <code>agent-unbound-key</code></td></tr>
 <tr><td>Desired state signed, with a generation that only rises</td><td>forged, replayed or reordered commands</td><td><code>agent-signed-state</code></td></tr>
 <tr><td>A node with instances refuses to update; moves through drains</td><td>a node update cutting traffic; failed requests during a move</td><td><code>agent-update-refused</code>, <code>move-under-load</code>, <code>evacuate-update</code></td></tr>
+<tr><td>A volume transfer only between the two nodes the control plane named, each checking the other's key</td><td>a node fetching a volume it wasn't given a ticket for; a stranger posing as the target</td><td><code>transfer-connect</code>, <code>transfer-wrong-peer</code></td></tr>
 <tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
@@ -1774,7 +1821,7 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>130 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>132 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -1799,7 +1846,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
 <tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-volume</code> <code>agent-epoch-stale</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code> <code>agent-volume-key</code> <code>agent-volume-key-swap</code> <code>agent-volume-unattested</code></td><td>port 7000; KVM, swtpm for <code>agent-attested</code> to <code>agent-volume-key-swap</code></td></tr>
-<tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
+<tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code> <code>transfer-connect</code> <code>transfer-wrong-peer</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>

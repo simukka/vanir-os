@@ -53,6 +53,8 @@ loads = true
 routes = true
 connects = true
 sends = ["net", "mgmt-net", "supervisor", "telemetry", "disk"]
+# A volume's source node listens here for the target's agent (RFD 3, P5), on mgmt-net.
+listen = [{ port = 7, max_connections = 2 }]
 
 [[slot_class]]
 name = "small"

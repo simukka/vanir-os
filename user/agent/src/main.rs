@@ -11,6 +11,7 @@ mod control;
 #[cfg(feature = "test-images")]
 mod images;
 mod lifecycle;
+mod transfer;
 
 use vanir_user::{err, events, lookup, println, slot};
 

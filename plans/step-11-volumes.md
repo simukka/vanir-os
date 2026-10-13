@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3); V4 planned (V4a–V4c).
+Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3), and V4a; V4b and V4c planned.
 
 ## Goal
 
@@ -560,3 +560,13 @@ Where it departs from the plan so far:
   instance is routed to, so the probe's write is always held, and `volume-fence` and
   `volume-handoff-off` check exactly one held request. In the run that was checked,
   `agent-volume`'s peer saw 801 counts, highest 801, none repeated or missing, none FENCED.
+- **V4a: the target dials again if the source closes before answering**, up to 5 times. The
+  management network's NAT (slirp) accepts a forwarded connection on the host before it knows
+  whether the guest listens, then closes it, so a target that dials before the source listens
+  sees an early close, not a refusal. The mock control plane also sends the target its ticket
+  only once the source reports `waiting`. Without either, `transfer-connect` failed in the full
+  suite and passed alone. A source that refuses the target closes every connection, so the
+  target gives up after the fifth ("the peer keeps closing the connection").
+- **V4a: one transfer at a time per node,** and the agent's `Control::turn` hands the transfer
+  every management-stack event that isn't the control plane's (net's events are level
+  triggered, so the shared wait loses none).

@@ -4,10 +4,12 @@
 //!   address built in (`VANIR_CP_ADDR`), and reconnects with backoff (100 ms doubling to 10 s)
 //!   whenever the connection drops. Deployments go on meanwhile.
 //! - **Noise `IK`.** The control plane's static key is pinned in the image (`VANIR_CP_PUB`). Our
-//!   static and ephemeral keys are fresh for each connection (RDRAND), and the first handshake
-//!   message carries a TPM quote over SHA-256(our ephemeral key || our static key) from
-//!   `attest` (`OP_QUOTE_FOR`), binding this handshake to an attested boot. Without a TPM it
-//!   says `no-tpm`, which a control plane may refuse.
+//!   static key is made once per boot and our ephemeral key for each connection (RDRAND), and
+//!   the first handshake message carries a TPM quote over SHA-256(our ephemeral key || our
+//!   static key) from `attest` (`OP_QUOTE_FOR`), binding this handshake to an attested boot.
+//!   Without a TPM it says `no-tpm`, which a control plane may refuse. The static key is also
+//!   how another node's agent knows us in a volume transfer (`transfer`, RFD 3, P5), so it
+//!   stays the same across reconnections.
 //! - **Frames.** Each Noise message goes over TCP behind a 2-byte big-endian length. Inside the
 //!   transport, the first byte says what it is:
 //!
@@ -34,6 +36,8 @@
 //!   stop web [drain <secs>]                                 # drain and stop every instance
 //!   commit web                                              # unload web's stopped slots
 //!   update                                  # reboot into the image installed now, if empty
+//!   transfer web send|receive ...           # move web's volume to or from another node
+//!                                           # (`transfer`, RFD 3)
 //!   ```
 //!
 //!   The agent keeps reconciling towards the last one it applied: it fetches the images it
@@ -42,7 +46,8 @@
 //!   offered it; `storage` refuses one lower than it has recorded.
 //! - **Reports** (`R`) say what it has: the generation applied, the node's name and its own
 //!   signed version (the node image), each slot's service, version, image hash and state, and
-//!   for a volume's writer `epoch <n>`, and `epoch-refused <n>` while `storage` refuses one. Sent
+//!   for a volume's writer `epoch <n>`, and `epoch-refused <n>` while `storage` refuses one, and
+//!   a line for a volume transfer under way (`transfer <service> send|receive <phase>`). Sent
 //!   after the handshake, on every change, and every 5 s.
 //! - **Volume keys** (RFD 3, P2). The control plane sends an attested node the key of each
 //!   service with a volume it runs, sealed to `attest`'s per-boot key (`seal_pub` in the quote).
@@ -54,6 +59,7 @@
 
 use crate::Image;
 use crate::lifecycle::{Agent, MAX_SLOTS, State};
+use crate::transfer::Transfers;
 use ed25519_compact::{PublicKey, Signature};
 use noise::{Initiator, Transport};
 use vanir_user::attest::{OP_QUOTE_FOR, OP_UNWRAP_VOLUME};
@@ -72,8 +78,16 @@ const HANDSHAKE_TICKS: u64 = 500;
 const MAX_FRAME: usize = 65535;
 const MAX_DOC: usize = 3072;
 
+/// Our static Noise key, made once per boot (see the module comment).
+static mut NODE_KEY: [u8; 32] = [0; 32];
+
+/// Our static Noise key.
+pub fn node_key() -> [u8; 32] {
+    unsafe { *(&raw const NODE_KEY) }
+}
+
 /// 32 random bytes from the CPU (RDRAND, which user code may run).
-fn random() -> [u8; 32] {
+pub fn random() -> [u8; 32] {
     let mut out = [0u8; 32];
     for chunk in out.chunks_mut(8) {
         let value = loop {
@@ -94,7 +108,7 @@ fn hex(bytes: &[u8], out: &mut LineWriter) {
     }
 }
 
-fn unhex32(s: &[u8]) -> Option<[u8; 32]> {
+pub fn unhex32(s: &[u8]) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
@@ -106,7 +120,7 @@ fn unhex32(s: &[u8]) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn number(s: &[u8]) -> Option<u64> {
+pub fn number(s: &[u8]) -> Option<u64> {
     core::str::from_utf8(s).ok()?.parse().ok()
 }
 
@@ -171,6 +185,8 @@ pub struct Control {
     /// Sealed volume keys (RFD 3, P2), and the service of the last one `attest` refused.
     keys: [Option<VolumeKey>; MAX_SLOTS],
     key_refused: Option<[u8; 32]>,
+    /// Volume transfers to and from other nodes (RFD 3, P5).
+    transfers: Transfers,
 }
 
 impl Control {
@@ -181,6 +197,7 @@ impl Control {
                 Err(_) => vanir_user::sleep(1),
             }
         };
+        unsafe { *(&raw mut NODE_KEY) = random() };
         Control {
             mgmt,
             attest: lookup("attest").ok(),
@@ -199,6 +216,7 @@ impl Control {
             update_refused: None,
             keys: [None; MAX_SLOTS],
             key_refused: None,
+            transfers: Transfers::new(mgmt),
         }
     }
 
@@ -214,10 +232,16 @@ impl Control {
             Link::Connecting { conn, .. } | Link::Handshake { conn, .. } | Link::Up { conn, .. } => Some(conn),
             Link::Down { .. } => None,
         };
-        if let Some(conn) = conn {
+        self.transfers.step(now, agent);
+        if conn.is_some() || self.transfers.busy() {
             let mut events = [Event::default(); 16];
             let n = net::wait(self.mgmt, 2, &mut events).unwrap_or(0);
-            for e in events[..n].iter().filter(|e| e.handle == conn) {
+            for &e in &events[..n] {
+                if Some(e.handle) != conn {
+                    self.transfers.event(e, agent);
+                    continue;
+                }
+                let conn = e.handle;
                 if e.flags & EV_WRITE != 0 && matches!(self.link, Link::Connecting { .. }) {
                     self.start_handshake(conn, now);
                 }
@@ -232,8 +256,9 @@ impl Control {
         agent.advance();
         self.reconcile(agent);
         if self.connected() {
-            if agent.changed || uptime() >= self.next_report {
+            if agent.changed || self.transfers.changed || uptime() >= self.next_report {
                 agent.changed = false;
+                self.transfers.changed = false;
                 self.report(agent);
             }
             self.forward_telemetry();
@@ -276,7 +301,7 @@ impl Control {
 
     fn start_handshake(&mut self, conn: u32, now: u64) {
         let rs = *CP_NOISE_PUB;
-        let Ok(mut initiator) = Initiator::new(random(), random(), rs, PROLOGUE) else {
+        let Ok(mut initiator) = Initiator::new(node_key(), random(), rs, PROLOGUE) else {
             return self.down("bad control plane key");
         };
         // The quote binds both our keys for this handshake to the boot the TPM measured.
@@ -532,6 +557,7 @@ impl Control {
         self.next_report = 0;
         println!("agent: desired state generation {} applied", generation);
         self.end = doc.split(|&b| b == b'\n').any(|l| l == b"end");
+        self.transfers.tickets(doc, uptime());
     }
 
     /// The `drain <secs>` asked for `service` in the desired state, if any.
@@ -697,6 +723,10 @@ impl Control {
             }
             put(&line);
         }
+        let mut line = LineWriter::new();
+        if self.transfers.report(&mut line) {
+            put(&line);
+        }
         self.send_frame(b'R', &text[..len]);
         self.next_report = uptime() + REPORT_TICKS;
     }
@@ -713,7 +743,7 @@ impl Control {
 }
 
 /// The first ten space-separated words of `line` (missing ones empty).
-fn words(line: &[u8]) -> [&[u8]; 10] {
+pub fn words(line: &[u8]) -> [&[u8]; 10] {
     let mut out: [&[u8]; 10] = [&[]; 10];
     for (o, w) in out.iter_mut().zip(line.split(|&b| b == b' ').filter(|w| !w.is_empty())) {
         *o = w;
@@ -723,11 +753,17 @@ fn words(line: &[u8]) -> [&[u8]; 10] {
 
 /// The control plane's address, built in (`VANIR_CP_ADDR`, e.g. 10.0.2.2:7000).
 fn cp_addr() -> ([u8; 4], u16) {
-    let s = env!("VANIR_CP_ADDR").as_bytes();
-    let (ip, port) = s.split_at(s.iter().position(|&b| b == b':').expect("VANIR_CP_ADDR: address:port"));
+    address(env!("VANIR_CP_ADDR").as_bytes()).expect("VANIR_CP_ADDR: address:port")
+}
+
+/// `a.b.c.d:port`.
+pub fn address(s: &[u8]) -> Option<([u8; 4], u16)> {
+    let at = s.iter().position(|&b| b == b':')?;
+    let (ip, port) = s.split_at(at);
     let mut addr = [0u8; 4];
-    for (a, part) in addr.iter_mut().zip(ip.split(|&b| b == b'.')) {
-        *a = number(part).unwrap_or(0) as u8;
+    let mut parts = ip.split(|&b| b == b'.');
+    for a in addr.iter_mut() {
+        *a = u8::try_from(number(parts.next()?)?).ok()?;
     }
-    (addr, number(&port[1..]).unwrap_or(7000) as u16)
+    Some((addr, u16::try_from(number(&port[1..])?).ok()?))
 }

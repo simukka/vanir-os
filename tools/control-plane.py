@@ -17,6 +17,11 @@ needs sealed to its attest task's per-boot key (`seal_pub`, bound into the hands
 in a K frame, with each desired state and when it connects again; a node without a TPM gets
 none.
 
+Volume moves (RFD 3, P5): a `transfer` line in each node's desired state is its ticket. The
+source's names the target and its key (the static key of its agent's handshake with us, one per
+boot); the target's also names the address it dials the source at (--node-addr). The two agents
+then talk directly.
+
 Nodes are named by their reports ("node a"). With --lb PORT and --backend NAME=PORT, we also
 run a TCP load balancer: each new client connection goes to the first node in the backend list,
 which scenarios change to move a service between nodes (tests/two-nodes.sh runs two).
@@ -162,6 +167,7 @@ class ControlPlane:
         self.epochs = {}  # service -> (epoch, slot, image) last asked for (RFD 3)
         self.volume_services = {}  # node name -> services with a volume its desired state runs
         self.backends = {}  # name -> data port, for the load balancer
+        self.node_addrs = {}  # name -> management address another node dials it at (RFD 3, P5)
         self.lb = []  # names new client connections go to (the first one)
         self.handshake_failures = 0
         self.connections = 0
@@ -275,7 +281,9 @@ class ControlPlane:
                     head += f" key refused for {report['key_refused']}" if report["key_refused"] else ""
                     head += f" refused {report['refused']}" if report["refused"] else ""
                     slots = [f"{s} {v['service']} v{v['version']} {v['state']}" for s, v in report["slots"].items()]
-                    say("report: " + "; ".join([head] + slots))
+                    transfers = [f"transfer {t} ({v['role']}) {v['phase']}" + (f" ({v['detail']})" if v["detail"] else "")
+                                 for t, v in report["transfers"].items()]
+                    say("report: " + "; ".join([head] + slots + transfers))
                 self.nodes[name] = node
                 self.latest[name] = report
                 self.reports += 1
@@ -391,6 +399,36 @@ class ControlPlane:
         self.wait(ok, what)
         say(f"reached: {what}")
 
+    def tickets(self, service, src, dst, epoch, expires=60, src_key=None):
+        """The transfer tickets moving `service`'s volume from node `src` to node `dst` (RFD 3,
+        P5): (src's line, dst's line). `src_key` overrides the target's key in the source's
+        ticket (a test of a ticket naming someone else)."""
+        a, b = self.nodes[src].static, self.nodes[dst].static
+        send = f"transfer {service} send {dst} {(src_key or b).hex()} epoch {epoch} expires {expires}"
+        receive = f"transfer {service} receive {src} {self.node_addrs[src]} {a.hex()} epoch {epoch} expires {expires}"
+        return send, receive
+
+    def start_transfer(self, service, src, dst, epoch, src_lines=(), dst_lines=(), **kw):
+        """Send the tickets: the source's first, and the target's once the source listens (a
+        target that dialed too early would find the port closed)."""
+        send, receive = self.tickets(service, src, dst, epoch, **kw)
+        self.tell(src, [*src_lines, send])
+        self.wait_transfer(f"node {src} listening", src, service, "waiting")
+        self.tell(dst, [*dst_lines, receive])
+
+    def transfer(self, node, service):
+        """The transfer of `service` in `node`'s last report, or None."""
+        return (self.latest.get(node) or {}).get("transfers", {}).get(service)
+
+    def wait_transfer(self, what, node, service, *phases):
+        """Wait until `node` reports `service`'s transfer in one of `phases` (None: no transfer)."""
+        def ok():
+            t = self.transfer(node, service)
+            return (t is None) if phases == (None,) else (t is not None and t["phase"] in phases)
+        self.wait(ok, what)
+        say(f"reached: {what}")
+        return self.transfer(node, service)
+
     def live(self, service, slot, image, drain=None, epoch=None):
         """A `live` line. For an image with a volume, the writer epoch goes up by one whenever
         the live instance changes (another slot or image); `epoch` overrides it."""
@@ -414,11 +452,11 @@ def volume_blocks(desc):
 def parse_report(text):
     """report <generation> node <name> image <version> [update-refused <n>] [refused <why>],
     [key-refused <service>], then a line per slot: slot <name> <service> <version> <hash> <state> [epoch <n>]
-    [epoch-refused <n>]"""
+    [epoch-refused <n>], and one for a volume transfer: transfer <service> send|receive <phase> [detail]"""
     lines = text.strip().split("\n")
     head = lines[0].split()
     report = {"generation": int(head[1]), "node": head[3], "image": int(head[5]), "update_refused": None, "key_refused": None,
-              "refused": None, "slots": {}}
+              "refused": None, "slots": {}, "transfers": {}}
     rest = head[6:]
     if rest[:1] == ["update-refused"]:
         report["update_refused"] = int(rest[1])
@@ -429,6 +467,10 @@ def parse_report(text):
     if rest[:1] == ["refused"]:
         report["refused"] = " ".join(rest[1:])
     for line in lines[1:]:
+        if line.startswith("transfer "):
+            _, service, role, phase, *detail = line.split()
+            report["transfers"][service] = {"role": role, "phase": phase, "detail": " ".join(detail)}
+            continue
         _, name, service, version, digest, state, *extra = line.split()
         slot = {"service": service, "version": int(version), "hash": digest, "state": state, "epoch": None, "epoch_refused": None}
         for key, value in zip(extra[::2], extra[1::2]):
@@ -650,6 +692,39 @@ def move(cp):
 
 
 @scenario
+def transfer_connect(cp):
+    """RFD 3, V4a: tickets for counter's volume from node a to node b; node b dials node a and
+    both check the other's key; then the tickets are withdrawn and the connection closes."""
+    cp.wait(lambda: "a" in cp.latest and "b" in cp.latest, "reports from nodes a and b")
+    cp.start_transfer("counter", "a", "b", epoch=2)
+    cp.wait_transfer("node a connected to node b", "a", "counter", "connected")
+    cp.wait_transfer("node b connected to node a", "b", "counter", "connected")
+    cp.tell("a", [])
+    cp.tell("b", [])
+    cp.wait_transfer("node a's ticket withdrawn", "a", "counter", None)
+    cp.wait_transfer("node b's ticket withdrawn", "b", "counter", None)
+    cp.tell("a", ["end"])
+    cp.tell("b", ["end"])
+    return True
+
+
+@scenario
+def transfer_wrong_peer(cp):
+    """RFD 3, V4a: node a's ticket names a key that isn't node b's, so node a closes node b's
+    connection after the first handshake message, and neither connects."""
+    cp.wait(lambda: "a" in cp.latest and "b" in cp.latest, "reports from nodes a and b")
+    other = public(os.urandom(32))
+    cp.start_transfer("counter", "a", "b", epoch=2, src_key=other)
+    t = cp.wait_transfer("node a refusing node b", "a", "counter", "aborted")
+    ok = t["detail"] == "not the peer my ticket names"
+    t = cp.wait_transfer("node b giving up", "b", "counter", "aborted")
+    say(f"node b: {t['detail']}")
+    cp.tell("a", ["end"])
+    cp.tell("b", ["end"])
+    return ok
+
+
+@scenario
 def evacuate(cp):
     """Node a runs web, refuses an update, is evacuated to node b, accepts the update, reboots
     into its new image (signed version 2), reconnects, and web moves back to it. All under load."""
@@ -695,6 +770,8 @@ def main():
     p.add_argument("--linger", type=float, default=1, metavar="SECONDS",
                    help="keep serving (the load balancer too) this long after the scenario")
     p.add_argument("--backend", action="append", default=[], metavar="NAME=PORT", help="a node's data port")
+    p.add_argument("--node-addr", action="append", default=[], metavar="NAME=ADDR:PORT",
+                   help="where another node reaches this one's management port 7 (volume transfers)")
     args = p.parse_args()
     if not os.path.exists(args.noise_key):  # e.g. a rogue key for a test
         key = X25519PrivateKey.generate().private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
@@ -706,6 +783,9 @@ def main():
     for b in args.backend:
         name, port = b.split("=")
         cp.backends[name] = int(port)
+    for n in args.node_addr:
+        name, addr = n.split("=")
+        cp.node_addrs[name] = addr
     if args.lb:
         threading.Thread(target=cp.balance, args=(args.lb,), daemon=True).start()
     try:

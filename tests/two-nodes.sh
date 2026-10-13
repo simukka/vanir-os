@@ -7,6 +7,9 @@
 #   two-nodes.sh APP USER_FEATURES KERNEL_FEATURES LIMIT MAKEVARS...
 #
 # Node a serves data on 127.0.0.1:8080, node b on 8090; the load balancer listens on 8000.
+# Their management ports (7, where a volume's source listens: RFD 3, P5) are 8081 and 8091 on
+# the host, which each node reaches as 10.0.2.2. With DISK=1 each node has its own disk
+# (build/disk-a.img, build/disk-b.img), from the one the build made.
 # With UPDATE=1, node a's image is also built with SIGN_VERSION=2: when node a reboots (QEMU
 # exits with status 0: -no-reboot), it boots again from that one, as an updated node would.
 # Prints each node's serial output, then the peer's and the control plane's; exits with node
@@ -16,11 +19,12 @@ cd "$(dirname "$0")/.."
 app=$1 user=$2 kernel=$3 limit=$4
 shift 4
 vars=("$@")
-cp="" peer="" update=""
+cp="" peer="" update="" disk=""
 for v in "${vars[@]}"; do
   [[ "$v" == CP=* ]] && cp=${v#CP=}
   [[ "$v" == PEER=* ]] && peer=${v#PEER=}
   [[ "$v" == UPDATE=1 ]] && update=1
+  [[ "$v" == DISK=1 ]] && disk=1
 done
 
 # build NAME ISO-OUT MAKEVARS...: an image for one node, and the command to boot it.
@@ -35,15 +39,18 @@ build() {
   cp build/vanir-os.iso "$iso"
 }
 build a build/node-a.iso
-qemu_a=$(make -s qemu-cmd "${vars[@]}" | sed "s|build/vanir-os.iso|build/node-a.iso|; s|build/telemetry.log|build/telemetry-a.log|")
+[ -n "$disk" ] && cp build/disk.img build/disk-a.img
+qemu_a=$(make -s qemu-cmd "${vars[@]}" | sed "s|build/vanir-os.iso|build/node-a.iso|; s|build/telemetry.log|build/telemetry-a.log|; s|build/disk.img|build/disk-a.img|")
 if [ -n "$update" ]; then
   build a build/node-a-v2.iso SIGN_VERSION=2
 fi
 build b build/node-b.iso
-qemu_b=$(make -s qemu-cmd "${vars[@]}" NET_PORT=8090 NET_MGMT_PORT=8091 | sed "s|build/vanir-os.iso|build/node-b.iso|; s|build/telemetry.log|build/telemetry-b.log|")
+[ -n "$disk" ] && cp build/disk.img build/disk-b.img
+qemu_b=$(make -s qemu-cmd "${vars[@]}" NET_PORT=8090 NET_MGMT_PORT=8091 | sed "s|build/vanir-os.iso|build/node-b.iso|; s|build/telemetry.log|build/telemetry-b.log|; s|build/disk.img|build/disk-b.img|")
 
 rm -f build/cp.log build/cp-telemetry.log build/peer.log build/node-a.out build/node-b.out
-tools/control-plane.py "$cp" --timeout "$limit" --lb 8000 --backend a=8080 --backend b=8090 --linger "$limit" >build/cp.log 2>&1 &
+tools/control-plane.py "$cp" --timeout "$limit" --lb 8000 --backend a=8080 --backend b=8090 --node-addr a=10.0.2.2:8081 \
+  --node-addr b=10.0.2.2:8091 --linger "$limit" >build/cp.log 2>&1 &
 cp_pid=$!
 sleep 0.5
 if [ -n "$peer" ]; then

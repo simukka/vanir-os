@@ -1,6 +1,7 @@
-//! Noise `IK_25519_ChaChaPoly_SHA256` (<https://noiseprotocol.org/noise.html>), the initiator
-//! side and transport messages, with no heap: the node agent dials the control plane, whose
-//! static key it already knows (RFD 2, P7).
+//! Noise `IK_25519_ChaChaPoly_SHA256` (<https://noiseprotocol.org/noise.html>), both sides and
+//! transport messages, with no heap: the node agent dials the control plane, whose static key it
+//! already knows (RFD 2, P7), and answers another node's agent that dials it to fetch a volume
+//! (RFD 3, P5).
 //!
 //! ```text
 //!   IK:
@@ -225,4 +226,70 @@ impl Initiator {
         let (send, recv) = self.state.split();
         Ok((Transport { send, recv, handshake_hash: self.state.h }, 32..32 + n))
     }
+}
+
+/// The responder of an IK handshake: it learns the initiator's static key from the first
+/// message, and the caller decides whether that key is the one it expects.
+pub struct Responder {
+    state: SymmetricState,
+    s: SecretKey,
+    e: SecretKey,
+    re: Option<PublicKey>,
+    rs: Option<PublicKey>,
+}
+
+impl Responder {
+    /// `s`: our static key; `e`: a fresh ephemeral key; `prologue`: bound into the handshake.
+    pub fn new(s: [u8; 32], e: [u8; 32], prologue: &[u8]) -> Responder {
+        let s = SecretKey::new(s);
+        let mut state = SymmetricState::new();
+        state.mix_hash(prologue);
+        state.mix_hash(&*s.recover_public_key().expect("valid scalar"));
+        Responder { state, s, e: SecretKey::new(e), re: None, rs: None }
+    }
+
+    /// The initiator's first message (`e, es, s, ss` and a payload, decrypted in place): returns
+    /// the initiator's static key and the payload's range.
+    pub fn read_message(&mut self, msg: &mut [u8]) -> Result<([u8; 32], core::ops::Range<usize>), Error> {
+        if msg.len() < DH_LEN + DH_LEN + TAG_LEN + TAG_LEN {
+            return Err(Error::Decrypt);
+        }
+        let re: [u8; 32] = msg[..32].try_into().unwrap();
+        self.state.mix_hash(&re);
+        let re = PublicKey::from_slice(&re).map_err(|_| Error::BadKey)?;
+        self.state.mix_key(&dh(&self.s, &re)?);
+        let n = self.state.decrypt_and_hash(&mut msg[32..], DH_LEN + TAG_LEN)?;
+        let rs_bytes: [u8; 32] = msg[32..32 + n].try_into().unwrap();
+        let rs = PublicKey::from_slice(&rs_bytes).map_err(|_| Error::BadKey)?;
+        self.state.mix_key(&dh(&self.s, &rs)?);
+        let at = 32 + DH_LEN + TAG_LEN;
+        let len = msg.len() - at;
+        let m = self.state.decrypt_and_hash(&mut msg[at..], len)?;
+        self.re = Some(re);
+        self.rs = Some(rs);
+        Ok((rs_bytes, at..at + m))
+    }
+
+    /// Our answer (`e, ee, se` and `payload`) into `out`: returns its length and the transport.
+    pub fn write_message(mut self, payload: &[u8], out: &mut [u8]) -> Result<(usize, Transport), Error> {
+        let (Some(re), Some(rs)) = (self.re, self.rs) else { return Err(Error::Decrypt) };
+        let need = DH_LEN + payload.len() + TAG_LEN;
+        if need > out.len() || need > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
+        let e_pub = *self.e.recover_public_key().expect("valid scalar");
+        out[..32].copy_from_slice(&e_pub);
+        self.state.mix_hash(&e_pub);
+        self.state.mix_key(&dh(&self.e, &re)?);
+        self.state.mix_key(&dh(&self.e, &rs)?);
+        out[32..32 + payload.len()].copy_from_slice(payload);
+        let n = self.state.encrypt_and_hash(&mut out[32..], payload.len())?;
+        let (recv, send) = self.state.split();
+        Ok((32 + n, Transport { send, recv, handshake_hash: self.state.h }))
+    }
+}
+
+/// The public key of a 32-byte X25519 secret.
+pub fn public_key(secret: [u8; 32]) -> [u8; 32] {
+    *SecretKey::new(secret).recover_public_key().expect("valid scalar")
 }
