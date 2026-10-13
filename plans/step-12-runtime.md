@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1 and R2 implemented (R1a–R1c, R2a–R2d).
+Status: R1 and R2 implemented (R1a–R1c, R2a–R2d); R3 planned.
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -319,4 +319,110 @@ Where it departs from the plan:
   next case) and passed in 4 runs alone and in the full suite; if it recurs, the suite runner
   in the plan's notes keeps each failing case's two-node logs. The suites ran in a second git worktree while the next step
   was written in the first (only one runs QEMU at a time: the tests use fixed host ports).
+
+## R3: the service runtime, and `counter` on it (RFD 9, P3, P4, P6)
+
+### Goal
+
+Implement RFD 9, phase R3. After R3:
+
+- `vanir-rt` (`user/rt`) is what a service is written against: a `Service` trait whose runtime
+  owns the event loop (accept, keep-alive, deadlines, `ready`, the drain and `done`, the writer
+  bit, telemetry counters), an HTTP module, typed handles for the volume with an `Error` enum,
+  and settings read through `ctx.config(key)` with the defaults the service declares
+- `counter` is its own program on `vanir-rt` (`user/counter`), not `http` with a volume: one
+  image, two modes, chosen by the signed setting `persist_ticks` (0, the default: write every
+  count; above 0: count in memory and write every that many ticks, and before draining or
+  exiting). `http/count-cached` goes away
+- `http` stays the plain web server of the RFD 1 and 2 tests, and uses `vanir-rt`'s HTTP parser
+  instead of its own copy
+- the load tests measure the runtime: `counter-load` and `counter-cached-load` run on the ported
+  `counter`, and give the same numbers within noise
+
+Out of scope: the host test backend (R4, RFD 9 open question 5), `make run-service` (R4), typed
+clients for calling other services (open question 4: `vanir_rt::raw` for now), async (open
+question 3: a trait), being told the volume was taken (RFD 3's follow-up; `fenced` fires on a
+failed write until then), porting `http` itself to the runtime.
+
+### What we have
+
+- **`http`** (`user/http/src/main.rs`, 826 lines) is a web server and, in a slot with a volume,
+  the counter: request parsing (`parse`, `Request`, `reason`), a fixed table of 80 connections
+  with header and idle deadlines, `Connection: close` while draining and `OP_DONE` once none
+  are left, telemetry counters (requests by status class, a latency histogram), the writer bit,
+  `/count` on the volume (`count_on_disk`), and the cached count (`count-cached`, `persist`).
+- **Its test features:** `exit-on-request` (29 cases), `volume-probe` (11: a scratch write every
+  100 ms, printing `writes OK`/`writes FENCED`, and a check that it can't name itself writer),
+  `crash-after-probes`, `count-cached` (2), `listen-81`, `try-mgmt-net`, `never-ready-v2`,
+  `crash-after-50-requests`. The volume cases match lines such as `counter v1 on small-0: writes
+  OK`, `now the writer of its volume`, `volume opened, count N`, `cannot open its volume`.
+- **`volume-none`** runs `web` (no volume) with `http/volume-probe` to check storage refuses a
+  slot without a volume; that part stays in `http`.
+- **Counter images:** `counter-v1`, `-v2`, `-v3` are `http` signed with `tests/slots/counter-*.toml`.
+  The control plane deploys them by name (`cp.live("counter", "small-0", "counter-v1")`).
+- **Stable Rust only:** array lengths can't come from a generic type's associated constant
+  (that needs `generic_const_exprs`), but const generic parameters on a struct are stable.
+
+### Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Crate | `user/rt`, package `vanir-rt`, crate `vanir_rt`; depends on `vanir-user` and `vanir-abi`, re-exports neither (P1) | a service sees the runtime's types, not raw ids and `u64` codes |
+| The trait | `Service`: `const CONFIG: &[(&str, u64)]` (settings and defaults); `start(ctx) -> Result<Self, Error>`; `request(&mut self, ctx, req, res)`; `tick(&mut self, ctx) -> Option<u64>` (work on a timer; returns ticks until the next call, None for no timer); `drain(&mut self, ctx)` (before `done`); `fenced(&mut self, ctx)` (lost the volume); all but `start` and `request` have defaults | P3, with `every` named `tick`; a trait, not async (open question 3's leaning) |
+| Sizes | `vanir_rt::service!(Counter, connections = 64)` declares the runtime's static with the connection table sized there (a const generic, `Runtime<N>`); the header and body limits stay `http`'s (4 KiB, 16 KiB) | P3 asked for associated constants, which stable Rust can't use for array lengths |
+| What the runtime checks at start | settings in the descriptor that `CONFIG` doesn't list: it prints them and exits 1, never ready; `max_connections` above `connections`: the same | P4 and P5: mistakes show at load, readably |
+| The loop | `http`'s, generalised: the service is called for each complete request; the runtime writes the status line, headers, keep-alive and `Connection: close`, and counts status classes and latency for telemetry. `ready` once `start` returns Ok. On `EV_DRAIN`: stop accepting, close as requests finish, then `drain()`, then `done` | the lifecycle is correct by default (RFD 9 goal) |
+| The volume | `ctx.volume() -> Result<Volume, Error>` (`NotDeclared` without one); `Volume::read`, `write`, `flush`, `blocks`; `Error::{NotDeclared, Fenced, Locked, Integrity, OutOfRange, Io, StorageGone, Other(u64)}`. A write that returns `Fenced` makes the runtime call `fenced()` once the callback returns. The writer bit prints `<name>: now the writer of its volume` as `http` does | P3; the line keeps the volume cases' expectations |
+| HTTP | `vanir_rt::http`: `Request` (method, path, keep-alive, head), `Response` (status, body writer), `parse`, `reason`, moved from `http`; `http` uses them too | one parser; `http` keeps its own loop and test features |
+| Escape hatch | `vanir_rt::raw` behind an `unstable` feature: the task's raw syscalls and `vanir_user` (for `counter`'s test feature that tries `OP_EPOCH` itself) | P3; what services reach for shows what to wrap next |
+| `counter` | `user/counter` on `vanir-rt`: `/` (`hello from <name>`), `/count`, and features `volume-probe`, `crash-after-probes`, `exit-on-request` reproducing `http`'s lines; `CONFIG = [("persist_ticks", 0)]` | P6; the RFD 3 cases keep their expectations, with `counter/...` features instead of `http/...` |
+| Cached images | `counter-v1-cached`, `counter-v2-cached`: the same ELF signed with `[config] persist_ticks = 1000`. `counter-cached-load` deploys `counter-v1-cached` (agent `script-volume-serve-cached`); `agent-volume-cached` passes `CP_ARGS=--image-suffix,-cached` so the control plane deploys the `-cached` images | a setting, not a build (P5); two descriptors of one image |
+| `http`'s counter code | removed: `/count` on the volume, `count-cached`, `crash-after-probes`, the writer bit; `volume-probe` keeps only the "no volume declared" check for `volume-none` | P6 |
+
+### Sub-steps
+
+#### R3a: the HTTP module
+
+1. `user/rt` with `http`: `parse`, `Request`, `reason`, the limits, moved from `user/http`.
+2. `http` uses it. No behaviour change: the `http-*`, `net-*`, `slot-*`, `deploy-*` cases and a
+   full suite.
+
+#### R3b: the runtime
+
+1. `Service`, `Ctx` (name, `config`, `volume`, `uptime`), `Volume`, `Error`, `Runtime<N>`,
+   `service!`; the loop from `http`, with the drain, ready, telemetry and writer bit; settings
+   and connection checks at start; `raw` behind `unstable`.
+2. A first service to drive it before `counter` exists: `user/hello-rt`? No: R3c's `counter` is
+   the first service; R3b ends when `vanir-rt` builds and a minimal `counter` (`/`, `/count`
+   without features) serves `slot-load`'s peer as `web` would. (Kept in R3c's commit.)
+
+#### R3c: `counter` on the runtime
+
+1. `user/counter`: `/count` on the volume, or cached with `persist_ticks`; the test features.
+2. Makefile: counter images built from `counter`; `counter-v1-cached`, `counter-v2-cached`.
+3. `http` loses its counter code; `tests/run.sh` rows switch `http/volume-probe`,
+   `http/crash-after-probes`, `http/count-cached` to `counter/...` where the images are
+   counters (`volume-none` keeps `http/volume-probe`); `agent-volume-cached` and
+   `counter-cached-load` use the `-cached` images.
+4. Control plane: `--image-suffix`. Agent: `script-volume-serve-cached`.
+5. Full suite; `counter-load` and `counter-cached-load` with `--bench`, compared with R2's.
+
+#### R3d: documentation
+
+- The manual: `vanir-rt` (what a service looks like, the lifecycle it owns, settings, the
+  volume handle), `counter` as the example, the file map; RFD 9 P3/P4/P6 as built; open
+  questions 3 and 4 as decided by R3 if the discussion agrees; the plan's notes.
+
+### Risks and how we'll know
+
+- **The runtime changes timing the volume cases depend on** (the probe's 100 ms, when `ready` is
+  sent, the drain order). `counter` keeps `http`'s order: open the volume, then ready; probe on
+  the same period; `done` only after `drain()`. The RFD 3 cases (`volume-*`, `agent-volume*`,
+  `move-volume-*`, `transfer-*`) are the check.
+- **Slower per request.** The load tests are the check; the request path adds a trait call.
+- **Image size.** Slot class `small` has 128 image pages (512 KiB) and 256 memory pages;
+  `counter`'s statics are the runtime's table (64 connections, about 300 KiB) like `http`'s.
+  `slot-memory`/`slot-image-size` and the boot lines (`frames of 256`) show it.
+- **A service that never returns from `request`** blocks the loop, as in `http` today; not
+  changed by R3.
 
