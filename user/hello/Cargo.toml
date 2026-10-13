@@ -20,3 +20,5 @@ bad-pointer = []
 exec-stack = []
 # W^X test: write to our own code; must #PF.
 write-code = []
+# Records read by size (RFD 9, P2): task_listen into buffers shorter and longer than the record.
+abi-sizes = []

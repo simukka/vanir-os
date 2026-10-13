@@ -601,10 +601,8 @@ fn report_death(table: &mut Table, sup: usize, buf: u64, cap: u64, regs: &mut Tr
     let bytes = unsafe {
         core::slice::from_raw_parts(&record as *const DeathRecord as *const u8, size_of::<DeathRecord>())
     };
-    if cap < bytes.len() as u64 {
-        regs.rax = err::TOO_LONG;
-        return true;
-    }
+    // Read by size (RFD 9, P2): as much of the record as fits; the message is that long.
+    let bytes = &bytes[..bytes.len().min(cap as usize)];
     if memory::copy_to_user_space(table.get(sup).space(), buf, bytes).is_err() {
         regs.rax = err::BAD_BUFFER;
         return true;
@@ -1137,7 +1135,9 @@ pub fn read_events(frame: &mut TrapFrame) {
 }
 
 
-/// `stats(buf, cap) -> bytes`: a `Stats` record. Only for the task with `events = true`.
+/// `stats(buf, cap) -> bytes`: a `Stats` record. Only for the task with `events = true`. Read by
+/// size (RFD 9, P2): as much of the record as fits in `cap` is copied, and the result is the
+/// record's whole size.
 pub fn stats(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     if !table.current().task.events {
@@ -1158,11 +1158,8 @@ pub fn stats(frame: &mut TrapFrame) {
         stats.tasks += 1;
     }
     let bytes = unsafe { core::slice::from_raw_parts(&stats as *const Stats as *const u8, size_of::<Stats>()) };
-    if frame.rsi < bytes.len() as u64 {
-        frame.rax = err::TOO_LONG;
-        return;
-    }
-    match memory::copy_to_user_space(table.current().space(), frame.rdi, bytes) {
+    let fits = &bytes[..bytes.len().min(frame.rsi as usize)];
+    match memory::copy_to_user_space(table.current().space(), frame.rdi, fits) {
         Ok(()) => frame.rax = bytes.len() as u64,
         Err(_) => frame.rax = err::BAD_BUFFER,
     }
@@ -1192,7 +1189,7 @@ pub fn task_name(frame: &mut TrapFrame) {
 /// `task_listen(id, buf, cap) -> bytes`: the network declarations of task `id` (any generation)
 /// as a `ListenInfo`: from the manifest, or for a slot from its service's signed descriptor. The
 /// network stack uses it to check who may listen where; the kernel vouches for it as it does for
-/// task names.
+/// task names. Read by size (RFD 9, P2): as much as fits in `cap`; the result is the whole size.
 pub fn task_listen(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     let Some(slot) = table.slot_of(frame.rdi) else {
@@ -1230,11 +1227,8 @@ pub fn task_listen(frame: &mut TrapFrame) {
         }
     }
     let bytes = unsafe { core::slice::from_raw_parts(&info as *const ListenInfo as *const u8, size_of::<ListenInfo>()) };
-    if frame.rdx < bytes.len() as u64 {
-        frame.rax = err::TOO_LONG;
-        return;
-    }
-    match memory::copy_to_user_space(table.current().space(), frame.rsi, bytes) {
+    let fits = &bytes[..bytes.len().min(frame.rdx as usize)];
+    match memory::copy_to_user_space(table.current().space(), frame.rsi, fits) {
         Ok(()) => frame.rax = bytes.len() as u64,
         Err(_) => frame.rax = err::BAD_BUFFER,
     }

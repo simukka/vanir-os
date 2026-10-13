@@ -6,6 +6,14 @@
 //! Data only: constants, `#[repr(C)]` records with public fields, and small safe functions that
 //! read them (accessors, names of codes). No syscalls, no `unsafe`, no state, no dependencies.
 //! `tests/snapshot.rs` pins every value and every record's layout; change one only on purpose.
+//!
+//! **Records are read by size** (RFD 9, P2). A syscall that writes a record (`stats`,
+//! `task_listen`, the supervisor's death notice) copies as much of it as fits in the caller's
+//! buffer and returns the record's whole size. So a record may grow, **at its end only**: a
+//! program built against the smaller record gets the fields it knows, and one built against the
+//! larger record, on an older kernel, finds the new fields zero (callers zero their buffer
+//! first). Records read as arrays (`events::Event`, the measurement and run-time log entries)
+//! can't grow, since their size is the array's stride; growing one needs a new syscall.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -156,21 +164,17 @@ pub mod task {
     }
 
     impl DeathRecord {
-        /// The record in a `NOTIFY_DEATH` message, if it is one.
+        /// The record in a `NOTIFY_DEATH` message, read by size: the fields the message holds,
+        /// the rest zero (a kernel older than this record). None if it doesn't hold the id and
+        /// kind.
         pub fn from_bytes(bytes: &[u8]) -> Option<DeathRecord> {
-            if bytes.len() != core::mem::size_of::<DeathRecord>() {
+            if bytes.len() < 16 {
                 return None;
             }
-            let f = |i: usize| u64::from_le_bytes([
-                bytes[i * 8],
-                bytes[i * 8 + 1],
-                bytes[i * 8 + 2],
-                bytes[i * 8 + 3],
-                bytes[i * 8 + 4],
-                bytes[i * 8 + 5],
-                bytes[i * 8 + 6],
-                bytes[i * 8 + 7],
-            ]);
+            let f = |i: usize| match bytes.get(i * 8..i * 8 + 8) {
+                Some(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+                None => 0,
+            };
             Some(DeathRecord { id: f(0), kind: f(1), code: f(2), rip: f(3), cr2: f(4), error_code: f(5), ticks: f(6) })
         }
     }

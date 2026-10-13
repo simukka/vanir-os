@@ -20,6 +20,31 @@ fn main() -> u64 {
         return if rejected { 0 } else { 1 };
     }
 
+    #[cfg(feature = "abi-sizes")]
+    {
+        // A short buffer gets the record's start, a long one the whole record; the rest of the
+        // buffer is untouched, and the result is always the record's whole size.
+        use vanir_user::{SYS_TASK_LISTEN, getpid, println, syscall6};
+        let size = core::mem::size_of::<vanir_user::ListenInfo>();
+        let read = |cap: usize| {
+            let mut buf = [0xaau8; 640];
+            let (n, _, _) = syscall6(SYS_TASK_LISTEN, [getpid(), buf.as_mut_ptr() as u64, cap as u64, 0, 0, 0]);
+            (n as usize, buf)
+        };
+        let (_, whole) = read(600);
+        let mut ok = true;
+        // 136: ListenInfo's size in ABI 1.0, before it grew.
+        for cap in [64, 136, 600] {
+            let (n, buf) = read(cap);
+            let got = cap.min(n);
+            let same = buf[..got] == whole[..got];
+            let untouched = buf[got..].iter().all(|&b| b == 0xaa);
+            println!("hello: task_listen into {} bytes: record {} bytes, {} copied, same start {}, rest untouched {}", cap, n, got, same, untouched);
+            ok &= n == size && same && untouched;
+        }
+        return if ok { 0 } else { 1 };
+    }
+
     #[cfg(feature = "exec-stack")]
     {
         let code = core::hint::black_box([0xc3u8]); // `ret`
