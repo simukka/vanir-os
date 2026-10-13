@@ -58,7 +58,8 @@
 //! service is left on the node.
 //!
 //! Storage events go to the telemetry task if it may send to one: volume_created,
-//! storage_locked, storage_unlocked and integrity_error (with the volume and block).
+//! storage_locked, storage_unlocked and integrity_error (with the volume and block). So do counters of the blocks read and written and the flushes, once
+//! per snapshot interval while requests come.
 //!
 //! On disk (4 KiB blocks): block 0 superblock, block 1 the volume table (both in plain text),
 //! then volumes: a header block, then `meta_blocks(size)` metadata blocks, then the data blocks.
@@ -195,6 +196,11 @@ struct Storage {
     /// entry `OP_IMPORT` brings next (RFD 3, P5).
     exported: Option<(usize, u64, u64, [u8; 16])>,
     importing: Option<(usize, u64, u64, [u8; 16])>,
+    /// Blocks read and written and flushes sent to the driver, reported to telemetry every
+    /// snapshot interval (on the next request after it ends).
+    io: [u64; 3],
+    next_snapshot: u64,
+    interval: u64,
 }
 
 /// Run a driver call, finding the driver again (by name) if it was restarted.
@@ -226,15 +232,35 @@ impl Storage {
         }
     }
 
+    /// Send our I/O counters to telemetry if the interval has ended.
+    fn snapshot(&mut self) {
+        let now = uptime();
+        if now < self.next_snapshot {
+            return;
+        }
+        self.next_snapshot = now + self.interval;
+        let Some(t) = self.telemetry else { return };
+        let mut r = Record::new("storage");
+        r.num("t", now).num("blocks_read", self.io[0]).num("blocks_written", self.io[1]).num("flushes", self.io[2]);
+        match telemetry::counters(t, &r) {
+            Ok(interval) => self.interval = interval,
+            Err(e) if e == err::NOT_ALLOWED || e == err::DEAD => self.telemetry = None,
+            Err(_) => {}
+        }
+    }
+
     fn read(&mut self, b: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), u64> {
+        self.io[0] += 1;
         on_driver(&mut self.driver, |d| block::read(d, b, buf))
     }
 
     fn write(&mut self, b: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), u64> {
+        self.io[1] += 1;
         on_driver(&mut self.driver, |d| block::write(d, b, buf))
     }
 
     fn flush(&mut self) -> Result<(), u64> {
+        self.io[2] += 1;
         on_driver(&mut self.driver, block::flush)
     }
 
@@ -1058,6 +1084,9 @@ fn main() -> u64 {
         release: None,
         exported: None,
         importing: None,
+        io: [0; 3],
+        next_snapshot: 0,
+        interval: telemetry::DEFAULT_INTERVAL_TICKS,
     };
     s.capacity = match on_driver(&mut s.driver, block::capacity) {
         Ok(c) => c,
@@ -1100,5 +1129,6 @@ fn main() -> u64 {
         if let Some(i) = s.release.take() {
             s.release_held(i);
         }
+        s.snapshot();
     }
 }

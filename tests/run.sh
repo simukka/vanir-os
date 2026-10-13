@@ -13,11 +13,23 @@
 # talks to the guest over NET/NET_MGMT); its output is checked with the serial log, after a
 # "--- peer ---" line. SLOW=0 skips the cases marked SLOW=1 (floods, drains).
 #
+# Cases marked BENCH=1 are load tests (they report throughput and latency, and take a minute or
+# more): they run only with `tests/run.sh --bench` or BENCH=1, e.g.
+#   BENCH=1 ACCEL=kvm ONLY=counter-load tests/run.sh   (LOAD_CLIENTS, LOAD_SECONDS, LOAD_PATH)
+# Each second's samples (request rate, clients, latency, guest CPU, memory, I/O) go to
+# build/bench/<case>.csv, charted by tools/bench-chart.py as build/bench/<case>.svg.
+#
 # CP=<scenario> runs tools/control-plane.py next to QEMU (see below). NODES=2 runs the case on two
 # nodes with tests/two-nodes.sh (the control plane load-balances their data ports; with UPDATE=1
 # node a boots an updated image when it reboots).
 set -u
 cd "$(dirname "$0")/.."
+for arg in "$@"; do
+  case "$arg" in
+    --bench) BENCH=1 ;;
+    *) echo "usage: tests/run.sh [--bench]" >&2; exit 2 ;;
+  esac
+done
 
 # name | app (tests/apps/<app>.toml) | user features (package/feature) | kernel features |
 #   make variables (e.g. TRANSPORT=vsock ACCEL=kvm) | expected status | expected text
@@ -144,6 +156,8 @@ CASES=(
   "volume-no-key         | volumes                 | supervisor/halt-on-exit http/volume-probe agent/script-volume-one unlocker/no-service-keys|               | NET=user DISK=1 DISK_RESET=1                                                                                                | 1 | re:keys: no key for service counter[\s\S]*agent: small-0 didn.t say it was ready in time[\s\S]*small-0 \(counter v1\): STARTING -> FAILED"
   "volume-forget         | volumes                 | supervisor/halt-on-exit http/volume-probe agent/script-volume-forget unlocker/service-keys-once|               | NET=user DISK=1 DISK_RESET=1                                                                                                | 1 | re:keys: key for service counter[\s\S]*counter v1 on small-0: writes OK[\s\S]*storage: counter: key forgotten[\s\S]*agent: no instance of counter left; storage forgot its key[\s\S]*keys: counter.s key was handed over already[\s\S]*after the key was forgotten, small-1 is FAILED"
   "volume-handoff-off    | volumes                 | supervisor/halt-on-exit http/volume-probe agent/script-volume-handoff-off |               | NET=user DISK=1 DISK_RESET=1                                                                                                 | 1 | cmd:out=\$(cat); grep -q \"storage: counter: holding small-1.s requests (handoff)\" <<<\"\$out\" && grep -q \"storage: counter: epoch 1 refused (recorded: 1)\" <<<\"\$out\" && grep -q \"storage: counter: handoff to small-1 called off; 1 held request(s) answered\" <<<\"\$out\" && grep -q \"after the refused epoch, small-1 is LIVE\" <<<\"\$out\" && ! grep -q \"counter v2 on small-1: writes OK\" <<<\"\$out\""
+  "counter-load          | counter-bench           | supervisor/halt-on-exit http/exit-on-request agent/script-volume-serve |      | NET=user DISK=1 DISK_RESET=1 PEER=count-load BENCH=1 TIMEOUT=120                                                             | 1 | cmd:out=\$(cat); grep -q \"agent: counter v1 is serving\" <<<\"\$out\" && grep -qE \"peer: [1-9][0-9]* answered in .*; 0 failed\" <<<\"\$out\" && grep -qE \"peer: [0-9]+ counts, highest [0-9]+, 0 repeated, 0 missing\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\""
+  "counter-cached-load   | counter-bench           | supervisor/halt-on-exit http/exit-on-request http/count-cached agent/script-volume-serve | | NET=user DISK=1 DISK_RESET=1 PEER=count-load BENCH=1 TIMEOUT=120                                                       | 1 | cmd:out=\$(cat); grep -qE \"counter v1 on small-0: count [0-9]+ written to the volume\" <<<\"\$out\" && grep -qE \"peer: [1-9][0-9]* answered in .*; 0 failed\" <<<\"\$out\" && grep -qE \"peer: [0-9]+ counts, highest [0-9]+, 0 repeated, 0 missing\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\""
   "volume-kinds          | volumes-kinds           | supervisor/halt-on-exit http/volume-probe agent/script-volume-one blktest/start-after-2s |               | NET=user DISK=1 DISK_RESET=1                                                                                                 | 1 | cmd:out=\$(cat); [ \$(grep -c \"new volume for counter\" <<<\"\$out\") = 2 ] && grep -q \"counter read back 32 blocks, all correct\" <<<\"\$out\" && grep -q \"counter v1 on small-0: writes OK\" <<<\"\$out\""
   "volume-storage-restart | volumes                 | supervisor/halt-on-exit http/volume-probe agent/script-volume-one storage/crash-after-16 |               | NET=user DISK=1 DISK_RESET=1                                                                                                 | 1 | re:counter v1 on small-0: writes OK[\s\S]*storage: crashing after 15 writes[\s\S]*storage: counter: epoch 1 again[\s\S]*counter v1 on small-0: writes OK"
   "volume-writer-restart | volumes                 | supervisor/halt-on-exit http/crash-after-probes agent/script-volume-one |               | NET=user DISK=1 DISK_RESET=1                                                                                                 | 1 | re:counter v1 on small-0: crashing after 20 probes[\s\S]*counter v1 on small-0: volume opened[\s\S]*counter v1 on small-0: writes OK"
@@ -152,6 +166,7 @@ CASES=(
   "agent-signed-state    | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=signed-state                                                                                       | 1 | re:desired state refused: bad signature[\s\S]*desired state generation 2 applied[\s\S]*desired state refused: stale generation[\s\S]*control-plane: refused: signed with another key[\s\S]*refused: replayed generation 2[\s\S]*refused: older generation 1[\s\S]*control-plane: PASS"
   "agent-deploy          | agent                   | supervisor/halt-on-exit http/exit-on-request                |               | NET=user NET_MGMT=user CP=deploy PEER=deploy-under-load SLOW=1                                                               | 1 | cmd:out=\$(cat); grep -q \"control-plane: reached: web v1 unloaded\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && grep -q \"followed web v1 on small-0 -> web v2 on small-1: 8/8\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\""
   "agent-volume          | agent-volumes           | supervisor/halt-on-exit http/exit-on-request                |               | NET=user NET_MGMT=user DISK=1 DISK_RESET=1 CP=volume PEER=count-under-deploy SLOW=1                                          | 1 | cmd:out=\$(cat); grep -q \"control-plane: reached: small-1 holds epoch 2\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && grep -qE \"peer: [0-9]+ counts, highest [0-9]+, 0 repeated, 0 missing; 0 FENCED\" <<<\"\$out\" && grep -q \"counter v2 on small-1: now the writer of its volume\" <<<\"\$out\" && grep -qE \"storage: counter: released [0-9]+ held request\" <<<\"\$out\" && grep -q \"followed counter v1 on small-0 -> counter v2 on small-1: 4/4\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\""
+  "agent-volume-cached   | agent-volumes           | supervisor/halt-on-exit http/exit-on-request http/count-cached |               | NET=user NET_MGMT=user DISK=1 DISK_RESET=1 CP=volume PEER=count-under-deploy SLOW=1                                          | 1 | cmd:out=\$(cat); grep -q \"control-plane: reached: small-1 holds epoch 2\" <<<\"\$out\" && grep -qE \"counter v1 on small-0: count [0-9]+ written to the volume\" <<<\"\$out\" && grep -qE \"peer: [0-9]+ counts, highest [0-9]+, 0 repeated, 0 missing; 0 FENCED\" <<<\"\$out\" && grep -q \"followed counter v1 on small-0 -> counter v2 on small-1: 4/4\" <<<\"\$out\" && grep -q \"peer: PASS\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\""
   "agent-epoch-stale     | agent-volumes           | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user DISK=1 DISK_RESET=1 CP=epoch-stale                                                                    | 1 | re:storage: counter: epoch 2, writer task [0-9]+[\s\S]*storage: counter: epoch 1 refused \(recorded: 2\)[\s\S]*agent: epoch 1 for small-0: FENCED[\s\S]*storage: counter: epoch 3, writer task [0-9]+[\s\S]*control-plane: reached: epoch 1 refused, small-0 still holds epoch 2[\s\S]*control-plane: PASS"
   "agent-reconnect       | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=reconnect SLOW=1                                                                                   | 1 | cmd:out=\$(cat); grep -q \"dropping the connection after 3 chunks\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && [ \$(grep -c \"run-time log entry .*: load\" <<<\"\$out\") = 2 ]"
   "agent-drain           | agent                   | supervisor/halt-on-exit agent/exit-on-end                   |               | NET=user NET_MGMT=user CP=drain                                                                                              | 1 | cmd:out=\$(cat); grep -q \"net: draining small-0 (deadline in 200 ticks)\" <<<\"\$out\" && grep -q \"control-plane: reached: web v1 stopped\" <<<\"\$out\" && grep -q \"control-plane: PASS\" <<<\"\$out\" && grep -q \\\"event\\\":\\\"instance\\\".*\\\"to\\\":\\\"STOPPED\\\" build/cp-telemetry.log && grep -q \\\"event\\\":\\\"image_loaded\\\" build/cp-telemetry.log && grep -q \\\"event\\\":\\\"stopped\\\" build/cp-telemetry.log"
@@ -214,6 +229,7 @@ for case in "${CASES[@]}"; do
   want_status=$(trim "$want_status"); want_text=$(trim "$want_text")
 
   [[ "${SLOW:-1}" == 0 && " $env " == *" SLOW=1 "* ]] && { echo "SKIP $name: slow"; continue; }
+  [[ "${BENCH:-0}" != 1 && " $env " == *" BENCH=1 "* ]] && { echo "SKIP $name: load test (--bench)"; continue; }
   vars=(ACCEL="${ACCEL:-tcg}" $env)
   limit=60
   for v in $env; do [[ "$v" == TIMEOUT=* ]] && limit=${v#TIMEOUT=}; done
@@ -253,6 +269,9 @@ for case in "${CASES[@]}"; do
     fi
     if [ -n "$peer" ]; then
       rm -f build/peer.log
+      # A load test's per-second samples (BENCH=1), charted after the run.
+      export BENCH_CSV="build/bench/$name.csv"
+      rm -f "$BENCH_CSV"
       tools/net-peer.py "$peer" --timeout "$limit" >build/peer.log 2>&1 &
       peer_pid=$!
     fi
@@ -305,6 +324,11 @@ for case in "${CASES[@]}"; do
 
   if [ "$status" -eq "$want_status" ] && [ "$text_ok" -eq 0 ]; then
     echo "PASS $name (status $status)"
+    # A load test's numbers are its point: show its summary, and chart its samples.
+    if [[ " $env " == *" BENCH=1 "* ]]; then
+      sed -n '/^--- peer ---$/,/^--- /p' <<<"$out" | grep '^peer:' | grep -v '^peer: t=' | sed 's/^/    /'
+      [ -s "build/bench/$name.csv" ] && echo "    chart: $(tools/bench-chart.py "build/bench/$name.csv")"
+    fi
   else
     echo "FAIL $name: status $status (want $want_status), want text: $want_text"
     sed 's/^/    /' <<<"$out"

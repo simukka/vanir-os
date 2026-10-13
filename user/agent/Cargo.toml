@@ -62,3 +62,4 @@ transfer-stall = []                       # a target that stops answering mirror
 transfer-drop-writes = []                 # a target that answers mirrored writes after the first without storing them
 transfer-corrupt = []                     # a source that changes a bit of the first block it sends
 script-volume-handoff-off = ["test-images"] # v1 with epoch 1, then v2 with epoch 1 (refused after the drain: handoff called off); exit
+script-volume-serve = ["test-images"]    # counter v1 in small-0 with epoch 1, then serve until the run ends (load tests)

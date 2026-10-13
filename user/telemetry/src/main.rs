@@ -282,8 +282,8 @@ fn heartbeat(out: &mut Out, n: u64) {
     let Ok(s) = events::stats() else { return };
     let _ = write!(
         out,
-        "{{\"t\":{},\"event\":\"heartbeat\",\"n\":{},\"frames\":{},\"irqs\":{},\"events\":{},\"tasks\":[",
-        s.uptime_ticks, n, s.frames_in_use, s.device_interrupts, s.events_logged
+        "{{\"t\":{},\"event\":\"heartbeat\",\"n\":{},\"frames\":{},\"frames_free\":{},\"irqs\":{},\"events\":{},\"tasks\":[",
+        s.uptime_ticks, n, s.frames_in_use, s.frames_available, s.device_interrupts, s.events_logged
     );
     let mut first = true;
     for [id, state, ticks] in s.task.iter().copied().filter(|t| t[0] != 0) {

@@ -1192,6 +1192,8 @@ struct Stats {
     device_interrupts: u64,
     events_logged: u64,
     tasks: u64,
+    /// Frames that can still be allocated.
+    frames_available: u64,
     /// Per task: id, state (as `task_state`), CPU ticks.
     task: [[u64; 3]; STATS_TASKS],
 }
@@ -1209,6 +1211,7 @@ pub fn stats(frame: &mut TrapFrame) {
         device_interrupts: irq::count(),
         events_logged: events::logged(),
         tasks: 0,
+        frames_available: memory::frames_available(),
         task: [[0; 3]; STATS_TASKS],
     };
     for p in table.procs.iter().flatten() {

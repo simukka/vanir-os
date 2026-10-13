@@ -690,13 +690,15 @@ pub mod events {
         pub device_interrupts: u64,
         pub events_logged: u64,
         pub tasks: u64,
+        /// Frames that can still be allocated.
+        pub frames_available: u64,
         /// Per task slot: id, state (0 running/ready, 1 blocked, 2 exited, 3 faulted,
         /// 4 over budget, 5 image rejected, 6 empty slot), CPU ticks.
         pub task: [[u64; 3]; super::MAX_TASKS],
     }
 
     pub fn stats() -> Result<Stats, u64> {
-        let mut s = Stats { uptime_ticks: 0, frames_in_use: 0, device_interrupts: 0, events_logged: 0, tasks: 0, task: [[0; 3]; super::MAX_TASKS] };
+        let mut s = Stats { uptime_ticks: 0, frames_in_use: 0, device_interrupts: 0, events_logged: 0, tasks: 0, frames_available: 0, task: [[0; 3]; super::MAX_TASKS] };
         let size = core::mem::size_of::<Stats>() as u64;
         let (n, _, _) = syscall6(SYS_STATS, [&mut s as *mut Stats as u64, size, 0, 0, 0, 0]);
         if err::is_error(n) { Err(n) } else { Ok(s) }

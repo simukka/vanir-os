@@ -1,0 +1,55 @@
+# Load tests of counter (http with a volume, RFD 3) on one node: tests/apps/volumes.toml plus
+# telemetry over the virtio console (build/telemetry.log), so tools/net-peer.py count-load can
+# sample CPU, memory and I/O every second while it sends requests.
+[[task]]
+name = "supervisor"
+supervisor = true
+
+[[task]]
+name = "nic"
+program = "virtio-net"
+devices = ["virtio-net"]
+dma_pages = 20
+sends = ["net"]
+
+[[task]]
+name = "net"
+sends = ["nic", "telemetry"]
+
+[[task]]
+name = "blockdev"
+program = "virtio-blk"
+devices = ["virtio-blk"]
+dma_pages = 16
+
+[[task]]
+name = "disk"
+program = "storage"
+sends = ["blockdev", "keys", "telemetry"]
+
+[[task]]
+name = "keys"
+program = "unlocker"
+
+[[task]]
+name = "agent"
+loads = true
+routes = true
+sends = ["net", "supervisor", "disk"]
+
+[[task]]
+name = "virtio-console"
+devices = ["virtio-console"]
+dma_pages = 16
+
+[[task]]
+name = "telemetry"
+events = true
+sends = ["virtio-console"]
+
+[[slot_class]]
+name = "small"
+count = 3
+memory_pages = 256
+image_pages = 128
+sends = ["net", "disk", "telemetry"]

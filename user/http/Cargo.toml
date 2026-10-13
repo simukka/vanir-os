@@ -24,5 +24,8 @@ try-mgmt-net = []
 never-ready-v2 = []
 # With a volume (RFD 3): write scratch block 1 every 100 ms and print each change in the result.
 volume-probe = []
+# With a volume: keep /count's count in memory, writing it to the volume every 10 s and before
+# draining or exiting (load tests: memory against a disk write per request).
+count-cached = []
 # With volume-probe, first start only: fault after 20 probes (the writer is restarted in its slot).
 crash-after-probes = ["volume-probe"]

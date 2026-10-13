@@ -14,6 +14,7 @@ Two ways in, matching the Makefile's NET / NET_MGMT backends:
 Each scenario prints "peer: ..." lines that the test case checks; the last says PASS or FAIL.
 """
 import argparse
+import json
 import os
 import random
 import socket
@@ -694,6 +695,176 @@ def count_steady(args):
     for f in failures[:5]:
         say(f"failure: {f}")
     return finish(not failures and repeats == 0 and missing == 0 and len(counts) > 0)
+
+
+class GuestSampler:
+    """Follows the guest's telemetry (newline-delimited JSON in TELEMETRY_LOG, default
+    build/telemetry.log, written by the virtio console as it arrives) and turns each heartbeat
+    and counter record into per-second rates: CPU (ticks charged to tasks over ticks elapsed,
+    at 100 ticks a second), memory (frames in use) and I/O (storage's blocks, net's bytes)."""
+
+    def __init__(self, path=os.environ.get("TELEMETRY_LOG", "build/telemetry.log")):
+        self.path, self.offset, self.partial = path, 0, b""
+        self.beat = None  # the last heartbeat: (t, {task: ticks})
+        self.counters = {}  # (task, scope) -> (t, record)
+        self.latest = {}  # what the next sample reports
+
+    def poll(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+        except OSError:
+            return
+        self.offset += len(data)
+        *lines, self.partial = (self.partial + data).split(b"\n")
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("event") == "heartbeat":
+                self.heartbeat(r)
+            elif r.get("event") == "counters":
+                self.counter(r)
+
+    def heartbeat(self, r):
+        ticks = {t["task"]: t["ticks"] for t in r["tasks"]}
+        frames, free = r["frames"], r.get("frames_free", 0)
+        self.latest["mem_mib"] = frames * 4096 / 2**20
+        self.latest["mem_pct"] = 100 * frames / max(frames + free, 1)
+        if self.beat:
+            t0, before = self.beat
+            elapsed = max(r["t"] - t0, 1)
+            used = {k: max(v - before.get(k, 0), 0) for k, v in ticks.items()}
+            self.latest["cpu_pct"] = 100 * sum(used.values()) / elapsed
+            for k, v in used.items():
+                self.latest[f"cpu_{k}"] = 100 * v / elapsed
+        self.beat = (r["t"], ticks)
+
+    def counter(self, r):
+        key = (r.get("task"), r.get("scope"))
+        rates = {"storage": [("blocks_read", "disk_read_kib_s", 4), ("blocks_written", "disk_write_kib_s", 4),
+                             ("flushes", "disk_flushes_s", 1)],
+                 "interface": [("rx_bytes", "net_rx_kib_s", 1 / 1024), ("tx_bytes", "net_tx_kib_s", 1 / 1024)]}.get(key[1])
+        if rates is None:
+            return
+        if key in self.counters:
+            t0, before = self.counters[key]
+            elapsed = max(r["t"] - t0, 1) / 100
+            for field, name, scale in rates:
+                self.latest[name] = max(r.get(field, 0) - before.get(field, 0), 0) * scale / elapsed
+        self.counters[key] = (r["t"], r)
+
+
+@scenario
+def count_load(args):
+    """Load test of counter v1 in small-0 (tests/apps/counter-bench.toml). Keep-alive clients ask
+    for LOAD_PATH (default /count) without pause for LOAD_SECONDS (default 60). LOAD_CLIENTS is a
+    count, or a comma-separated ramp spread evenly over the run (default 1,2,4,8,16,32).
+
+    Every second we sample the request rate, the clients, latency, and the guest's CPU, memory
+    and I/O (GuestSampler); the samples go to BENCH_CSV (default build/bench/count-load.csv).
+    Fails if any request fails or, with /count, if the counts aren't exactly 1..N."""
+    ramp = [int(n) for n in os.environ.get("LOAD_CLIENTS", "1,2,4,8,16,32").split(",")]
+    seconds = float(os.environ.get("LOAD_SECONDS", 60))
+    path = os.environ.get("LOAD_PATH", "/count")
+    out = os.environ.get("BENCH_CSV", "build/bench/count-load.csv")
+    deadline = time.monotonic() + args.timeout - 5
+    if not wait_for_instance("counter v1 on small-0", deadline):
+        say("counter v1 on small-0 never answered")
+        return finish(False)
+    say(f"{' -> '.join(map(str, ramp))} clients asking for {path} for {seconds:.0f} s")
+    done = []  # (finished at, latency) per answered request; list.append is atomic
+    counts, failures = [], []
+    stop = threading.Event()
+    guest = GuestSampler()
+    guest.poll()  # skip to now (deltas start from the last heartbeat before the run)
+
+    def client(i):
+        c = None
+        while not stop.is_set():
+            try:
+                if c is None:
+                    c = Http(timeout=10)
+                started = time.monotonic()
+                status, _, body = c.request(path)
+                ended = time.monotonic()
+                if status == 200:
+                    done.append((ended, ended - started))
+                    if path == "/count":
+                        counts.append(int(body))
+                else:
+                    failures.append(f"{path}: {status} {body.strip()!r}")
+                if c.closed:
+                    c.close()
+                    c = None
+            except (HttpError, OSError) as e:
+                failures.append(f"{e} (client {i})")
+                c = None
+
+    threads = []
+    samples = []
+    start = time.monotonic()
+    seconds = min(seconds, max(1, deadline - start))
+    step = seconds / len(ramp)
+    for second in range(1, int(seconds) + 1):
+        want = ramp[min(int((second - 1) / step), len(ramp) - 1)]
+        while len(threads) < want:
+            threads.append(threading.Thread(target=client, args=(len(threads),)))
+            threads[-1].start()
+        clients = len(threads)
+        seen = len(done)
+        time.sleep(max(0, start + second - time.monotonic()))
+        lat = sorted(l for _, l in done[seen:])
+        guest.poll()
+        sample = {"second": second, "clients": clients, "requests_s": len(lat),
+                  "p50_ms": lat[len(lat) // 2] * 1000 if lat else 0,
+                  "p99_ms": lat[min(len(lat) - 1, int(0.99 * len(lat)))] * 1000 if lat else 0,
+                  "failed": len(failures), **guest.latest}
+        samples.append(sample)
+        say(f"t={second:3d}s clients={clients:2d} req/s={sample['requests_s']:5d} p99={sample['p99_ms']:6.1f}ms "
+            f"cpu={sample.get('cpu_pct', 0):5.1f}% mem={sample.get('mem_mib', 0):5.1f}MiB "
+            f"disk w={sample.get('disk_write_kib_s', 0):7.0f}KiB/s r={sample.get('disk_read_kib_s', 0):7.0f}KiB/s "
+            f"net rx={sample.get('net_rx_kib_s', 0):5.0f} tx={sample.get('net_tx_kib_s', 0):5.0f}KiB/s")
+    stop.set()
+    for t in threads:
+        t.join()
+    elapsed = time.monotonic() - start
+
+    columns = list(dict.fromkeys(k for s in samples for k in s))
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w") as f:
+        f.write(",".join(columns) + "\n")
+        for s in samples:
+            f.write(",".join(f"{s[c]:.2f}" if isinstance(s.get(c), float) else str(s.get(c, "")) for c in columns) + "\n")
+
+    lat = sorted(l for _, l in done)
+
+    def pct(p):
+        return lat[min(len(lat) - 1, int(p / 100 * len(lat)))] * 1000 if lat else 0
+
+    best = max(samples, key=lambda s: s["requests_s"])
+    say(f"{len(done)} answered in {elapsed:.1f} s: {len(done) / elapsed:.0f} requests/s; {len(failures)} failed")
+    say(f"peak {best['requests_s']} requests/s at {best['clients']} clients (t={best['second']}s, "
+        f"cpu {best.get('cpu_pct', 0):.0f}%)")
+    for n in dict.fromkeys(s["clients"] for s in samples):
+        steady = [s for s in samples if s["clients"] == n][1:] or [s for s in samples if s["clients"] == n]
+        say(f"{n:2d} clients: {sum(s['requests_s'] for s in steady) / len(steady):6.0f} requests/s, "
+            f"p99 {max(s['p99_ms'] for s in steady):6.1f} ms, cpu {sum(s.get('cpu_pct', 0) for s in steady) / len(steady):5.1f}%")
+    say(f"latency ms: p50 {pct(50):.2f}, p90 {pct(90):.2f}, p99 {pct(99):.2f}, max {pct(100):.2f}")
+    say(f"samples: {out}")
+    for f in failures[:5]:
+        say(f"failure: {f}")
+    ok = not failures and len(done) > 0 and "cpu_pct" in samples[-1]
+    if "cpu_pct" not in samples[-1]:
+        say(f"no telemetry heartbeats in {guest.path}")
+    if path == "/count":
+        repeats = len(counts) - len(set(counts))
+        missing = len(set(range(1, max(counts, default=0) + 1)) - set(counts))
+        say(f"{len(counts)} counts, highest {max(counts, default=0)}, {repeats} repeated, {missing} missing")
+        ok = ok and repeats == 0 and missing == 0
+    return finish(ok)
 
 
 @scenario

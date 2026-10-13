@@ -308,7 +308,8 @@ fn volume_script() -> Option<u64> {
         feature = "script-volume-resize",
         feature = "script-volume-none",
         feature = "script-volume-forget",
-        feature = "script-volume-handoff-off"
+        feature = "script-volume-handoff-off",
+        feature = "script-volume-serve"
     )) {
         return None;
     }
@@ -340,6 +341,14 @@ fn volume_script() -> Option<u64> {
     {
         run_for(&mut agent, 400);
         return Some(0);
+    }
+    #[cfg(feature = "script-volume-serve")]
+    {
+        // Until the peer ends the run (http/exit-on-request): load tests.
+        println!("agent: counter v1 is serving");
+        loop {
+            run_for(&mut agent, 100);
+        }
     }
     #[cfg(feature = "script-volume-fence")]
     {
