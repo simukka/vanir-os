@@ -1,4 +1,4 @@
-# A stateful service (RFD 3): http with a volume, counting requests in block 0.
+# A stateful service (RFD 3): counter (user/counter, on vanir-rt), counting requests in block 0.
 name = "counter"
 version = 1
 min_version = 1

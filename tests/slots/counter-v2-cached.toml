@@ -1,0 +1,10 @@
+# counter v2 counting in memory, written to its volume every 10 s (RFD 9, P5: a setting, not a build).
+name = "counter"
+version = 2
+min_version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+volume = { blocks = 16 }
+
+[config]
+persist_ticks = 1000

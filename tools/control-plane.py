@@ -432,7 +432,11 @@ class ControlPlane:
 
     def live(self, service, slot, image, drain=None, epoch=None):
         """A `live` line. For an image with a volume, the writer epoch goes up by one whenever
-        the live instance changes (another slot or image); `epoch` overrides it."""
+        the live instance changes (another slot or image); `epoch` overrides it. With
+        --image-suffix, the image of that name with the suffix is deployed instead, if there is
+        one (e.g. counter-v1-cached: the same program with other signed settings)."""
+        if self.args.image_suffix and image + self.args.image_suffix in self.images:
+            image += self.args.image_suffix
         line = f"live {service} {slot} {self.images[image][0].hex()}"
         line += f" drain {drain}" if drain is not None else ""
         if volume_blocks(self.images[image][3]):
@@ -884,6 +888,8 @@ def main():
     p.add_argument("--require-attestation", action="store_true")
     p.add_argument("--reference", help="also compare quotes with this reference (verify-quote.py --record)")
     p.add_argument("--timeout", type=float, default=60)
+    p.add_argument("--image-suffix", default="", metavar="SUFFIX",
+                   help="deploy NAME+SUFFIX wherever a scenario names image NAME, if it exists")
     p.add_argument("--volume-keys", default="build/cp-volume-keys", metavar="DIR", help="where service volume keys are kept")
     p.add_argument("--seal-for", metavar="SERVICE", help="test: seal every volume key for this service instead")
     p.add_argument("--lb", type=int, metavar="PORT", help="run a load balancer on this port")

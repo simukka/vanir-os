@@ -1,0 +1,21 @@
+[package]
+name = "counter"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "counter"
+test = false
+bench = false
+
+[dependencies]
+vanir-rt = { path = "../rt" }
+
+[features]
+# For tests: GET /exit answers, then the task exits (with the supervisor's halt-on-exit, the run ends).
+exit-on-request = []
+# Write scratch block 1 every 100 ms and print each change in the result, so tests see fencing
+# without client traffic; and check, once, that the instance can't name itself the writer.
+volume-probe = ["vanir-rt/unstable"]
+# With volume-probe, first start only: fault after 20 probes (the writer is restarted in its slot).
+crash-after-probes = ["volume-probe"]

@@ -322,7 +322,8 @@ fn volume_script() -> Option<u64> {
         feature = "script-volume-none",
         feature = "script-volume-forget",
         feature = "script-volume-handoff-off",
-        feature = "script-volume-serve"
+        feature = "script-volume-serve",
+        feature = "script-volume-serve-cached"
     )) {
         return None;
     }
@@ -346,7 +347,11 @@ fn volume_script() -> Option<u64> {
         let _ = agent.assign_epoch(s1, (1, 0));
         return Some(0);
     }
-    // Every other script starts with counter v1 in small-0, holding epoch 1.
+    // Every other script starts with counter v1 in small-0, holding epoch 1 (counting in memory
+    // for script-volume-serve-cached: the same program, with persist_ticks in its descriptor).
+    #[cfg(feature = "script-volume-serve-cached")]
+    agent.deploy(s0, Some(image!("counter-v1-cached")), None, Some((1, 0)));
+    #[cfg(not(feature = "script-volume-serve-cached"))]
     agent.deploy(s0, Some(COUNTER_V1), None, Some((1, 0)));
     settle(&mut agent);
 
@@ -355,7 +360,7 @@ fn volume_script() -> Option<u64> {
         run_for(&mut agent, 400);
         return Some(0);
     }
-    #[cfg(feature = "script-volume-serve")]
+    #[cfg(any(feature = "script-volume-serve", feature = "script-volume-serve-cached"))]
     {
         // Until the peer ends the run (http/exit-on-request): load tests.
         println!("agent: counter v1 is serving");

@@ -11,14 +11,16 @@ PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
-USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest net http mgmt-echo switcher agent
+USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest net http counter mgmt-echo switcher agent
 # Service images for generic slots (RFD 2), built into build/slots/: <name>:<program>:<descriptor>.
 # The agent is built after them, since its test scripts carry them.
 SLOT_IMAGES    := web-v1:http:tests/slots/web-v1.toml web-v2:http:tests/slots/web-v2.toml \
                   web-floor:http:tests/slots/web-floor.toml web-large:http:tests/slots/web-large.toml \
                   hello:hello:tests/slots/hello.toml crasher:crasher:tests/slots/crasher.toml \
-                  counter-v1:http:tests/slots/counter-v1.toml counter-v2:http:tests/slots/counter-v2.toml \
-                  counter-v3:http:tests/slots/counter-v3.toml web-abi-next:http:tests/slots/web-abi-next.toml \
+                  counter-v1:counter:tests/slots/counter-v1.toml counter-v2:counter:tests/slots/counter-v2.toml \
+                  counter-v3:counter:tests/slots/counter-v3.toml \
+                  counter-v1-cached:counter:tests/slots/counter-v1-cached.toml \
+                  counter-v2-cached:counter:tests/slots/counter-v2-cached.toml web-abi-next:http:tests/slots/web-abi-next.toml \
                   web-config:http:tests/slots/web-config.toml
 USER_FEATURES  :=
 KERNEL_FEATURES:=

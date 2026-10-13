@@ -9,21 +9,9 @@
 //! Every snapshot interval we send telemetry our request counters by status class and a
 //! latency histogram (from a request's first byte to its response, in fixed buckets).
 //!
-//! **With a volume** (a slot image whose descriptor declares one, RFD 3), `/count` counts in
-//! block 0 of the volume instead: it reads the count, adds one and writes it back, and answers
-//! 503 with storage's code if any of that fails (e.g. FENCED: this instance isn't the writer).
-//! We read block 0 before saying we're ready, and never say so if that fails. With
-//! `volume-probe` (tests), we also write scratch block 1 once before saying we're ready and
-//! every 100 ms after, and print each change in the result, so tests see fencing without client
-//! traffic. With `count-cached`, `/count` counts in memory instead: the first request reads
-//! and writes block 0 as above (so it waits for, and proves, that we are the writer), the rest
-//! only add one, and the count is written back every `PERSIST_TICKS` and before we drain or
-//! exit. A crash loses the counts since the last write, and a write that fails (FENCED: another
-//! instance is the writer now) throws the cached count away, so the next request goes to the
-//! volume again. It also checks, once, that we can't name a writer ourselves (`OP_EPOCH`), and in a
-//! slot without a volume that the storage task refuses us. If the storage task restarts, we
-//! find it again. When we become the volume's writer, the storage task posts us a bit
-//! (`block::NOTIFY_WRITER`), and we print that we have it.
+//! The counter with a volume (RFD 3) is its own program now, `user/counter`, on the runtime
+//! (`vanir-rt`, RFD 9). In a slot without a volume, `volume-probe` (tests) checks that the
+//! storage task refuses us.
 //!
 //! When `net` tells us to drain, we stop accepting and answer each connection's next request
 //! with `Connection: close`, then say `OP_DONE` once none are left. Idle connections are left
@@ -36,7 +24,7 @@
 use core::fmt::Write;
 use vanir_user::net::{self, CODE_CLOSED, EV_ACCEPT, EV_CLOSED, EV_DRAIN, EV_READ, EV_WRITE, Event};
 use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
-use vanir_user::block::{self, BLOCK_SIZE, CODE_LOCKED};
+use vanir_user::block;
 use vanir_rt::http::{BODY_LIMIT, HEADER_LIMIT, HEADER_TICKS, IDLE_TICKS, parse, reason};
 use vanir_user::{err, getpid, lookup, println, rdtsc, sleep, task_listen, task_name, uptime};
 
@@ -45,12 +33,6 @@ vanir_user::entry!(main);
 const PORT: u16 = 80;
 const CONNECTIONS: usize = 80;
 const OUT: usize = 512;
-/// `volume-probe`: how often to try a write.
-#[cfg(feature = "volume-probe")]
-const PROBE_TICKS: u64 = 10;
-/// `count-cached`: how often the cached count is written to the volume.
-#[cfg(feature = "count-cached")]
-const PERSIST_TICKS: u64 = 1000;
 /// Upper bounds of the latency buckets, in milliseconds (the last bucket is everything above).
 const LATENCY_MS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 
@@ -106,21 +88,8 @@ struct Server {
     telemetry: Option<u64>,
     interval: u64,
     next_snapshot: u64,
-    /// The storage task, if our descriptor declares a volume.
-    disk: Option<u64>,
-    /// The volume couldn't be opened: never say we're ready.
-    volume_failed: bool,
-    /// `volume-probe`: when to probe next, and the last result printed.
-    #[cfg(feature = "volume-probe")]
-    probe: (u64, Option<u64>),
-    #[cfg(feature = "crash-after-probes")]
-    probes: u32,
     #[cfg(feature = "exit-on-request")]
     exit: bool,
-    /// `count-cached`: the count, once read from the volume; whether it has changed since it was
-    /// written; when to write it next.
-    #[cfg(feature = "count-cached")]
-    cached: (Option<u64>, bool, u64),
 }
 
 /// Bytes formatted into a fixed buffer.
@@ -137,36 +106,6 @@ impl Write for Buf<'_> {
         self.len += n;
         Ok(())
     }
-}
-
-/// Print that instance `name` became its volume's writer, if the storage task's bit is posted.
-fn writer_bit(name: &[u8]) {
-    if vanir_user::posted() & block::NOTIFY_WRITER != 0 {
-        println!("{}: now the writer of its volume", core::str::from_utf8(name).unwrap_or("?"));
-    }
-}
-
-/// `/count` with a volume: read block 0's count, add one, write it back.
-fn count_on_disk(disk: u64) -> Result<u64, u64> {
-    let mut buf = [0u8; BLOCK_SIZE];
-    block::read(disk, 0, &mut buf)?;
-    let n = u64::from_le_bytes(buf[..8].try_into().unwrap()) + 1;
-    buf[..8].copy_from_slice(&n.to_le_bytes());
-    block::write(disk, 0, &buf)?;
-    Ok(n)
-}
-
-/// `/count` with `count-cached`: in memory, once the volume has been read (and written, which
-/// only the writer may do).
-#[cfg(feature = "count-cached")]
-fn count_cached(disk: u64, cached: &mut (Option<u64>, bool, u64)) -> Result<u64, u64> {
-    if let (Some(n), _, at) = *cached {
-        *cached = (Some(n + 1), true, at);
-        return Ok(n + 1);
-    }
-    let n = count_on_disk(disk)?;
-    *cached = (Some(n), false, uptime() + PERSIST_TICKS);
-    Ok(n)
 }
 
 impl Server {
@@ -213,87 +152,10 @@ impl Server {
         }
         // Test only: version 2 and later never say they are ready (a deployment that fails).
         let never = cfg!(feature = "never-ready-v2") && task_listen(getpid()).is_ok_and(|i| i.version >= 2);
-        if !never && !self.volume_failed {
+        if !never {
             let _ = net::ready(self.net);
         }
         println!("{}: serving HTTP on port {}", self.name(), PORT);
-    }
-
-    /// Read block 0 of the volume, waiting while storage is locked: the volume is usable.
-    fn open_volume(&mut self) {
-        let Some(disk) = self.disk else { return };
-        let mut buf = [0u8; BLOCK_SIZE];
-        let mut result = block::read(disk, 0, &mut buf);
-        for _ in 0..1000 {
-            if result != Err(CODE_LOCKED) {
-                break;
-            }
-            sleep(1);
-            result = block::read(disk, 0, &mut buf);
-        }
-        match result {
-            Ok(()) => println!("{}: volume opened, count {}", self.name(), u64::from_le_bytes(buf[..8].try_into().unwrap())),
-            Err(e) => {
-                println!("{}: cannot open its volume: {}", self.name(), block::code_name(e));
-                self.volume_failed = true;
-            }
-        }
-        #[cfg(feature = "volume-probe")]
-        if !self.volume_failed {
-            let e = block::epoch(disk, 1 << 40, 0, getpid()).err().unwrap_or(block::CODE_OK);
-            println!("{}: naming itself the writer: {}", self.name(), block::code_name(e));
-            self.probe(0);
-        }
-    }
-
-    /// The storage task died: find the new one.
-    #[cfg(feature = "volume-probe")]
-    fn find_disk_again(&mut self) {
-        if let Ok(d) = lookup("disk") {
-            self.disk = Some(d);
-        }
-    }
-
-    /// Whether the storage task said we are its volume's writer now (RFD 3, P1): it posts the bit
-    /// before answering a request it held, so we look after each request too. A count we cache
-    /// (`count-cached`) is only ever read once we are the writer, so there is nothing to throw
-    /// away; the line is for the tests.
-    fn check_writer(&mut self) {
-        if self.disk.is_some() {
-            writer_bit(&self.name[..self.name_len]);
-        }
-    }
-
-    /// `volume-probe`: write scratch block 1 if it's time, and print a change in the result.
-    /// Returns when to probe next.
-    #[cfg(feature = "volume-probe")]
-    fn probe(&mut self, now: u64) -> Option<u64> {
-        let disk = self.disk?;
-        if self.volume_failed {
-            return None;
-        }
-        if now >= self.probe.0 {
-            let code = block::write(disk, 1, &[0x5a; BLOCK_SIZE]).err().unwrap_or(block::CODE_OK);
-            self.check_writer();
-            if self.probe.1 != Some(code) {
-                println!("{}: writes {}", self.name(), block::code_name(code));
-                self.probe.1 = Some(code);
-            }
-            if code == err::DEAD {
-                self.find_disk_again();
-            }
-            self.probe.0 = now + PROBE_TICKS;
-            #[cfg(feature = "crash-after-probes")]
-            {
-                self.probes += 1;
-                // First start only: a slot's id is already at generation 1 once loaded.
-                if self.probes == 20 && getpid() >> 16 <= 1 {
-                    println!("{}: crashing after 20 probes", self.name());
-                    unsafe { core::ptr::read_volatile(0x10 as *const u8) };
-                }
-            }
-        }
-        Some(self.probe.0)
     }
 
     fn slot(&self, handle: u32) -> Option<usize> {
@@ -447,29 +309,6 @@ impl Server {
                     } else if r.path == b"/" {
                         let _ = write!(w, "hello from {}\n", core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"));
                         200
-                    } else if let (b"/count", Some(disk)) = (r.path, self.disk) {
-                        #[cfg(feature = "count-cached")]
-                        let counted = count_cached(disk, &mut self.cached);
-                        #[cfg(not(feature = "count-cached"))]
-                        let counted = count_on_disk(disk);
-                        writer_bit(&self.name[..self.name_len]);
-                        match counted {
-                            Ok(n) => {
-                                let _ = write!(w, "{}\n", n);
-                                200
-                            }
-                            Err(e) if e == err::DEAD => {
-                                if let Ok(d) = lookup("disk") {
-                                    self.disk = Some(d);
-                                }
-                                let _ = write!(w, "{}\n", block::code_name(e));
-                                503
-                            }
-                            Err(e) => {
-                                let _ = write!(w, "{}\n", block::code_name(e));
-                                503
-                            }
-                        }
                     } else if r.path == b"/count" {
                         let _ = write!(w, "{}\n", self.requests + 1);
                         200
@@ -555,40 +394,6 @@ impl Server {
 
     /// `count-cached`: write the cached count to block 0 if it changed and it's time (or `now`
     /// is None: before draining or exiting). Returns when to look again.
-    #[cfg(feature = "count-cached")]
-    fn persist(&mut self, now: Option<u64>) -> Option<u64> {
-        let (Some(n), dirty, at) = self.cached else { return None };
-        if now.is_some_and(|t| t < at) {
-            return Some(at);
-        }
-        let next = uptime() + PERSIST_TICKS;
-        self.cached = (Some(n), false, next);
-        if !dirty {
-            return Some(next);
-        }
-        let mut buf = [0u8; BLOCK_SIZE];
-        buf[..8].copy_from_slice(&n.to_le_bytes());
-        match self.disk.map(|d| block::write(d, 0, &buf)) {
-            Some(Ok(())) => {
-                println!("{}: count {} written to the volume", self.name(), n);
-                Some(next)
-            }
-            Some(Err(e)) => {
-                // Not the writer any more (or storage restarted): what we counted is lost, and
-                // the next request goes to the volume.
-                println!("{}: writing count {} failed: {}; cache dropped", self.name(), n, block::code_name(e));
-                self.cached = (None, false, 0);
-                if e == err::DEAD
-                    && let Ok(d) = lookup("disk")
-                {
-                    self.disk = Some(d);
-                }
-                None
-            }
-            None => None,
-        }
-    }
-
     fn start_drain(&mut self) {
         println!("{}: draining", self.name());
         self.draining = true;
@@ -614,16 +419,8 @@ static mut SERVER: Server = Server {
     telemetry: None,
     interval: DEFAULT_INTERVAL_TICKS,
     next_snapshot: 0,
-    disk: None,
-    volume_failed: false,
-    #[cfg(feature = "volume-probe")]
-    probe: (0, None),
-    #[cfg(feature = "crash-after-probes")]
-    probes: 0,
     #[cfg(feature = "exit-on-request")]
     exit: false,
-    #[cfg(feature = "count-cached")]
-    cached: (None, false, 0),
 };
 
 fn main() -> u64 {
@@ -645,22 +442,14 @@ fn main() -> u64 {
         for setting in info.settings() {
             println!("{}: setting {} = {}", s.name(), core::str::from_utf8(setting.key()).unwrap_or("?"), setting.value);
         }
-        if info.volume_blocks > 0 {
-            match lookup("disk") {
-                Ok(disk) => s.disk = Some(disk),
-                Err(_) => {
-                    println!("{}: no storage task for its volume", s.name());
-                    s.volume_failed = true;
-                }
-            }
-        } else if cfg!(feature = "volume-probe")
+        if cfg!(feature = "volume-probe")
+            && info.volume_blocks == 0
             && let Ok(disk) = lookup("disk")
         {
             let e = block::capacity(disk).err().unwrap_or(block::CODE_OK);
             println!("{}: no volume declared; the storage task says {}", s.name(), block::code_name(e));
         }
     }
-    s.open_volume();
     s.cycles_per_tick = vanir_user::tsc_per_tick();
     s.attach();
 
@@ -675,18 +464,7 @@ fn main() -> u64 {
         if s.telemetry.is_some() {
             next = Some(next.map_or(s.next_snapshot, |n| n.min(s.next_snapshot)));
         }
-        #[cfg(feature = "volume-probe")]
-        if let Some(p) = s.probe(now) {
-            next = Some(next.map_or(p, |n| n.min(p)));
-        }
-        #[cfg(feature = "count-cached")]
-        if let Some(p) = s.persist(Some(now)) {
-            next = Some(next.map_or(p, |n| n.min(p)));
-        }
         if s.draining && !s.done_sent && s.conns.iter().all(|c| c.handle == 0) {
-            // The next writer reads the count once we are done: write it first.
-            #[cfg(feature = "count-cached")]
-            s.persist(None);
             s.done_sent = true;
             println!("{}: drained, {} requests served", s.name(), s.requests);
             let _ = net::done(s.net);
@@ -705,7 +483,6 @@ fn main() -> u64 {
                 continue;
             }
         };
-        s.check_writer();
         let now = uptime();
         for e in &events[..n] {
             if e.flags & EV_DRAIN != 0 {
@@ -726,8 +503,6 @@ fn main() -> u64 {
         }
         #[cfg(feature = "exit-on-request")]
         if s.exit {
-            #[cfg(feature = "count-cached")]
-            s.persist(None);
             println!("{}: exiting after {} requests, as asked", s.name(), s.requests);
             return 0;
         }
