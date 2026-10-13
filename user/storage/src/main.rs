@@ -28,6 +28,14 @@
 //! a restarted writer stays the writer, and after this task restarts nobody is until the agent
 //! says again. Epochs only go up, across reboots (they are in the header).
 //!
+//! **Handoff (RFD 3, P3).** Just before the agent routes to a new instance of a service whose old
+//! instance still writes, it names the new one the candidate (OP_HANDOFF). From then on the
+//! candidate's reads, writes and flushes are held, not answered, until OP_EPOCH makes it the
+//! writer; then it gets the writer bit (`block::NOTIFY_WRITER`, posted to every new writer) and
+//! the held requests are served in order. Called off (OP_HANDOFF for no candidate or another),
+//! they are served at once, as if they had just arrived. A client blocked in a call has one
+//! request outstanding, so there is at most one held request per slot.
+//!
 //! Keys are only ever in memory. The task starts locked, answering CODE_LOCKED: it asks the key
 //! server ("keys") for the master key if it may send to one, and otherwise waits for OP_UNLOCK
 //! (from "attest", after the host released the key). A restarted storage task starts locked
@@ -55,11 +63,11 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use vanir_user::block::{
     self, BLOCK_SIZE, CODE_BAD_OP, CODE_FENCED, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE,
-    OP_EPOCH, OP_FLUSH, OP_FORGET_KEY, OP_INFO, OP_READ, OP_SERVICE_KEY, OP_UNLOCK, OP_WRITE, split,
+    NOTIFY_WRITER, OP_EPOCH, OP_FLUSH, OP_FORGET_KEY, OP_HANDOFF, OP_INFO, OP_READ, OP_SERVICE_KEY, OP_UNLOCK, OP_WRITE, split,
 };
 use vanir_user::keys::{self, OP_MASTER_KEY};
 use vanir_user::telemetry::{self, INTEGRITY_ERROR, Record, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
-use vanir_user::{err, lookup, println, recv, reply, send, sleep, task_index, task_listen, task_name, uptime};
+use vanir_user::{err, lookup, notify, println, recv, reply, send, sleep, task_index, task_listen, task_name, uptime};
 
 vanir_user::entry!(main);
 
@@ -87,6 +95,8 @@ const UNLOCKERS: [&[u8]; 2] = [b"keys", b"attest"];
 const MAX_VOLUMES: usize = BLOCK_SIZE / ENTRY;
 /// Volume table entry: name (32 bytes, zero padded), start block, size in data blocks, kind.
 const ENTRY: usize = 64;
+/// Requests held during handoffs (RFD 3, P3): one per slot is enough.
+const MAX_HELD: usize = 8;
 
 #[derive(Clone, Copy)]
 struct Volume {
@@ -104,6 +114,8 @@ struct Volume {
     writer: Option<u64>,
     /// Slots (bit index - 1) already reported for a fenced write at this epoch.
     fenced_seen: u64,
+    /// The handoff's candidate (task id), whose requests are held until it is the writer.
+    candidate: Option<u64>,
 }
 
 /// Metadata blocks for `blocks` data blocks.
@@ -122,6 +134,20 @@ impl Volume {
     }
 }
 
+/// A request held during a handoff (RFD 3, P3); its data is in `HELD_DATA` at the same index.
+#[derive(Clone, Copy)]
+struct Held {
+    volume: usize,
+    sender: u64,
+    op: u64,
+    len: usize,
+    since: u64,
+    seq: u64,
+}
+
+/// The held requests' data, 4 KiB each: too much for the stack.
+static mut HELD_DATA: [[u8; BLOCK_SIZE]; MAX_HELD] = [[0; BLOCK_SIZE]; MAX_HELD];
+
 /// A service's key (RFD 3, P2), by service name (zero padded).
 #[derive(Clone, Copy)]
 struct ServiceKey {
@@ -139,6 +165,11 @@ struct Storage {
     volumes: [Option<Volume>; MAX_VOLUMES],
     /// The telemetry task, while we may send to it.
     telemetry: Option<u64>,
+    /// Requests held during handoffs, and the next arrival number.
+    held: [Option<Held>; MAX_HELD],
+    held_seq: u64,
+    /// A volume whose held requests are served once the current request has been answered.
+    release: Option<usize>,
 }
 
 /// Run a driver call, finding the driver again (by name) if it was restarted.
@@ -210,6 +241,7 @@ impl Storage {
                     lease_until: 0,
                     writer: None,
                     fenced_seen: 0,
+                    candidate: None,
                 });
             }
         }
@@ -267,6 +299,7 @@ impl Storage {
             lease_until: 0,
             writer: None,
             fenced_seen: 0,
+            candidate: None,
         };
         if self.next_free + v.footprint() > self.capacity {
             return Err(CODE_OUT_OF_RANGE);
@@ -399,6 +432,8 @@ impl Storage {
             self.flush()?;
             self.volumes[i] = Some(v);
             println!("storage: {}: epoch {}, writer task {} (recorded in {} ticks)", service, epoch, slot, uptime() - started);
+            // Tell the new writer, before any request it has waiting is answered.
+            let _ = notify(writer, NOTIFY_WRITER);
         } else if epoch == v.epoch && epoch != 0 && v.writer.is_none_or(|w| w == slot) {
             v.writer = Some(slot);
             self.volumes[i] = Some(v);
@@ -407,12 +442,89 @@ impl Storage {
             println!("storage: {}: epoch {} refused (recorded: {})", service, epoch, v.epoch);
             return Err(CODE_FENCED);
         }
+        if self.volumes[i].unwrap().candidate.is_some_and(|c| task_index(c) == slot) {
+            self.release = Some(i);
+        }
         if let Some(t) = self.telemetry {
             let mut r = Record::new("epoch_changed");
             r.text("volume", service).num("epoch", epoch).num("writer", slot);
             let _ = telemetry::event(t, &r);
         }
         Ok(())
+    }
+
+    /// OP_HANDOFF (RFD 3, P3): hold `candidate`'s requests to `service`'s volume until it is the
+    /// writer; 0 calls the handoff off.
+    fn handoff(&mut self, service: &[u8; 32], candidate: u64) -> Result<(), u64> {
+        let i = if candidate == 0 {
+            let found = self.volumes.iter().position(|v| v.is_some_and(|v| v.kind == KIND_SERVICE && v.name == *service));
+            found.ok_or(CODE_BAD_OP)?
+        } else {
+            let info = task_listen(candidate).map_err(|_| CODE_BAD_OP)?;
+            if !info.is_slot() || info.volume_blocks == 0 || block::service_name(info.service()) != *service {
+                return Err(CODE_BAD_OP);
+            }
+            self.has_key(KIND_SERVICE, info.service())?;
+            self.volume(KIND_SERVICE, info.service(), info.volume_blocks)?
+        };
+        let v = self.volumes[i].unwrap();
+        if v.candidate == Some(candidate) || (candidate == 0 && v.candidate.is_none()) {
+            return Ok(());
+        }
+        if v.candidate.is_some() {
+            self.release_held(i); // called off: serve what was held as it is
+        }
+        self.volumes[i].as_mut().unwrap().candidate = (candidate != 0).then_some(candidate);
+        if candidate != 0 {
+            let mut buf = [0u8; 64];
+            let who = task_name(candidate, &mut buf).unwrap_or("?");
+            println!("storage: {}: holding {}'s requests (handoff)", core::str::from_utf8(trim(service)).unwrap_or("?"), who);
+        }
+        Ok(())
+    }
+
+    /// Keep a request from volume `i`'s candidate until it is the writer.
+    fn hold(&mut self, i: usize, sender: u64, op: u64, len: usize, msg: &[u8; BLOCK_SIZE]) {
+        let Some(k) = self.held.iter().position(Option::is_none) else {
+            let _ = reply(sender, block::CODE_BUSY, &[]); // the client tries again
+            return;
+        };
+        let data = unsafe { &mut *(&raw mut HELD_DATA) }; // only this task, one request at a time
+        data[k][..len].copy_from_slice(&msg[..len]);
+        self.held[k] = Some(Held { volume: i, sender, op, len, since: uptime(), seq: self.held_seq });
+        self.held_seq += 1;
+    }
+
+    /// Serve volume `i`'s held requests in the order they came: to the new writer, or as they
+    /// are if the handoff was called off.
+    fn release_held(&mut self, i: usize) {
+        let mut v = self.volumes[i].unwrap();
+        let candidate = v.candidate.take().unwrap_or(0);
+        self.volumes[i] = Some(v);
+        let writer = v.writer.is_some_and(|w| candidate != 0 && task_index(candidate) == w);
+        let (mut n, mut longest, now) = (0u64, 0u64, uptime());
+        let mut buf = [0u8; BLOCK_SIZE];
+        while let Some(k) = (0..MAX_HELD).filter(|&k| self.held[k].is_some_and(|h| h.volume == i)).min_by_key(|&k| self.held[k].unwrap().seq) {
+            let h = self.held[k].take().unwrap();
+            let data = unsafe { &*(&raw const HELD_DATA) };
+            buf[..h.len].copy_from_slice(&data[k][..h.len]);
+            n += 1;
+            longest = longest.max(now - h.since);
+            self.serve(h.sender, h.op, h.len, &mut buf);
+        }
+        let service = core::str::from_utf8(name_of(&v)).unwrap_or("?");
+        let mut name = [0u8; 64];
+        let who = task_name(candidate, &mut name).unwrap_or("?");
+        if writer {
+            println!("storage: {}: released {} held request(s) to {} (longest wait {} ticks)", service, n, who, longest);
+        } else {
+            println!("storage: {}: handoff to {} called off; {} held request(s) answered", service, who, n);
+        }
+        if let Some(t) = self.telemetry {
+            let mut r = Record::new("handoff");
+            r.text("volume", service).num("held", n).num("longest_wait", longest).num("called_off", !writer as u64);
+            let _ = telemetry::event(t, &r);
+        }
     }
 
     /// Whether slot `slot` may write volume `i` (a service volume's writer; anyone for a task's).
@@ -521,6 +633,147 @@ impl Storage {
     }
 }
 
+impl Storage {
+    /// Answer one request (or hold it, from a handoff's candidate).
+    fn serve(&mut self, sender: u64, raw_op: u64, len: usize, msg: &mut [u8; BLOCK_SIZE]) {
+        let mut name_buf = [0u8; 64];
+        let Ok(name) = task_name(sender, &mut name_buf).map(|n| n.as_bytes()) else {
+            let _ = reply(sender, CODE_BAD_OP, &[]);
+            return;
+        };
+        let mut name_copy = [0u8; 64];
+        name_copy[..name.len()].copy_from_slice(name);
+        let name = &name_copy[..name.len()];
+        let (op, b) = split(raw_op);
+        if op == OP_UNLOCK {
+            let code = if !UNLOCKERS.contains(&name) {
+                CODE_NOT_ALLOWED
+            } else if len != 32 {
+                CODE_BAD_OP
+            } else {
+                self.master = Some(msg[..32].try_into().unwrap());
+                // A new key: every task volume's header has to open under it again.
+                self.volumes.iter_mut().flatten().filter(|v| v.kind == KIND_TASK).for_each(|v| v.checked = false);
+                println!("storage: unlocked by {}", core::str::from_utf8(name).unwrap_or("?"));
+                self.event(STORAGE_UNLOCKED, 0, name);
+                CODE_OK
+            };
+            let _ = reply(sender, code, &[]);
+            return;
+        }
+        if op == OP_SERVICE_KEY {
+            let code = if !UNLOCKERS.contains(&name) {
+                CODE_NOT_ALLOWED
+            } else if len != 64 {
+                CODE_BAD_OP
+            } else {
+                let from = core::str::from_utf8(name).unwrap_or("?");
+                self.set_service_key(&msg[..32].try_into().unwrap(), &msg[32..64].try_into().unwrap(), from)
+            };
+            let _ = reply(sender, code, &[]);
+            return;
+        }
+        if op == OP_FORGET_KEY {
+            let code = if !task_listen(sender).is_ok_and(|i| i.may_load()) {
+                CODE_NOT_ALLOWED
+            } else if len != 32 {
+                CODE_BAD_OP
+            } else {
+                self.forget_service_key(&msg[..32].try_into().unwrap());
+                CODE_OK
+            };
+            let _ = reply(sender, code, &[]);
+            return;
+        }
+        let code_of = |e: u64| if err::is_error(e) { CODE_IO_ERROR } else { e };
+        if op == OP_HANDOFF {
+            let code = if !task_listen(sender).is_ok_and(|i| i.may_load()) {
+                CODE_NOT_ALLOWED
+            } else if len != 40 {
+                CODE_BAD_OP
+            } else {
+                let candidate = u64::from_le_bytes(msg[32..40].try_into().unwrap());
+                match self.handoff(&msg[..32].try_into().unwrap(), candidate) {
+                    Ok(()) => CODE_OK,
+                    Err(e) => code_of(e),
+                }
+            };
+            let _ = reply(sender, code, &[]);
+            return;
+        }
+        if op == OP_EPOCH {
+            let code = if !task_listen(sender).is_ok_and(|i| i.may_load()) {
+                CODE_NOT_ALLOWED
+            } else if len != 24 {
+                CODE_BAD_OP
+            } else {
+                let at = |k: usize| u64::from_le_bytes(msg[k..k + 8].try_into().unwrap());
+                match self.assign_epoch(at(0), at(8), at(16)) {
+                    Ok(()) => CODE_OK,
+                    Err(e) => code_of(e),
+                }
+            };
+            let _ = reply(sender, code, &[]);
+            return;
+        }
+        // A slot's instance reaches its service's volume (RFD 3), anything else its task'self.
+        let info = task_listen(sender).ok().filter(|i| i.is_slot());
+        let found = match &info {
+            Some(i) if i.volume_blocks == 0 => Err(CODE_NOT_ALLOWED),
+            Some(i) => self.has_key(KIND_SERVICE, i.service()).and_then(|()| self.volume(KIND_SERVICE, i.service(), i.volume_blocks)),
+            None => self.has_key(KIND_TASK, name).and_then(|()| self.volume(KIND_TASK, name, TASK_BLOCKS)),
+        };
+        let i = match found {
+            Ok(i) => i,
+            Err(code) => {
+                let _ = reply(sender, code_of(code), &[]);
+                return;
+            }
+        };
+        // The handoff's candidate waits until it is the writer (RFD 3, P3).
+        if matches!(op, OP_READ | OP_WRITE | OP_FLUSH)
+            && self.volumes[i].unwrap().candidate.is_some_and(|c| task_index(c) == task_index(sender))
+        {
+            self.hold(i, sender, raw_op, len, msg);
+            return;
+        }
+        if matches!(op, OP_READ | OP_WRITE)
+            && let Err(e) = self.check_header(i)
+        {
+            let _ = reply(sender, code_of(e), &[]);
+            return;
+        }
+        if matches!(op, OP_WRITE | OP_FLUSH) && !self.may_write(i, task_index(sender)) {
+            let _ = reply(sender, CODE_FENCED, &[]);
+            return;
+        }
+        let v = self.volumes[i].unwrap();
+        let result = match op {
+            OP_INFO => {
+                let _ = reply(sender, CODE_OK, &v.blocks.to_le_bytes());
+                return;
+            }
+            OP_FLUSH => self.flush(),
+            OP_READ | OP_WRITE if b >= v.blocks => Err(CODE_OUT_OF_RANGE),
+            OP_READ => match self.read_data(&v, b, msg) {
+                Ok(()) => {
+                    let _ = reply(sender, CODE_OK, &msg[..]);
+                    return;
+                }
+                Err(e) => Err(e),
+            },
+            OP_WRITE if len == BLOCK_SIZE => self.write_data(&v, b, msg),
+            _ => Err(CODE_BAD_OP),
+        };
+        let code = match result {
+            Ok(()) => CODE_OK,
+            Err(e) if err::is_error(e) => CODE_IO_ERROR,
+            Err(code) => code,
+        };
+        let _ = reply(sender, code, &[]);
+    }
+}
+
 /// A volume's name without its zero padding.
 fn name_of(v: &Volume) -> &[u8] {
     trim(&v.name)
@@ -560,6 +813,9 @@ fn main() -> u64 {
         next_free: FIRST_DATA,
         volumes: [None; MAX_VOLUMES],
         telemetry: lookup("telemetry").ok(),
+        held: [None; MAX_HELD],
+        held_seq: 0,
+        release: None,
     };
     s.capacity = match on_driver(&mut s.driver, block::capacity) {
         Ok(c) => c,
@@ -590,126 +846,17 @@ fn main() -> u64 {
                 continue;
             }
         };
-        let mut name_buf = [0u8; 64];
-        let Ok(name) = task_name(m.sender, &mut name_buf).map(|n| n.as_bytes()) else {
-            let _ = reply(m.sender, CODE_BAD_OP, &[]);
-            continue;
-        };
-        let mut name_copy = [0u8; 64];
-        name_copy[..name.len()].copy_from_slice(name);
-        let name = &name_copy[..name.len()];
-        let (op, b) = split(m.op);
         #[cfg(feature = "crash-after-16")]
-        if op == block::OP_WRITE {
+        if split(m.op).0 == block::OP_WRITE {
             writes += 1;
             if writes == 16 && vanir_user::getpid() >> 16 == 0 {
                 println!("storage: crashing after 15 writes");
                 unsafe { core::ptr::read_volatile(0x10 as *const u8) };
             }
         }
-        if op == OP_UNLOCK {
-            let code = if !UNLOCKERS.contains(&name) {
-                CODE_NOT_ALLOWED
-            } else if m.len != 32 {
-                CODE_BAD_OP
-            } else {
-                s.master = Some(msg[..32].try_into().unwrap());
-                // A new key: every task volume's header has to open under it again.
-                s.volumes.iter_mut().flatten().filter(|v| v.kind == KIND_TASK).for_each(|v| v.checked = false);
-                println!("storage: unlocked by {}", core::str::from_utf8(name).unwrap_or("?"));
-                s.event(STORAGE_UNLOCKED, 0, name);
-                CODE_OK
-            };
-            let _ = reply(m.sender, code, &[]);
-            continue;
+        s.serve(m.sender, m.op, m.len, &mut msg);
+        if let Some(i) = s.release.take() {
+            s.release_held(i);
         }
-        if op == OP_SERVICE_KEY {
-            let code = if !UNLOCKERS.contains(&name) {
-                CODE_NOT_ALLOWED
-            } else if m.len != 64 {
-                CODE_BAD_OP
-            } else {
-                let from = core::str::from_utf8(name).unwrap_or("?");
-                s.set_service_key(&msg[..32].try_into().unwrap(), &msg[32..64].try_into().unwrap(), from)
-            };
-            let _ = reply(m.sender, code, &[]);
-            continue;
-        }
-        if op == OP_FORGET_KEY {
-            let code = if !task_listen(m.sender).is_ok_and(|i| i.may_load()) {
-                CODE_NOT_ALLOWED
-            } else if m.len != 32 {
-                CODE_BAD_OP
-            } else {
-                s.forget_service_key(&msg[..32].try_into().unwrap());
-                CODE_OK
-            };
-            let _ = reply(m.sender, code, &[]);
-            continue;
-        }
-        let code_of = |e: u64| if err::is_error(e) { CODE_IO_ERROR } else { e };
-        if op == OP_EPOCH {
-            let code = if !task_listen(m.sender).is_ok_and(|i| i.may_load()) {
-                CODE_NOT_ALLOWED
-            } else if m.len != 24 {
-                CODE_BAD_OP
-            } else {
-                let at = |k: usize| u64::from_le_bytes(msg[k..k + 8].try_into().unwrap());
-                match s.assign_epoch(at(0), at(8), at(16)) {
-                    Ok(()) => CODE_OK,
-                    Err(e) => code_of(e),
-                }
-            };
-            let _ = reply(m.sender, code, &[]);
-            continue;
-        }
-        // A slot's instance reaches its service's volume (RFD 3), anything else its task's.
-        let info = task_listen(m.sender).ok().filter(|i| i.is_slot());
-        let found = match &info {
-            Some(i) if i.volume_blocks == 0 => Err(CODE_NOT_ALLOWED),
-            Some(i) => s.has_key(KIND_SERVICE, i.service()).and_then(|()| s.volume(KIND_SERVICE, i.service(), i.volume_blocks)),
-            None => s.has_key(KIND_TASK, name).and_then(|()| s.volume(KIND_TASK, name, TASK_BLOCKS)),
-        };
-        let i = match found {
-            Ok(i) => i,
-            Err(code) => {
-                let _ = reply(m.sender, code_of(code), &[]);
-                continue;
-            }
-        };
-        if matches!(op, OP_READ | OP_WRITE)
-            && let Err(e) = s.check_header(i)
-        {
-            let _ = reply(m.sender, code_of(e), &[]);
-            continue;
-        }
-        if matches!(op, OP_WRITE | OP_FLUSH) && !s.may_write(i, task_index(m.sender)) {
-            let _ = reply(m.sender, CODE_FENCED, &[]);
-            continue;
-        }
-        let v = s.volumes[i].unwrap();
-        let result = match op {
-            OP_INFO => {
-                let _ = reply(m.sender, CODE_OK, &v.blocks.to_le_bytes());
-                continue;
-            }
-            OP_FLUSH => s.flush(),
-            OP_READ | OP_WRITE if b >= v.blocks => Err(CODE_OUT_OF_RANGE),
-            OP_READ => match s.read_data(&v, b, &mut msg) {
-                Ok(()) => {
-                    let _ = reply(m.sender, CODE_OK, &msg);
-                    continue;
-                }
-                Err(e) => Err(e),
-            },
-            OP_WRITE if m.len == BLOCK_SIZE => s.write_data(&v, b, &mut msg),
-            _ => Err(CODE_BAD_OP),
-        };
-        let code = match result {
-            Ok(()) => CODE_OK,
-            Err(e) if err::is_error(e) => CODE_IO_ERROR,
-            Err(code) => code,
-        };
-        let _ = reply(m.sender, code, &[]);
     }
 }

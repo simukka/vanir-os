@@ -13,9 +13,10 @@
 //! A service with a volume (RFD 3) has one writer, named by an epoch the control plane assigns
 //! with the deployment. The agent hands it to `storage` (`block::epoch`) at the moment the RFD
 //! fixes: with no old instance, before routing to the new one; with one, once it has drained and
-//! before it is stopped. Until V3, the new instance's writes are refused in between. When
-//! `storage` restarts, it has forgotten the writer, so the agent sends each live writer's epoch
-//! again.
+//! before it is stopped. In between, `storage` holds the new instance's requests: the agent names
+//! it the handoff's candidate (`block::handoff`) just before routing to it, and calls the handoff
+//! off if the epoch is refused (RFD 3, P3). When `storage` restarts, it has forgotten the writer
+//! and the candidate, so the agent sends each live writer's epoch and each handoff again.
 //!
 //! Nothing here blocks: operations (`Op`) advance a step at a time in `advance`, called from
 //! the agent's loop, so the agent keeps serving its other work (the control plane) while a
@@ -310,6 +311,19 @@ impl Agent {
         }
     }
 
+    /// Name deployment `d`'s new instance the candidate of its volume's handoff (RFD 3, P3), or
+    /// call the handoff off. Without a volume or an old instance there is no handoff.
+    fn handoff(&mut self, d: Deploy, on: bool) {
+        let (Some(disk), Some(old), Some(_)) = (self.disk, d.old, d.epoch) else { return };
+        if old == d.new {
+            return;
+        }
+        let new = self.get(d.new);
+        if let Err(e) = block::handoff(disk, new.service(), if on { new.id } else { 0 }) {
+            println!("agent: handoff to {}: {}", new.name, block::code_name(e));
+        }
+    }
+
     /// Notice a restarted `storage`, and send it each live writer's epoch again.
     fn keep_epochs(&mut self) {
         if let Ok(id) = lookup("disk")
@@ -328,6 +342,11 @@ impl Agent {
                 && s.state == State::Live
             {
                 done &= self.assign_epoch(k, epoch).unwrap_or(true);
+            }
+        }
+        if done {
+            for d in self.deploys.into_iter().flatten().filter(|d| d.step == Step::WaitDrained) {
+                self.handoff(d, true);
             }
         }
         self.resend_epochs = !done;
@@ -400,6 +419,8 @@ impl Agent {
                         }
                     }
                 }
+                // With one, the new instance's requests wait from here until it holds the epoch.
+                self.handoff(d, true);
                 if let Err(e) = net::route(self.net, new.id) {
                     println!("agent: routing to {} failed: {}", new.name, net::code_name(e));
                     return d.step;
@@ -421,12 +442,16 @@ impl Agent {
                             self.set(old, State::Drained);
                         }
                         // The epoch moves once the old instance has drained, before it stops
-                        // (RFD 3, P3). A refusal leaves the new instance live without it.
+                        // (RFD 3, P3). A refusal leaves the new instance live without it, and
+                        // calls the handoff off so its held requests are answered.
                         if d.new != old
                             && let Some(epoch) = d.epoch
-                            && self.assign_epoch(d.new, epoch) == Ok(false)
                         {
-                            return d.step;
+                            match self.assign_epoch(d.new, epoch) {
+                                Ok(false) => return d.step,
+                                Ok(true) => {}
+                                Err(_) => self.handoff(d, false),
+                            }
                         }
                         match supervisor::stop(self.supervisor, self.get(old).id) {
                             Ok(()) => self.set(old, State::Stopped),

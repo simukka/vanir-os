@@ -895,10 +895,12 @@ pub fn reply(frame: &mut TrapFrame) {
     client.state = State::Ready;
 }
 
-/// `notify(target, bits) -> 0`: post `bits` (not 0) to a task this one may send to, without
-/// waiting. They reach the target's next `recv` as sender 0, op `NOTIFY_POST`, ORed with any
-/// others not yet received. This is how a server tells a client that something is ready while
-/// only the client ever sends to the server, so the two can't deadlock sending to each other.
+/// `notify(target, bits) -> 0`: post `bits` (not 0) to a task this one may send to, or that may
+/// send to it, without waiting. They reach the target's next `recv` as sender 0, op
+/// `NOTIFY_POST`, ORed with any others not yet received. This is how a server tells a client that
+/// something is ready while only the client ever sends to the server, so the two can't deadlock
+/// sending to each other (RFD 3's writer bit goes from `storage` to slots, which nothing may send
+/// to).
 pub fn notify(frame: &mut TrapFrame) {
     let mut table = TABLE.lock();
     let me = table.current;
@@ -907,7 +909,7 @@ pub fn notify(frame: &mut TrapFrame) {
         frame.rax = err::BAD_TARGET;
         return;
     };
-    if !table.current().task.sends.contains(&to) {
+    if !table.current().task.sends.contains(&to) && !table.get(to).task.sends.contains(&me) {
         events::log(events::IPC_REFUSED, table.current().id(), target, err::NOT_ALLOWED, 0);
         frame.rax = err::NOT_ALLOWED;
         return;

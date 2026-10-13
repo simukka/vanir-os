@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1 and V2 implemented (V1a–V1c, V2a–V2b); V3 planned. V4 will be added here.
+Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3). V4 will be added here.
 
 ## Goal
 
@@ -405,3 +405,13 @@ Where it departs from the plan so far:
   and fetches the image again in the same turn, so `volume-no-key` (the mock control plane's
   scenario for the swap and unattested cases) waits for an instance that started and went away.
   The retry loop itself is older behaviour.
+- **V3: `OP_HANDOFF` carries the service name** as well as the candidate's id (40 bytes), so the
+  agent can call a handoff off by service even if the candidate has gone. Calling off (or
+  naming another candidate) serves what was held before the reply to the agent.
+- **V3: `http` looks for the writer bit after each storage call,** not only after `net::wait`,
+  so its "now the writer of its volume" line comes before the result of the request that was
+  held, which shows the order `storage` guarantees.
+- **V3: the scripts pause in the handoff.** `settle_after_routing` waits 300 ms once the new
+  instance is routed to, so the probe's write is always held, and `volume-fence` and
+  `volume-handoff-off` check exactly one held request. In the run that was checked,
+  `agent-volume`'s peer saw 801 counts, highest 801, none repeated or missing, none FENCED.

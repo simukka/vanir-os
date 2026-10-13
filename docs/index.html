@@ -1001,21 +1001,38 @@ determination 8).</p>
 <pre class="diagram">
  agent: deploy counter v2 into small-1, epoch 2         counter v1 (small-0)   counter v2 (small-1)
    load, start ......................................... writes OK             reads OK, writes FENCED
-   ready, route to small-1; drain small-0 .............. drains                writes FENCED (V1)
-   small-0 drained: OP_EPOCH(2, lease, small-1) ........                       writes OK
+   OP_HANDOFF(counter, small-1); route; drain small-0 .. drains                reads, writes wait
+   small-0 drained: OP_EPOCH(2, lease, small-1) ........                       writer bit; held
+                                                                               requests answered;
+                                                                               writes OK
    stop small-0
 </pre>
 
-<p>Until RFD 3's phase V3, the new instance's writes are <em>refused</em> between the routing
-change and the old instance draining (the diagram's "V1" line); V3 makes them wait instead.
-<code>http</code> uses a volume when its descriptor declares one (<code>counter</code>,
+<p><strong>Handoff</strong> (RFD 3, P3). Between the routing change and the old instance
+draining, the new instance's requests <em>wait</em> rather than fail. Just before routing to
+it, the agent names it the handoff's candidate (<code>block::OP_HANDOFF</code>: service,
+candidate). From then on <code>disk</code> holds the candidate's reads, writes and flushes
+without answering them; the kernel lets a server answer a blocked caller later. When
+<code>OP_EPOCH</code> makes the candidate the writer, <code>disk</code> posts it the
+<strong>writer bit</strong> (<code>block::NOTIFY_WRITER</code>, which every new writer gets) and
+then serves the held requests in order. Until an instance has seen the bit, it must not trust
+anything it cached while read-only; from the bit on, nobody else writes the volume. If the
+epoch is refused, the agent calls the handoff off (candidate 0) and the held requests are
+served as they are: reads succeed, writes get <code>FENCED</code>
+(<code>volume-handoff-off</code>). A client blocked in a call has one request outstanding, so
+<code>disk</code> holds at most one per slot (8 entries; <code>BUSY</code>, which the client
+retries, if ever full). A restarted <code>disk</code> loses what it held (its callers get
+<code>DEAD</code>), and the agent sends the handoff again with the epochs.</p>
+
+<p><code>http</code> uses a volume when its descriptor declares one (<code>counter</code>,
 <code>tests/slots/counter-v*.toml</code>): <code>/count</code> reads a count from block 0, adds
 one and writes it back. It reads block 0 before it says it is ready, and never says so if that
 fails. A task named like a service still gets a volume of its own: the table records each
 volume's kind, and their keys use different salts (<code>volume-kinds</code>).</p>
 
-<p>Events: <code>epoch_changed</code> (volume, epoch, writer slot) and <code>write_fenced</code>
-(volume, slot, epoch; the first refusal per slot and epoch).</p>
+<p>Events: <code>epoch_changed</code> (volume, epoch, writer slot), <code>write_fenced</code>
+(volume, slot, epoch; the first refusal per slot and epoch) and <code>handoff</code> (volume,
+requests held, longest wait in ticks, whether it was called off).</p>
 
 <h3 id="storage-service-keys"><span class="num">13.6</span>Service keys<a class="anchor" href="#storage-service-keys">#</a></h3>
 
@@ -1068,7 +1085,7 @@ under V1's keys (salt <code>vanir-service-v1</code>, from the master key) no lon
 
 <div class="agent"><span class="label">For agents</span><dl>
 <dt>files</dt><dd><code>user/storage/src/main.rs</code>, <code>user/virtio-blk/</code>, <code>user/unlocker/</code>, <code>user/blktest/</code>, <code>block</code>/<code>keys</code>/<code>telemetry</code> modules in <code>user/lib/src/lib.rs</code>, <code>tools/corrupt-disk.py</code></dd>
-<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5, EPOCH 6, SERVICE_KEY 7, FORGET_KEY 8; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7, FENCED 8</dd>
+<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5, EPOCH 6, SERVICE_KEY 7, FORGET_KEY 8, HANDOFF 9; notify bit WRITER 1; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7, FENCED 8</dd>
 <dt>constants</dt><dd><code>MAGIC "VNRSTOR3"</code>, <code>TASK_BLOCKS 256</code>, <code>META_ENTRY 24</code>, header sealed as block <code>u64::MAX</code>; changing the format needs a new magic and an update to <code>tools/corrupt-disk.py</code></dd>
 <dt>gotcha</dt><dd><code>storage-*</code> cases depend on the disk image the previous case left; <code>DISK_RESET=1</code> starts clean</dd>
 </dl></div>
@@ -1456,7 +1473,8 @@ deployments go on meanwhile (<code>user/agent/src/control.rs</code>).</p>
     <code>epoch &lt;n&gt;</code>, and <code>epoch-refused &lt;n&gt;</code> while
     <code>disk</code> refuses the one asked for (<code>agent-epoch-stale</code>). In
     <code>agent-volume</code>, four clients keep counting through a deployment of
-    <code>counter</code>, and no count is answered twice.</li>
+    <code>counter</code>: every request is answered, and the counts are exactly 1 to N, none
+    twice and none missing.</li>
   <li><strong>Telemetry</strong> goes to the control plane through the agent. With no uplink
     driver, the telemetry task keeps its lines in a 16 KiB ring and the agent pulls them
     (<code>telemetry::OP_PULL</code>): if telemetry pushed to the agent while the agent sends to
@@ -1522,7 +1540,7 @@ calls return <code>u64::MAX</code> on error; IPC calls return the IPC error code
 <tr><td><code>read_events(buf, cap)</code></td><td>113</td><td>event reader only &rarr; <code>(count, dropped)</code></td></tr>
 <tr><td><code>stats(buf, cap)</code></td><td>114</td><td>event reader only: uptime, memory, interrupts, per-task state</td></tr>
 <tr><td><code>measurements(buf, cap)</code></td><td>115</td><td>TPM task only &rarr; <code>(count, TPM address)</code>; the boot measurement log</td></tr>
-<tr><td><code>notify(target, bits)</code></td><td>116</td><td>post bits to a task in <code>sends</code> without waiting; it gets them in <code>recv</code> as <code>NOTIFY_POST</code></td></tr>
+<tr><td><code>notify(target, bits)</code></td><td>116</td><td>post bits, without waiting, to a task in <code>sends</code> or one that has the caller in its own <code>sends</code> (a server to its client); it gets them in <code>recv</code> as <code>NOTIFY_POST</code>, or from <code>posted()</code>, which only polls</td></tr>
 <tr><td><code>halt(code)</code></td><td>117</td><td>supervisor only: stop the system, reporting every task's state</td></tr>
 <tr><td><code>task_listen(id, buf, cap)</code></td><td>118</td><td>a task's service, flags (<code>routes</code>, <code>connects</code>), declared ports and signed version (<code>ListenInfo</code>); for a slot, from its descriptor</td></tr>
 <tr><td><code>slot_stage(slot, offset, buf, len)</code></td><td>119</td><td>loader only: copy part of an image into an empty slot's image area</td></tr>
@@ -1566,7 +1584,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Measured boot + TPM quotes</td><td>a host trusting a VM that booted something else</td><td><code>measured-*</code>, <code>attest-*</code></td></tr>
 <tr><td>Only the storage task may use the block driver</td><td>tasks reading the raw disk</td><td><code>storage-no-driver</code></td></tr>
 <tr><td>A volume per task, chosen by kernel-checked name</td><td>tasks reading or writing each other's data</td><td><code>storage-isolation</code></td></tr>
-<tr><td>A service's volume, from its signed descriptor; one writer, named by an epoch only the agent can assign</td><td>two instances writing one volume; an old writer writing after a handoff</td><td><code>volume-fence</code>, <code>volume-persist</code>, <code>volume-none</code>, <code>volume-kinds</code></td></tr>
+<tr><td>A service's volume, from its signed descriptor; one writer, named by an epoch only the agent can assign; the candidate's requests held during a handoff</td><td>two instances writing one volume; an old writer writing after a handoff; a new instance reading data the old one is still changing</td><td><code>volume-fence</code>, <code>volume-persist</code>, <code>volume-none</code>, <code>volume-kinds</code>, <code>volume-handoff-off</code>, <code>agent-volume</code></td></tr>
 <tr><td>Encryption at rest (XChaCha20-Poly1305)</td><td>plain text on the disk image</td><td><code>storage-at-rest</code></td></tr>
 <tr><td>Authenticated blocks, bound to volume, block and counter</td><td>changed or moved ciphertext read as data</td><td><code>storage-tampered</code>, <code>storage-bad-block</code>, <code>storage-header-tampered</code></td></tr>
 <tr><td>Key per volume; locked until the key arrives</td><td>reading the disk without the key</td><td><code>storage-wrong-key</code>, <code>storage-locked</code></td></tr>
@@ -1610,9 +1628,8 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
     guaranteed durable before a flush.</li>
   <li><strong>Volumes are never freed</strong>, and a fixed task's volume is always 256 blocks.
     A service's volume is sized by its descriptor, and that size can't change.</li>
-  <li><strong>Writes are refused during a handoff</strong> of a service with a volume, from the
-    routing change until the old instance has drained (RFD 3, V3 makes them wait). Writer leases
-    are recorded, not enforced.</li>
+  <li><strong>Writer leases are recorded, not enforced,</strong> and volumes don't move between
+    nodes yet (RFD 3, V4).</li>
   <li><strong>The control plane holds every service's key</strong> (RFD 8, vector 7), in plain
     files for the mock (<code>build/cp-volume-keys/</code>). Keys are never rotated.</li>
   <li><strong>One key release per boot.</strong> In the attested flow the host says
@@ -1757,7 +1774,7 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>129 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>130 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -1772,7 +1789,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>measured boot, attestation</td><td><code>measured-boot</code> <code>measured-rejected</code> <code>no-tpm</code> <code>attest-record</code> <code>attest-verify</code> <code>attest-replay</code> <code>attest-tampered</code> <code>attest-other-version</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>block</td><td><code>blk-rw</code> <code>blk-persist</code> <code>blk-persist-negative</code> <code>blk-restart</code></td><td></td></tr>
 <tr><td>storage</td><td><code>storage-isolation</code> <code>storage-old-format</code> <code>storage-persist</code> <code>storage-at-rest</code> <code>storage-tampered</code> <code>storage-header-tampered</code> <code>storage-wrong-key</code> <code>storage-locked</code> <code>storage-no-driver</code> <code>storage-events</code> <code>storage-bad-block</code> <code>storage-restart</code> <code>storage-blk-restart</code></td><td></td></tr>
-<tr><td>service volumes</td><td><code>volume-fence</code> <code>volume-persist</code> <code>volume-wrong-key</code> <code>volume-size-fixed</code> <code>volume-none</code> <code>volume-no-key</code> <code>volume-forget</code> <code>volume-kinds</code> <code>volume-storage-restart</code> <code>volume-writer-restart</code></td><td><code>volume-persist</code> and <code>volume-wrong-key</code> use the disk <code>volume-fence</code> leaves</td></tr>
+<tr><td>service volumes</td><td><code>volume-fence</code> <code>volume-persist</code> <code>volume-wrong-key</code> <code>volume-size-fixed</code> <code>volume-none</code> <code>volume-no-key</code> <code>volume-forget</code> <code>volume-handoff-off</code> <code>volume-kinds</code> <code>volume-storage-restart</code> <code>volume-writer-restart</code></td><td><code>volume-persist</code> and <code>volume-wrong-key</code> use the disk <code>volume-fence</code> leaves</td></tr>
 <tr><td>key release</td><td><code>attest-storage-record</code> <code>attest-unlock</code> <code>attest-unlock-persist</code> <code>attest-unlock-refused</code></td><td>KVM, swtpm, vsock</td></tr>
 <tr><td>NIC</td><td><code>nic-arp-ping</code> <code>nic-restart</code> <code>nic-no-grant</code></td><td>free UDP ports 18090-18091</td></tr>
 <tr><td>sockets, HTTP</td><td><code>build-http-port-clash</code> <code>http-get</code> <code>http-undeclared-port</code> <code>net-restart</code> <code>http-restart</code></td><td>free TCP port 8080</td></tr>

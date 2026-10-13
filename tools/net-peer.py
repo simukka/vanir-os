@@ -578,9 +578,9 @@ def under_load(args, path):
 @scenario
 def count_under_deploy(args):
     """Four keep-alive clients ask counter for /count, then for / (which instance answered),
-    while the agent deploys counter v2 over v1 (RFD 3, V1). Every count answered 200 must be
-    new: a repeat would be an update made from stale data, or lost. Until V3, the new instance's
-    writes are refused while the old one drains, so 503 FENCED is allowed; nothing else is."""
+    while the agent deploys counter v2 over v1 (RFD 3). Every request must be answered 200 (V3:
+    the new instance's requests wait during the handoff, so none is FENCED), and the counts must
+    be exactly 1..N: a repeat would be an update made from stale data, a gap a lost write."""
     path = ["counter v1 on small-0", "counter v2 on small-1"]
     deadline = time.monotonic() + args.timeout - 5
     if not wait_for_instance(path[0], deadline):
@@ -626,13 +626,14 @@ def count_under_deploy(args):
     for t in threads:
         t.join()
     repeats = len(counts) - len(set(counts))
+    missing = len(set(range(1, max(counts, default=0) + 1)) - set(counts))
     followed = sum(1 for a in answers if seen(a) == path)
-    say(f"{len(counts)} counts, highest {max(counts, default=0)}, {repeats} repeated; {len(fenced)} FENCED; {len(failures)} failed")
+    say(f"{len(counts)} counts, highest {max(counts, default=0)}, {repeats} repeated, {missing} missing; {len(fenced)} FENCED; {len(failures)} failed")
     for f in failures[:5]:
         say(f"failure: {f}")
     say(f"clients that followed {' -> '.join(path)}: {followed}/4")
     time.sleep(1)
-    return finish(not failures and repeats == 0 and followed == 4 and len(counts) > 0)
+    return finish(not failures and not fenced and repeats == 0 and missing == 0 and followed == 4 and len(counts) > 0)
 
 
 @scenario

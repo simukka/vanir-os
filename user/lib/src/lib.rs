@@ -150,8 +150,9 @@ pub const NOTIFY_TIMER: u64 = 3;
 /// holds them.
 pub const NOTIFY_POST: u64 = 4;
 
-/// Post `bits` to task `target` (which must be in our `sends`) without waiting: it gets them
-/// in its next `recv` as op `NOTIFY_POST`. Fails like `send` (DEAD, NOT_ALLOWED, ...).
+/// Post `bits` to task `target` (which must be in our `sends`, or have us in its own) without
+/// waiting: it gets them in its next `recv` as op `NOTIFY_POST`. Fails like `send` (DEAD,
+/// NOT_ALLOWED, ...).
 pub fn notify(target: u64, bits: u64) -> Result<(), u64> {
     let (status, _, _) = syscall6(SYS_NOTIFY, [target, bits, 0, 0, 0, 0]);
     if status == 0 { Ok(()) } else { Err(status) }
@@ -163,6 +164,15 @@ pub const RECV_TIMEOUT: u64 = 2;
 /// take a message (or notification) that is already waiting.
 pub fn recv_timeout(buf: &mut [u8], ticks: u64) -> Result<Message, u64> {
     recv_raw(buf, RECV_TIMEOUT, ticks)
+}
+
+/// Take the bits posted to us with `notify` since we last looked (0 if none), without waiting.
+/// Only for a task nothing sends to (a slot's instance): a message waiting would be refused.
+pub fn posted() -> u64 {
+    match recv_timeout(&mut [], 0) {
+        Ok(m) if m.sender == 0 && m.op == NOTIFY_POST => m.len as u64,
+        _ => 0,
+    }
 }
 
 fn recv_raw(buf: &mut [u8], flags: u64, ticks: u64) -> Result<Message, u64> {
@@ -379,6 +389,25 @@ pub mod block {
     pub fn forget_key(storage: u64, service: &[u8]) -> Result<(), u64> {
         call(storage, OP_FORGET_KEY, &service_name(service), &mut []).map(|_| ())
     }
+
+    /// Storage task (RFD 3, P3): message is a service name (32 bytes, zero padded) and the
+    /// candidate's task id (u64, little endian), or 0. From now until the candidate holds the
+    /// service volume's epoch, its reads, writes and flushes are held and answered once it does.
+    /// 0, or another candidate, calls the handoff off: what was held is answered at once, as if
+    /// it had just arrived. Only the task with `loads = true` may send it.
+    pub const OP_HANDOFF: u64 = 9;
+
+    pub fn handoff(storage: u64, service: &[u8], candidate: u64) -> Result<(), u64> {
+        let mut msg = [0u8; 40];
+        msg[..32].copy_from_slice(&service_name(service));
+        msg[32..].copy_from_slice(&candidate.to_le_bytes());
+        call(storage, OP_HANDOFF, &msg, &mut []).map(|_| ())
+    }
+
+    /// Bit the storage task posts (`notify`) to an instance that has just become its volume's
+    /// writer, before it answers any request it held (RFD 3, P1). From then on nobody else writes
+    /// the volume, so what the instance caches stays current.
+    pub const NOTIFY_WRITER: u64 = 1;
 
     pub fn op(code: u64, block: u64) -> u64 {
         code | block << 8

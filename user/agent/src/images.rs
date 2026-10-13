@@ -274,6 +274,18 @@ fn deployment_script() -> Option<u64> {
     None
 }
 
+/// `settle`, but wait 300 ms once slot `k` is routed to, so its instance's next probe write
+/// lands in the handoff (RFD 3, P3) whatever the old instance's drain takes.
+#[allow(dead_code)]
+fn settle_after_routing(agent: &mut Agent, k: usize) {
+    while agent.get(k).state != crate::lifecycle::State::Live && !agent.idle() {
+        agent.advance();
+        sleep(1);
+    }
+    sleep(30);
+    settle(agent);
+}
+
 /// Keep the agent's loop turning for `ticks` (it notices a restarted storage task there).
 #[allow(dead_code)]
 fn run_for(agent: &mut Agent, ticks: u64) {
@@ -295,7 +307,8 @@ fn volume_script() -> Option<u64> {
         feature = "script-volume-persist",
         feature = "script-volume-resize",
         feature = "script-volume-none",
-        feature = "script-volume-forget"
+        feature = "script-volume-forget",
+        feature = "script-volume-handoff-off"
     )) {
         return None;
     }
@@ -332,7 +345,7 @@ fn volume_script() -> Option<u64> {
     {
         sleep(30);
         agent.deploy(s1, Some(COUNTER_V2), None, Some((2, 0)));
-        settle(&mut agent);
+        settle_after_routing(&mut agent, s1);
         sleep(30);
         println!("agent: starting counter v1 in small-0 again, outside any deployment");
         if let Err(e) = vanir_user::supervisor::start(agent.supervisor(), agent.get(s0).id) {
@@ -354,6 +367,17 @@ fn volume_script() -> Option<u64> {
         agent.deploy(s1, Some(COUNTER_V1), None, Some((2, 0)));
         settle(&mut agent);
         println!("agent: after the key was forgotten, small-1 is {}", agent.get(s1).state.name());
+        return Some(0);
+    }
+    #[cfg(feature = "script-volume-handoff-off")]
+    {
+        // Epoch 1 again, for another slot: refused once v1 has drained, so the handoff to v2 is
+        // called off, and the probe write it held is answered FENCED.
+        sleep(30);
+        agent.deploy(s1, Some(COUNTER_V2), None, Some((1, 0)));
+        settle_after_routing(&mut agent, s1);
+        sleep(30);
+        println!("agent: after the refused epoch, small-1 is {}", agent.get(s1).state.name());
         return Some(0);
     }
     #[cfg(feature = "script-volume-resize")]

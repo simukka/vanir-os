@@ -58,3 +58,4 @@ script-volume-persist = ["test-images"]  # (a second boot) v2 with epoch 2 again
 script-volume-resize = ["test-images"]   # v1 with epoch 1, then v3 (another volume size); exit
 script-volume-none = ["test-images"]     # web v1 (no volume) in small-0; exit
 script-volume-forget = ["test-images"]   # v1 with epoch 1, drained and committed (key forgotten), then v1 again; exit
+script-volume-handoff-off = ["test-images"] # v1 with epoch 1, then v2 with epoch 1 (refused after the drain: handoff called off); exit

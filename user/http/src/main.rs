@@ -17,7 +17,8 @@
 //! every 100 ms after, and print each change in the result, so tests see fencing without client
 //! traffic. It also checks, once, that we can't name a writer ourselves (`OP_EPOCH`), and in a
 //! slot without a volume that the storage task refuses us. If the storage task restarts, we
-//! find it again.
+//! find it again. When we become the volume's writer, the storage task posts us a bit
+//! (`block::NOTIFY_WRITER`), and we print that we have it.
 //!
 //! When `net` tells us to drain, we stop accepting and answer each connection's next request
 //! with `Connection: close`, then say `OP_DONE` once none are left. Idle connections are left
@@ -128,6 +129,13 @@ impl Write for Buf<'_> {
         self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
         self.len += n;
         Ok(())
+    }
+}
+
+/// Print that instance `name` became its volume's writer, if the storage task's bit is posted.
+fn writer_bit(name: &[u8]) {
+    if vanir_user::posted() & block::NOTIFY_WRITER != 0 {
+        println!("{}: now the writer of its volume", core::str::from_utf8(name).unwrap_or("?"));
     }
 }
 
@@ -312,6 +320,15 @@ impl Server {
         }
     }
 
+    /// Whether the storage task said we are its volume's writer now (RFD 3, P1): it posts the bit
+    /// before answering a request it held, so we look after each request too. We cache nothing,
+    /// so there is nothing to throw away; the line is for the tests.
+    fn check_writer(&mut self) {
+        if self.disk.is_some() {
+            writer_bit(&self.name[..self.name_len]);
+        }
+    }
+
     /// `volume-probe`: write scratch block 1 if it's time, and print a change in the result.
     /// Returns when to probe next.
     #[cfg(feature = "volume-probe")]
@@ -322,6 +339,7 @@ impl Server {
         }
         if now >= self.probe.0 {
             let code = block::write(disk, 1, &[0x5a; BLOCK_SIZE]).err().unwrap_or(block::CODE_OK);
+            self.check_writer();
             if self.probe.1 != Some(code) {
                 println!("{}: writes {}", self.name(), block::code_name(code));
                 self.probe.1 = Some(code);
@@ -495,7 +513,9 @@ impl Server {
                         let _ = write!(w, "hello from {}\n", core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"));
                         200
                     } else if let (b"/count", Some(disk)) = (r.path, self.disk) {
-                        match count_on_disk(disk) {
+                        let counted = count_on_disk(disk);
+                        writer_bit(&self.name[..self.name_len]);
+                        match counted {
                             Ok(n) => {
                                 let _ = write!(w, "{}\n", n);
                                 200
@@ -698,6 +718,7 @@ fn main() -> u64 {
                 continue;
             }
         };
+        s.check_writer();
         let now = uptime();
         for e in &events[..n] {
             if e.flags & EV_DRAIN != 0 {
