@@ -17,7 +17,7 @@
 //!   |---|---|---|
 //!   | `S` | control plane | desired state: length (u32 LE), the document, Ed25519 signature |
 //!   | `C` | control plane | image chunk: hash (32), offset (u32 LE), bytes |
-//!   | `E` | control plane | image end: hash (32), signature file (176), descriptor (256) |
+//!   | `E` | control plane | image end: hash (32), signature file (176), descriptor (256 or 512: format 1 or 2) |
 //!   | `R` | agent | report (text) |
 //!   | `G` | agent | get image: hash (32), slot name |
 //!   | `T` | agent | telemetry JSON lines, pulled from the telemetry task |
@@ -57,6 +57,7 @@
 //! - **Update** (RFD 2, P3, determination 1): a node with instances refuses, and says how many in
 //!   its report; an empty one asks the supervisor to reboot it into the image installed now.
 
+use vanir_abi::descriptor;
 use crate::Image;
 use crate::lifecycle::{Agent, MAX_SLOTS, State};
 use crate::transfer::Transfers;
@@ -157,7 +158,7 @@ struct VolumeKey {
 
 /// Signature file and descriptor of images fetched into each slot (they outlive the frames
 /// they came in, as `Image` borrows them).
-static mut FETCHED: [([u8; 176], [u8; 256]); MAX_SLOTS] = [([0; 176], [0; 256]); MAX_SLOTS];
+static mut FETCHED: [([u8; 176], [u8; descriptor::LEN_V2], usize); MAX_SLOTS] = [([0; 176], [0; descriptor::LEN_V2], 0); MAX_SLOTS];
 static mut RX: [u8; MAX_FRAME + 2] = [0; MAX_FRAME + 2];
 static mut FRAME: [u8; MAX_FRAME] = [0; MAX_FRAME];
 
@@ -443,13 +444,15 @@ impl Control {
                     self.fetch = None;
                 }
             }
-            b'E' if body.len() == 32 + 176 + 256 => {
+            b'E' if body.len() == 32 + 176 + descriptor::LEN_V1 || body.len() == 32 + 176 + descriptor::LEN_V2 => {
                 let hash: [u8; 32] = body[..32].try_into().unwrap();
                 let Some(f) = self.fetch.filter(|f| f.hash == hash) else { return };
                 let fetched = unsafe { &mut *(&raw mut FETCHED) };
+                let n = body.len() - 208;
                 fetched[f.slot].0.copy_from_slice(&body[32..208]);
-                fetched[f.slot].1.copy_from_slice(&body[208..464]);
-                let (sig, desc) = (&fetched[f.slot].0, &fetched[f.slot].1);
+                fetched[f.slot].1[..n].copy_from_slice(&body[208..]);
+                fetched[f.slot].2 = n;
+                let (sig, desc) = (&fetched[f.slot].0, &fetched[f.slot].1[..n]);
                 let image = Image { name: "fetched", elf: &[], descriptor: desc, sig };
                 if image.hash() != hash {
                     println!("agent: a fetched image's signature file isn't the one asked for");
