@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3), and V4a; V4b and V4c planned.
+Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3), and V4a–V4b; V4c planned.
 
 ## Goal
 
@@ -570,3 +570,20 @@ Where it departs from the plan so far:
 - **V4a: one transfer at a time per node,** and the agent's `Control::turn` hands the transfer
   every management-stack event that isn't the control plane's (net's events are level
   triggered, so the shared wait loses none).
+- **V4b: the agent polls for mirrored writes** (`OP_MIRROR_PENDING` each turn, and at once after
+  each `A`) instead of `storage` posting it a bit: the agent spends its turn blocked in
+  `net::wait`, which a bit can't cut short, so a bit would be seen no sooner. In the run that was
+  checked, `transfer-mirror` mirrored 163 writes in 5 s, the slowest round trip 2 ticks, and the
+  peer's 8072 counts were all answered, none lost.
+- **V4b: `OP_IMPORT` carries only the ciphertext** (4096 bytes is the most an IPC message holds),
+  so the volume comes from the entry `OP_IMPORT_ENTRY` gave. `OP_HAND_OVER` and `OP_DIGEST` keep
+  their numbers (20, 21) for V4c. The source prints how many writes it mirrored when the
+  transfer ends, and `transfer-mirror` checks it is more than none.
+- **V4b: frames `B` aren't acknowledged,** only mirrored writes (`W`/`A`). A target that refuses
+  a copied block says so with `Q`; the digest compared at the handoff (V4c) catches anything else.
+- **V4b: `transfer-connect` runs counter on node a,** since copying now starts as soon as the
+  two connect, and a source with no volume gives up ("no volume to send").
+- **Flaky test, from before this step.** `swap-under-load` (RFD 1) failed once in V4b's full
+  run with every request answered: the switcher printed "web-1 drained" before `net` did, and
+  the test's regex wants `net`'s line first. It passed when run again; nothing in V4 touches
+  either task.

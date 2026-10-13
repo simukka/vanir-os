@@ -404,6 +404,40 @@ pub mod block {
         call(storage, OP_HANDOFF, &msg, &mut []).map(|_| ())
     }
 
+    /// Storage task, moving a service's volume to another node (RFD 3, P4–P5). Only the task
+    /// with `loads = true` may send these; each message starts with the service name (32
+    /// bytes, zero padded). Blocks travel as they are on disk: ciphertext, write counter and tag.
+    ///
+    /// Source: the ciphertext of data block `b` (in the op's block field), whose counter and
+    /// tag `OP_EXPORT_ENTRY` then gives (b, counter, tag: 32 bytes), as they were when it was
+    /// read. A block never written has counter 0, and isn't sent.
+    pub const OP_EXPORT: u64 = 10;
+    pub const OP_EXPORT_ENTRY: u64 = 11;
+    /// Metadata block `m` as it is on disk: 170 (counter, tag) entries of 24 bytes.
+    pub const OP_EXPORT_META: u64 = 12;
+    /// The volume's size in data blocks (u64) and its header's 96 bytes (counter, tag, sealed
+    /// fields).
+    pub const OP_EXPORT_HEADER: u64 = 13;
+    /// Target: name, size (u64) and the source's header: the volume is made, or emptied, with
+    /// that header. Refused while an instance writes it or a handoff waits on it.
+    pub const OP_IMPORT_HEADER: u64 = 14;
+    /// Target: name, then b, counter (u64s) and tag (16) of the block `OP_IMPORT` brings next
+    /// (its message is the ciphertext alone, so it doesn't start with the name).
+    pub const OP_IMPORT_ENTRY: u64 = 15;
+    /// Target: block `b`'s ciphertext. It must open with the service key, the volume name, `b`
+    /// and the counter from `OP_IMPORT_ENTRY` (else CODE_INTEGRITY); then it is stored as it is.
+    /// A counter lower than the one the block has already is ignored.
+    pub const OP_IMPORT: u64 = 16;
+    /// Source: name and 1 or 0. While on, each write the writer makes is made and then held,
+    /// unanswered, until `OP_MIRROR_ACK`: the agent fetches it (`OP_MIRROR_PENDING` gives its
+    /// block number, or nothing) and sends it to the target. Off answers a held write.
+    pub const OP_MIRROR: u64 = 17;
+    pub const OP_MIRROR_PENDING: u64 = 18;
+    pub const OP_MIRROR_ACK: u64 = 19;
+    /// Wipe the volume (header and counters: every block reads as never written) and free its
+    /// space for a volume of the same size. Refused while an instance writes it.
+    pub const OP_DROP: u64 = 22;
+
     /// Bit the storage task posts (`notify`) to an instance that has just become its volume's
     /// writer, before it answers any request it held (RFD 3, P1). From then on nobody else writes
     /// the volume, so what the instance caches stays current.

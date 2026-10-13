@@ -1086,7 +1086,7 @@ under V1's keys (salt <code>vanir-service-v1</code>, from the master key) no lon
 
 <div class="agent"><span class="label">For agents</span><dl>
 <dt>files</dt><dd><code>user/storage/src/main.rs</code>, <code>user/virtio-blk/</code>, <code>user/unlocker/</code>, <code>user/blktest/</code>, <code>block</code>/<code>keys</code>/<code>telemetry</code> modules in <code>user/lib/src/lib.rs</code>, <code>tools/corrupt-disk.py</code></dd>
-<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5, EPOCH 6, SERVICE_KEY 7, FORGET_KEY 8, HANDOFF 9; notify bit WRITER 1; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7, FENCED 8</dd>
+<dt>protocol</dt><dd><code>op = code | block &lt;&lt; 8</code>; ops READ 1, WRITE 2, FLUSH 3, INFO 4, UNLOCK 5, EPOCH 6, SERVICE_KEY 7, FORGET_KEY 8, HANDOFF 9, EXPORT 10, EXPORT_ENTRY 11, EXPORT_META 12, EXPORT_HEADER 13, IMPORT_HEADER 14, IMPORT_ENTRY 15, IMPORT 16, MIRROR 17, MIRROR_PENDING 18, MIRROR_ACK 19, DROP 22 (10 to 22: the agent only, moving a volume, 15.7); notify bit WRITER 1; volume kinds TASK 1, SERVICE 2, FREE 3; codes OK 0, BUSY 1, BAD_OP 2, OUT_OF_RANGE 3, IO_ERROR 4, LOCKED 5, INTEGRITY 6, NOT_ALLOWED 7, FENCED 8</dd>
 <dt>constants</dt><dd><code>MAGIC "VNRSTOR3"</code>, <code>TASK_BLOCKS 256</code>, <code>META_ENTRY 24</code>, header sealed as block <code>u64::MAX</code>; changing the format needs a new magic and an update to <code>tools/corrupt-disk.py</code></dd>
 <dt>gotcha</dt><dd><code>storage-*</code> cases depend on the disk image the previous case left; <code>DISK_RESET=1</code> starts clean</dd>
 </dl></div>
@@ -1555,8 +1555,54 @@ only sets the transfer up (<code>user/agent/src/transfer.rs</code>).</p>
     <code>transfer-wrong-peer</code>). The control plane already holds the volume keys, so trusting
     its ticket for the peer adds no trust.</li>
   <li><strong>Reports</strong> carry a line for the transfer: <code>transfer &lt;service&gt;
-    send|receive &lt;phase&gt; [why]</code>, with phases <code>waiting</code>,
-    <code>connected</code> and <code>aborted</code>.</li>
+    send|receive &lt;phase&gt; [detail]</code>, with phases <code>waiting</code>,
+    <code>connected</code>, <code>copying</code>, <code>mirroring</code> and
+    <code>aborted</code> (with why).</li>
+</ul>
+
+<figure>
+<pre class="diagram">
+  source agent                         target agent                     target disk
+    | -- H size, header (96 bytes) -----&gt; | -- OP_IMPORT_HEADER -----------&gt; | made or emptied; header must open
+    | -- B b, counter, tag, ciphertext -&gt; | -- OP_IMPORT_ENTRY, OP_IMPORT --&gt; | must open with the service key
+    |    ... every block written ...      |                                  |
+    | -- R blocks in the round ---------&gt; |                                  |
+    |    rounds until one sends &lt;= 2     |                                  |
+  OP_MIRROR on; a last round; M -------&gt; |                                  |
+  a write by the writer: made, held      |                                  |
+    | -- W the write -------------------&gt; | -- OP_IMPORT ------------------&gt; |
+    | &lt;-- A stored ---------------------- |                                  |
+  OP_MIRROR_ACK: the writer is answered  |                                  |
+</pre>
+<figcaption>Copying, catching up and mirroring (frames inside the Noise transport)</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Blocks travel as they are on disk:</strong> ciphertext, write counter and tag
+    (<code>block::OP_EXPORT</code>, <code>OP_EXPORT_ENTRY</code>, kept together when read). The
+    seal binds only the volume name, the block number within the volume and the counter, so a
+    block is valid on any disk with the service's key, and the target's <code>disk</code> checks
+    each one opens before storing it (<code>OP_IMPORT</code>; <code>transfer-corrupt</code>: a bit
+    changed on the way is refused, and the target drops its copy).</li>
+  <li><strong>Catching up.</strong> The source compares each block's counter
+    (<code>OP_EXPORT_META</code>) with the one it last sent, and sends what changed, in rounds,
+    until a round sends at most 2 blocks.</li>
+  <li><strong>Mirroring.</strong> The source's <code>disk</code> then makes each write by the
+    writer and holds its reply (<code>OP_MIRROR</code>); the agent finds it each turn
+    (<code>OP_MIRROR_PENDING</code>), sends it, and answers it (<code>OP_MIRROR_ACK</code>) once
+    the target says it is stored. A last round catches what changed before mirroring began. A
+    write is acknowledged only once both nodes have it (<code>transfer-mirror</code>: four
+    clients counting, every count answered, none lost).</li>
+  <li><strong>Giving up.</strong> If the target doesn't store a mirrored write within 2 s, the
+    source stops mirroring, answers the held write (it is on the source) and writes alone
+    (<code>transfer-stall</code>). Either side's agent tells the other it is giving up
+    (<code>Q</code>), and a ticket withdrawn or expired ends the transfer too: the source stops
+    mirroring and the target drops what it received (<code>OP_DROP</code>: header and counters
+    wiped, so every block reads as never written, and the space kept for the next volume of the
+    same size).</li>
+  <li><strong>Limits.</strong> One transfer at a time per node; volumes of at most 4096 blocks;
+    no rate limit (RFD 3, P5 question 1); a dropped transfer starts again from the beginning,
+    with new tickets.</li>
 </ul>
 
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
@@ -1644,6 +1690,7 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
 <tr><td>Desired state signed, with a generation that only rises</td><td>forged, replayed or reordered commands</td><td><code>agent-signed-state</code></td></tr>
 <tr><td>A node with instances refuses to update; moves through drains</td><td>a node update cutting traffic; failed requests during a move</td><td><code>agent-update-refused</code>, <code>move-under-load</code>, <code>evacuate-update</code></td></tr>
 <tr><td>A volume transfer only between the two nodes the control plane named, each checking the other's key</td><td>a node fetching a volume it wasn't given a ticket for; a stranger posing as the target</td><td><code>transfer-connect</code>, <code>transfer-wrong-peer</code></td></tr>
+<tr><td>Volumes travel sealed, and the target checks every block; a write is acknowledged only once both nodes have it; a target that stalls costs at most 2 s of writes</td><td>a block changed in transit stored on the target; a write lost in a move; a move stopping the service</td><td><code>transfer-corrupt</code>, <code>transfer-mirror</code>, <code>transfer-stall</code></td></tr>
 <tr><td>Restart forever, with exponential backoff</td><td>crashing a service to take it down for good; a crash loop eating the CPU</td><td><code>crash-loop</code>, <code>backoff-reset</code></td></tr>
 <tr><td>Ports declared in the manifest, checked by <code>net</code> through the kernel</td><td>a service listening where it wasn't given</td><td><code>http-undeclared-port</code>, <code>build-http-port-clash</code></td></tr>
 <tr><td>Separate management stack, NIC and driver</td><td>a data-network flood or compromise cutting off the control plane</td><td><code>mgmt-separate</code>, <code>mgmt-under-flood</code></td></tr>
@@ -1673,8 +1720,9 @@ drivers), <code>NOTIFY_TIMER</code> (3) or <code>NOTIFY_POST</code> (4, bits fro
   <li><strong>Storage isn't crash-consistent.</strong> Data is written before its metadata; a
     crash in between leaves that block failing its integrity check until rewritten. Nothing is
     guaranteed durable before a flush.</li>
-  <li><strong>Volumes are never freed</strong>, and a fixed task's volume is always 256 blocks.
-    A service's volume is sized by its descriptor, and that size can't change.</li>
+  <li><strong>Volumes are only freed when they move away</strong> (a dropped copy), and the
+    space is reused only by a volume of the same size. A fixed task's volume is always 256
+    blocks. A service's volume is sized by its descriptor, and that size can't change.</li>
   <li><strong>Writer leases are recorded, not enforced,</strong> and volumes don't move between
     nodes yet (RFD 3, V4).</li>
   <li><strong>The control plane holds every service's key</strong> (RFD 8, vector 7), in plain
@@ -1821,7 +1869,7 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>132 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>135 cases, one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -1846,7 +1894,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
 <tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-volume</code> <code>agent-epoch-stale</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code> <code>agent-volume-key</code> <code>agent-volume-key-swap</code> <code>agent-volume-unattested</code></td><td>port 7000; KVM, swtpm for <code>agent-attested</code> to <code>agent-volume-key-swap</code></td></tr>
-<tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code> <code>transfer-connect</code> <code>transfer-wrong-peer</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
+<tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code> <code>transfer-connect</code> <code>transfer-mirror</code> <code>transfer-stall</code> <code>transfer-corrupt</code> <code>transfer-wrong-peer</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>
 <tr><td>slots: measurement</td><td><code>slot-measured</code> <code>slot-tpm-busy</code> <code>slot-attest</code></td><td>KVM, swtpm; vsock for <code>slot-attest</code></td></tr>
 </table>
 <p>Cases needing vsock are skipped (printed as <code>SKIP</code>) when <code>/dev/vhost-vsock</code>

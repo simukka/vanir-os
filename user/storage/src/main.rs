@@ -36,6 +36,13 @@
 //! they are served at once, as if they had just arrived. A client blocked in a call has one
 //! request outstanding, so there is at most one held request per slot.
 //!
+//! **Moving a volume (RFD 3, P4–P5).** The agent moves a service's volume to another node
+//! block by block, as the blocks are on disk: the source exports ciphertext, counters and tags
+//! (`OP_EXPORT*`), and the target imports them (`OP_IMPORT*`), checking each block opens with
+//! the service key before storing it. While the source mirrors (`OP_MIRROR`), each write by the
+//! writer is held after it is made, until the agent says the target has it too. A dropped volume
+//! (`OP_DROP`) is wiped and its space reused by the next volume of the same size.
+//!
 //! Keys are only ever in memory. The task starts locked, answering CODE_LOCKED: it asks the key
 //! server ("keys") for the master key if it may send to one, and otherwise waits for OP_UNLOCK
 //! (from "attest", after the host released the key). A restarted storage task starts locked
@@ -63,7 +70,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use vanir_user::block::{
     self, BLOCK_SIZE, CODE_BAD_OP, CODE_FENCED, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE,
-    NOTIFY_WRITER, OP_EPOCH, OP_FLUSH, OP_FORGET_KEY, OP_HANDOFF, OP_INFO, OP_READ, OP_SERVICE_KEY, OP_UNLOCK, OP_WRITE, split,
+    NOTIFY_WRITER, OP_DROP, OP_EPOCH, OP_EXPORT, OP_EXPORT_ENTRY, OP_EXPORT_HEADER, OP_EXPORT_META, OP_FLUSH, OP_FORGET_KEY, OP_HANDOFF,
+    OP_IMPORT, OP_IMPORT_ENTRY, OP_IMPORT_HEADER, OP_INFO, OP_MIRROR, OP_MIRROR_ACK, OP_MIRROR_PENDING, OP_READ, OP_SERVICE_KEY,
+    OP_UNLOCK, OP_WRITE, split,
 };
 use vanir_user::keys::{self, OP_MASTER_KEY};
 use vanir_user::telemetry::{self, INTEGRITY_ERROR, Record, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
@@ -90,6 +99,10 @@ const HEADER_FIELDS: usize = 72;
 /// Volume kinds, in the table and the header.
 const KIND_TASK: u8 = 1;
 const KIND_SERVICE: u8 = 2;
+/// A freed volume's space, kept for the next volume of the same size.
+const KIND_FREE: u8 = 3;
+/// A header's meaningful bytes: counter, tag and sealed fields.
+const HEADER_BYTES: usize = 24 + HEADER_FIELDS;
 /// Tasks that may hand over the master key.
 const UNLOCKERS: [&[u8]; 2] = [b"keys", b"attest"];
 const MAX_VOLUMES: usize = BLOCK_SIZE / ENTRY;
@@ -116,6 +129,10 @@ struct Volume {
     fenced_seen: u64,
     /// The handoff's candidate (task id), whose requests are held until it is the writer.
     candidate: Option<u64>,
+    /// Mirroring to another node (RFD 3, P4): the writer's last write, made and not yet
+    /// answered (its id and block), until the agent says the target has it.
+    mirror: bool,
+    mirror_pending: Option<(u64, u64)>,
 }
 
 /// Metadata blocks for `blocks` data blocks.
@@ -170,6 +187,10 @@ struct Storage {
     held_seq: u64,
     /// A volume whose held requests are served once the current request has been answered.
     release: Option<usize>,
+    /// The last block exported (volume, block, counter, tag), for `OP_EXPORT_ENTRY`, and the
+    /// entry `OP_IMPORT` brings next (RFD 3, P5).
+    exported: Option<(usize, u64, u64, [u8; 16])>,
+    importing: Option<(usize, u64, u64, [u8; 16])>,
 }
 
 /// Run a driver call, finding the driver again (by name) if it was restarted.
@@ -242,10 +263,12 @@ impl Storage {
                     writer: None,
                     fenced_seen: 0,
                     candidate: None,
+                    mirror: false,
+                    mirror_pending: None,
                 });
             }
         }
-        let count = self.volumes.iter().flatten().count();
+        let count = self.volumes.iter().flatten().filter(|v| v.kind != KIND_FREE).count();
         println!("storage: {} volume(s) on the disk", count);
         Ok(())
     }
@@ -288,11 +311,14 @@ impl Storage {
             }
             return Ok(i);
         }
-        let Some(slot) = self.volumes.iter().position(Option::is_none) else { return Err(CODE_OUT_OF_RANGE) };
+        // A freed volume of the same size first, then new space.
+        let free = self.volumes.iter().position(|v| v.is_some_and(|v| v.kind == KIND_FREE && v.blocks == blocks));
+        let Some(slot) = free.or_else(|| self.volumes.iter().position(Option::is_none)) else { return Err(CODE_OUT_OF_RANGE) };
+        let start = free.map_or(self.next_free, |i| self.volumes[i].unwrap().start);
         let mut v = Volume {
             name: key,
             kind,
-            start: self.next_free,
+            start,
             blocks,
             checked: true,
             epoch: 0,
@@ -300,8 +326,10 @@ impl Storage {
             writer: None,
             fenced_seen: 0,
             candidate: None,
+            mirror: false,
+            mirror_pending: None,
         };
-        if self.next_free + v.footprint() > self.capacity {
+        if free.is_none() && self.next_free + v.footprint() > self.capacity {
             return Err(CODE_OUT_OF_RANGE);
         }
         // Fresh metadata (every block unwritten: counter 0), then the header, then the table.
@@ -312,7 +340,9 @@ impl Storage {
         self.write(v.start, &zero)?;
         self.write_header(&mut v)?;
         self.volumes[slot] = Some(v);
-        self.next_free += v.footprint();
+        if free.is_none() {
+            self.next_free += v.footprint();
+        }
         self.save()?;
         self.event(VOLUME_CREATED, v.start, name);
         println!(
@@ -527,6 +557,167 @@ impl Storage {
         }
     }
 
+    /// A service's volume, if there is one (not made on demand).
+    fn service_volume(&self, name: &[u8; 32]) -> Result<usize, u64> {
+        self.volumes.iter().position(|v| v.is_some_and(|v| v.kind == KIND_SERVICE && v.name == *name)).ok_or(CODE_BAD_OP)
+    }
+
+    /// The transfer ops (RFD 3, P5): `msg` starts with the service name, and the reply goes back
+    /// into it; returns the reply's length.
+    fn transfer(&mut self, op: u64, b: u64, len: usize, msg: &mut [u8; BLOCK_SIZE]) -> Result<usize, u64> {
+        if op == OP_IMPORT {
+            return self.import(b, len, msg);
+        }
+        let name: [u8; 32] = msg[..32].try_into().unwrap();
+        let shown = core::str::from_utf8(trim(&name)).unwrap_or("?");
+        let at = |msg: &[u8; BLOCK_SIZE], k: usize| u64::from_le_bytes(msg[k..k + 8].try_into().unwrap());
+        if op == OP_IMPORT_HEADER {
+            if len != 40 + HEADER_BYTES {
+                return Err(CODE_BAD_OP);
+            }
+            let blocks = at(msg, 32);
+            self.has_key(KIND_SERVICE, trim(&name))?;
+            let i = self.volume(KIND_SERVICE, trim(&name), blocks)?;
+            let v = self.volumes[i].unwrap();
+            if v.writer.is_some() || v.candidate.is_some() {
+                println!("storage: {}: not receiving the volume: an instance here uses it", shown);
+                return Err(CODE_NOT_ALLOWED);
+            }
+            // Every block unwritten, then the source's header, which must open here too.
+            let zero = [0u8; BLOCK_SIZE];
+            for m in 0..meta_blocks(blocks) {
+                self.write(v.start + 1 + m, &zero)?;
+            }
+            let mut header = [0u8; BLOCK_SIZE];
+            header[..HEADER_BYTES].copy_from_slice(&msg[40..40 + HEADER_BYTES]);
+            self.write(v.start, &header)?;
+            self.flush()?;
+            self.volumes[i].as_mut().unwrap().checked = false;
+            self.check_header(i)?;
+            println!("storage: {}: receiving the volume ({} blocks, epoch {})", shown, blocks, self.volumes[i].unwrap().epoch);
+            self.importing = None;
+            return Ok(0);
+        }
+        let i = self.service_volume(&name)?;
+        let v = self.volumes[i].unwrap();
+        match op {
+            OP_EXPORT => {
+                if b >= v.blocks {
+                    return Err(CODE_OUT_OF_RANGE);
+                }
+                let (mb, off) = Self::meta(&v, b);
+                let mut meta = [0u8; BLOCK_SIZE];
+                self.read(mb, &mut meta)?;
+                let counter = u64::from_le_bytes(meta[off..off + 8].try_into().unwrap());
+                let tag: [u8; 16] = meta[off + 8..off + 24].try_into().unwrap();
+                self.read(v.data_start() + b, msg)?;
+                self.exported = Some((i, b, counter, tag));
+                Ok(BLOCK_SIZE)
+            }
+            OP_EXPORT_ENTRY => {
+                let Some((vi, b, counter, tag)) = self.exported.filter(|e| e.0 == i) else { return Err(CODE_BAD_OP) };
+                let _ = vi;
+                msg[..8].copy_from_slice(&b.to_le_bytes());
+                msg[8..16].copy_from_slice(&counter.to_le_bytes());
+                msg[16..32].copy_from_slice(&tag);
+                Ok(32)
+            }
+            OP_EXPORT_META => {
+                if b >= meta_blocks(v.blocks) {
+                    return Err(CODE_OUT_OF_RANGE);
+                }
+                self.read(v.start + 1 + b, msg)?;
+                Ok(BLOCK_SIZE)
+            }
+            OP_EXPORT_HEADER => {
+                let mut header = [0u8; BLOCK_SIZE];
+                self.read(v.start, &mut header)?;
+                msg[..8].copy_from_slice(&v.blocks.to_le_bytes());
+                msg[8..8 + HEADER_BYTES].copy_from_slice(&header[..HEADER_BYTES]);
+                Ok(8 + HEADER_BYTES)
+            }
+            OP_IMPORT_ENTRY => {
+                if len != 64 {
+                    return Err(CODE_BAD_OP);
+                }
+                self.importing = Some((i, at(msg, 32), at(msg, 40), msg[48..64].try_into().unwrap()));
+                Ok(0)
+            }
+            OP_MIRROR => {
+                let on = len >= 40 && at(msg, 32) != 0;
+                let mut v = v;
+                v.mirror = on;
+                let held = if on { None } else { v.mirror_pending.take() };
+                self.volumes[i] = Some(v);
+                if let Some((writer, _)) = held {
+                    let _ = reply(writer, CODE_OK, &[]);
+                }
+                println!("storage: {}: mirroring {}", shown, if on { "on" } else { "off" });
+                Ok(0)
+            }
+            OP_MIRROR_PENDING => match v.mirror_pending {
+                Some((_, b)) => {
+                    msg[..8].copy_from_slice(&b.to_le_bytes());
+                    Ok(8)
+                }
+                None => Ok(0),
+            },
+            OP_MIRROR_ACK => {
+                if let Some((writer, _)) = self.volumes[i].as_mut().unwrap().mirror_pending.take() {
+                    let _ = reply(writer, CODE_OK, &[]);
+                }
+                Ok(0)
+            }
+            OP_DROP => {
+                if v.writer.is_some() || v.candidate.is_some() || v.mirror {
+                    println!("storage: {}: not dropping the volume: it is in use", shown);
+                    return Err(CODE_NOT_ALLOWED);
+                }
+                let zero = [0u8; BLOCK_SIZE];
+                for m in 0..=meta_blocks(v.blocks) {
+                    self.write(v.start + m, &zero)?;
+                }
+                self.volumes[i] = Some(Volume { name: [0; 32], kind: KIND_FREE, checked: false, epoch: 0, ..v });
+                self.save()?;
+                println!("storage: {}: volume dropped (blocks {}..{} free)", shown, v.start, v.start + v.footprint());
+                Ok(0)
+            }
+            _ => Err(CODE_BAD_OP),
+        }
+    }
+
+    /// OP_IMPORT: block `b`'s ciphertext (all of `msg`), for the entry `OP_IMPORT_ENTRY` gave.
+    fn import(&mut self, b: u64, len: usize, msg: &mut [u8; BLOCK_SIZE]) -> Result<usize, u64> {
+        let Some((i, eb, counter, tag)) = self.importing.take() else { return Err(CODE_BAD_OP) };
+        let v = self.volumes[i].unwrap();
+        if len != BLOCK_SIZE || eb != b || b >= v.blocks || v.kind != KIND_SERVICE {
+            return Err(CODE_BAD_OP);
+        }
+        let name = v.name;
+        let shown = core::str::from_utf8(trim(&name)).unwrap_or("?");
+        self.has_key(KIND_SERVICE, trim(&name))?;
+        let (mb, off) = Self::meta(&v, b);
+        let mut meta = [0u8; BLOCK_SIZE];
+        self.read(mb, &mut meta)?;
+        if counter <= u64::from_le_bytes(meta[off..off + 8].try_into().unwrap()) {
+            return Ok(0); // what we have is as new or newer
+        }
+        // It must open here, under this volume's name and this block number.
+        let mut check = *msg;
+        let (nonce, aad) = Self::binding(&v, b, counter);
+        let tag_ = Tag::try_from(&tag[..]).unwrap();
+        if self.cipher(&v).decrypt_inout_detached(&nonce, &aad, check.as_mut_slice().into(), &tag_).is_err() {
+            println!("storage: {}: block {} from the source does not open", shown, b);
+            self.event(INTEGRITY_ERROR, b, trim(&name));
+            return Err(CODE_INTEGRITY);
+        }
+        self.write(v.data_start() + b, msg)?;
+        meta[off..off + 8].copy_from_slice(&counter.to_le_bytes());
+        meta[off + 8..off + 24].copy_from_slice(&tag);
+        self.write(mb, &meta)?;
+        Ok(0)
+    }
+
     /// Whether slot `slot` may write volume `i` (a service volume's writer; anyone for a task's).
     /// Reports the first refusal per slot and epoch.
     fn may_write(&mut self, i: usize, slot: u64) -> bool {
@@ -686,6 +877,20 @@ impl Storage {
             return;
         }
         let code_of = |e: u64| if err::is_error(e) { CODE_IO_ERROR } else { e };
+        if (OP_EXPORT..=OP_DROP).contains(&op) {
+            let (code, n) = if !task_listen(sender).is_ok_and(|i| i.may_load()) {
+                (CODE_NOT_ALLOWED, 0)
+            } else if len < 32 {
+                (CODE_BAD_OP, 0)
+            } else {
+                match self.transfer(op, b, len, msg) {
+                    Ok(n) => (CODE_OK, n),
+                    Err(e) => (code_of(e), 0),
+                }
+            };
+            let _ = reply(sender, code, &msg[..n]);
+            return;
+        }
         if op == OP_HANDOFF {
             let code = if !task_listen(sender).is_ok_and(|i| i.may_load()) {
                 CODE_NOT_ALLOWED
@@ -762,7 +967,14 @@ impl Storage {
                 }
                 Err(e) => Err(e),
             },
-            OP_WRITE if len == BLOCK_SIZE => self.write_data(&v, b, msg),
+            OP_WRITE if len == BLOCK_SIZE => match self.write_data(&v, b, msg) {
+                // Mirroring: answered once the target has it too (RFD 3, P4).
+                Ok(()) if v.mirror => {
+                    self.volumes[i].as_mut().unwrap().mirror_pending = Some((sender, b));
+                    return;
+                }
+                other => other,
+            },
             _ => Err(CODE_BAD_OP),
         };
         let code = match result {
@@ -816,6 +1028,8 @@ fn main() -> u64 {
         held: [None; MAX_HELD],
         held_seq: 0,
         release: None,
+        exported: None,
+        importing: None,
     };
     s.capacity = match on_driver(&mut s.driver, block::capacity) {
         Ok(c) => c,

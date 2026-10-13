@@ -637,6 +637,54 @@ def count_under_deploy(args):
 
 
 @scenario
+def count_steady(args):
+    """Four keep-alive clients count on counter v1 in small-0 for 30 s, through the control
+    plane's load balancer, while its volume is copied and mirrored to another node (RFD 3, V4b).
+    Every request must be answered 200, and the counts must be exactly 1..N."""
+    deadline = time.monotonic() + args.timeout - 5
+    if not wait_for_instance("counter v1 on small-0", deadline):
+        say("counter v1 on small-0 never answered")
+        return finish(False)
+    counts, failures, slow = [], [], []
+    stop = threading.Event()
+
+    def client(i):
+        c = None
+        while not stop.is_set():
+            try:
+                if c is None:
+                    c = Http()
+                started = time.monotonic()
+                status, _, body = c.request("/count")
+                slow.append(time.monotonic() - started)
+                if status == 200:
+                    counts.append(int(body))
+                else:
+                    failures.append(f"/count: {status} {body.strip()!r}")
+                if c.closed:
+                    c.close()
+                    c = None
+            except (HttpError, OSError) as e:
+                failures.append(f"{e} (client {i})")
+                c = None
+
+    threads = [threading.Thread(target=client, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(min(30, max(0, deadline - time.monotonic())))
+    stop.set()
+    for t in threads:
+        t.join()
+    repeats = len(counts) - len(set(counts))
+    missing = len(set(range(1, max(counts, default=0) + 1)) - set(counts))
+    say(f"{len(counts)} counts, highest {max(counts, default=0)}, {repeats} repeated, {missing} missing; {len(failures)} failed; "
+        f"slowest {max(slow, default=0):.2f} s")
+    for f in failures[:5]:
+        say(f"failure: {f}")
+    return finish(not failures and repeats == 0 and missing == 0 and len(counts) > 0)
+
+
+@scenario
 def swap_under_load(args):
     """The switcher makes web-2 live and drains web-1 (RFD 1)."""
     return under_load(args, ["web-1", "web-2"])

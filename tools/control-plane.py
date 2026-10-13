@@ -694,12 +694,14 @@ def move(cp):
 @scenario
 def transfer_connect(cp):
     """RFD 3, V4a: tickets for counter's volume from node a to node b; node b dials node a and
-    both check the other's key; then the tickets are withdrawn and the connection closes."""
-    cp.wait(lambda: "a" in cp.latest and "b" in cp.latest, "reports from nodes a and b")
-    cp.start_transfer("counter", "a", "b", epoch=2)
-    cp.wait_transfer("node a connected to node b", "a", "counter", "connected")
-    cp.wait_transfer("node b connected to node a", "b", "counter", "connected")
-    cp.tell("a", [])
+    both check the other's key (and copying starts); then the tickets are withdrawn and the
+    connection closes."""
+    live = counter_on_a(cp)
+    cp.start_transfer("counter", "a", "b", epoch=2, src_lines=[live])
+    up = ("connected", "copying", "mirroring")
+    cp.wait_transfer("node a connected to node b", "a", "counter", *up)
+    cp.wait_transfer("node b connected to node a", "b", "counter", *up)
+    cp.tell("a", [live])
     cp.tell("b", [])
     cp.wait_transfer("node a's ticket withdrawn", "a", "counter", None)
     cp.wait_transfer("node b's ticket withdrawn", "b", "counter", None)
@@ -720,6 +722,69 @@ def transfer_wrong_peer(cp):
     t = cp.wait_transfer("node b giving up", "b", "counter", "aborted")
     say(f"node b: {t['detail']}")
     cp.tell("a", ["end"])
+    cp.tell("b", ["end"])
+    return ok
+
+
+def counter_on_a(cp):
+    """counter v1 live on node a with its volume, and the load balancer sending to it."""
+    cp.wait(lambda: "a" in cp.latest and "b" in cp.latest, "reports from nodes a and b")
+    live = cp.live("counter", "small-0", "counter-v1")
+    cp.tell("a", [live])
+    cp.wait_slots("counter live on node a", node="a", small_0=("counter", 1, "LIVE"))
+    cp.route("a")
+    return live
+
+
+@scenario
+def transfer_mirror(cp):
+    """RFD 3, V4b: counter counts on node a under load while its volume is copied to node b,
+    caught up and mirrored; then the tickets are withdrawn, node a writes alone again and node b
+    drops its copy. The peer ends the run (through node a)."""
+    live = counter_on_a(cp)
+    time.sleep(3)  # some counts to copy
+    cp.start_transfer("counter", "a", "b", epoch=2, src_lines=[live])
+    cp.wait_transfer("node b mirroring", "b", "counter", "mirroring")
+    cp.wait_transfer("node a mirroring", "a", "counter", "mirroring")
+    time.sleep(5)  # mirrored writes, under load
+    t = cp.transfer("a", "counter")
+    say(f"node a: {t['detail']}")
+    cp.tell("a", [live])
+    cp.tell("b", [])
+    cp.wait_transfer("node a's ticket withdrawn", "a", "counter", None)
+    cp.wait_transfer("node b's ticket withdrawn", "b", "counter", None)
+    cp.tell("b", ["end"])
+    return True
+
+
+@scenario
+def transfer_stall(cp):
+    """RFD 3, V4b: node b stops answering mirrored writes (agent/transfer-stall); node a gives
+    up after its mirror timeout and writes alone, with no failed request."""
+    live = counter_on_a(cp)
+    time.sleep(3)
+    cp.start_transfer("counter", "a", "b", epoch=2, src_lines=[live])
+    t = cp.wait_transfer("node a giving up", "a", "counter", "aborted")
+    ok = t["detail"] == "mirror timeout"
+    t = cp.wait_transfer("node b giving up", "b", "counter", "aborted")
+    say(f"node b: {t['detail']}")
+    cp.tell("a", [live])
+    cp.tell("b", ["end"])
+    return ok
+
+
+@scenario
+def transfer_corrupt(cp):
+    """RFD 3, V4b: a bit of the first block node a sends changes on its way
+    (agent/transfer-corrupt); node b's storage refuses it, and both give up."""
+    live = counter_on_a(cp)
+    time.sleep(3)
+    cp.start_transfer("counter", "a", "b", epoch=2, src_lines=[live])
+    t = cp.wait_transfer("node b refusing the block", "b", "counter", "aborted")
+    ok = t["detail"] == "a block does not open"
+    t = cp.wait_transfer("node a giving up", "a", "counter", "aborted")
+    say(f"node a: {t['detail']}")
+    cp.tell("a", [live])
     cp.tell("b", ["end"])
     return ok
 
