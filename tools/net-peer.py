@@ -424,6 +424,24 @@ def http_get(args, want="hello from web\n"):
 
 
 @scenario
+def serve_count(args):
+    """make run-service's node (RFD 9, R4): counter answers on the forwarded port, and two
+    /count requests give counts that follow on."""
+    body = wait_ready(time.monotonic() + args.timeout - 5)
+    if body is None:
+        say("the service never answered")
+        return finish(False)
+    say(f"first answer: {body.strip()!r}")
+    try:
+        counts = [int(get("/count")[1]) for _ in range(2)]
+    except (HttpError, ValueError) as e:
+        say(f"/count failed: {e}")
+        return finish(False)
+    say(f"counts {counts[0]}, {counts[1]}")
+    return finish(counts[1] == counts[0] + 1)
+
+
+@scenario
 def slot_http_get(args):
     """http_get against web v1 loaded into slot small-0 at run time (RFD 2)."""
     return http_get(args, want="hello from web v1 on small-0\n")

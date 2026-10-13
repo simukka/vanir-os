@@ -67,3 +67,5 @@ transfer-corrupt = []                     # a source that changes a bit of the f
 script-volume-handoff-off = ["test-images"] # v1 with epoch 1, then v2 with epoch 1 (refused after the drain: handoff called off); exit
 script-volume-serve-cached = ["test-images"] # the same with counter-v1-cached (persist_ticks = 1000), then serve
 script-volume-serve = ["test-images"]    # counter v1 in small-0 with epoch 1, then serve until the run ends (load tests)
+# make run-service (RFD 9, R4): slot image "service" in small-0, with epoch 1 if it has a volume, then serve
+script-serve = ["test-images"]

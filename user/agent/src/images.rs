@@ -49,6 +49,8 @@ pub fn script() -> Option<u64> {
     if let Some(code) = volume_script() {
         return Some(code);
     }
+    #[cfg(feature = "script-serve")]
+    serve();
     #[cfg(feature = "script-load")]
     {
         let _ = load_and_report("small-0", &WEB_V1);
@@ -196,6 +198,28 @@ pub fn script() -> Option<u64> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// make run-service (RFD 9, R4): deploy slot image "service" (the Makefile's SERVICE, signed
+/// with SERVICE_DESC) into small-0, as its volume's writer if it has one, and keep the loop
+/// turning (the agent notices a restarted storage task or network stack there).
+#[cfg(feature = "script-serve")]
+fn serve() -> ! {
+    let image = image!("service");
+    let mut agent = Agent::new();
+    let s0 = agent.slot("small-0");
+    // Storage accepts the epoch it recorded again: the volume's disk is the service's alone.
+    let epoch = (image.volume_blocks() > 0).then_some((1, 0));
+    agent.deploy(s0, Some(image), None, epoch);
+    settle(&mut agent);
+    let service = core::str::from_utf8(image.service()).unwrap_or("?");
+    match agent.get(s0).state {
+        crate::lifecycle::State::Live => println!("agent: {} v{} is serving from small-0", service, image.version()),
+        s => println!("agent: {} v{} didn't start: small-0 is {}", service, image.version(), s.name()),
+    }
+    loop {
+        run_for(&mut agent, 100);
+    }
 }
 
 #[allow(dead_code)]

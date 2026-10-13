@@ -7,6 +7,7 @@
   sign-image.py sign-slot KEY ELF DESC.toml OUT             a service image for a slot (RFD 2):
                                                             OUT.desc and OUT.sig
   sign-image.py descriptor DESC.toml OUT                    the descriptor alone (fixtures)
+  sign-image.py port DESC.toml                              the first port it listens on (make run-service)
 
 The signature file (144 bytes) is what the kernel checks before running a task:
 
@@ -189,9 +190,18 @@ def main():
     dsc = sub.add_parser("descriptor")
     dsc.add_argument("descriptor")
     dsc.add_argument("out")
+    prt = sub.add_parser("port", help="print the first port a descriptor listens on (make run-service)")
+    prt.add_argument("descriptor")
     args = p.parse_args()
     if args.cmd == "sign-slot":
         sign_slot(args.key, args.elf, args.descriptor, args.out)
+    elif args.cmd == "port":
+        import tomllib
+        with open(args.descriptor, "rb") as f:
+            listen = tomllib.load(f).get("listen", [])
+        if not listen:
+            sys.exit(f"{args.descriptor}: listens on no port")
+        print(listen[0]["port"])
     elif args.cmd == "descriptor":
         with open(args.out, "wb") as f:
             f.write(descriptor(args.descriptor)[0])

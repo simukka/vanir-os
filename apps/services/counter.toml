@@ -1,0 +1,11 @@
+# counter (user/counter) for make run-service: GET /count counts in block 0 of its volume, and
+# GET / says which instance answered. Descriptor keys: tools/sign-image.py.
+name = "counter"
+version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+volume = { blocks = 16 }
+
+# Count in memory, written to the volume every this many 10 ms ticks (0: write every count).
+[config]
+persist_ticks = 0

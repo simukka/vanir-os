@@ -59,3 +59,8 @@ driver `nic`, and `mgmt-net` drives `nic-mgmt` (declare the data driver first: e
 entry claims the next device of its kind). Give each driver `sends = ["<its stack>"]` (it posts
 `NOTIFY_RX`), each stack `sends = ["<its driver>"]` (plus `"telemetry"` for counters), and each
 service `sends = ["net"]`.
+
+`apps/service.toml` is the node `make run-service` boots (RFD 9): one service, deployed by the
+agent into `small-0`. Its descriptors are in `apps/services/<program>.toml` (keys in
+`tools/sign-image.py`); the slot class is `small`, so a service gets 256 frames and a 512 KiB
+image.

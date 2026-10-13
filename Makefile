@@ -6,12 +6,22 @@
 #   make test                         boot every scenario in tests/run.sh and check the results
 #   make test ACCEL=kvm               same, under KVM instead of QEMU's emulator
 #   make run BOOT=uefi-secure ACCEL=kvm   boot through UEFI Secure Boot (see docs/index.html#boot-chain)
+#   make run-service SERVICE=counter  boot a node running one service, its port on 127.0.0.1:8080
 
 PROFILE        := release
 TARGET_DIR     := target/x86_64-unknown-none/$(PROFILE)
 LIMINE_BRANCH  := v11.x-binary
 APP            := apps/default.toml
 USER_PROGS     := hello spinner isolation runaway echo client deadlock supervisor crasher sleeper devprobe dmatest virtio-console chatter telemetry virtio-vsock attest control virtio-blk blktest storage unlocker virtio-net nictest net http counter mgmt-echo switcher agent
+# make run-service: the program SERVICE, signed with SERVICE_DESC, is slot image "service", which
+# the agent (feature script-serve) deploys into small-0. Its descriptor's first port is forwarded
+# to 127.0.0.1:SERVICE_PORT; its volume is in build/service-disk.img, kept across runs
+# (SERVICE_RESET=1 starts it from zeros).
+SERVICE        := counter
+SERVICE_DESC   = apps/services/$(SERVICE).toml
+SERVICE_PORT   := 8080
+SERVICE_RESET  :=
+SERVE          :=
 # Service images for generic slots (RFD 2), built into build/slots/: <name>:<program>:<descriptor>.
 # The agent is built after them, since its test scripts carry them.
 SLOT_IMAGES    := web-v1:http:tests/slots/web-v1.toml web-v2:http:tests/slots/web-v2.toml \
@@ -21,7 +31,8 @@ SLOT_IMAGES    := web-v1:http:tests/slots/web-v1.toml web-v2:http:tests/slots/we
                   counter-v3:counter:tests/slots/counter-v3.toml \
                   counter-v1-cached:counter:tests/slots/counter-v1-cached.toml \
                   counter-v2-cached:counter:tests/slots/counter-v2-cached.toml web-abi-next:http:tests/slots/web-abi-next.toml \
-                  web-config:http:tests/slots/web-config.toml
+                  web-config:http:tests/slots/web-config.toml \
+                  $(if $(SERVE),service:$(SERVICE):$(SERVICE_DESC))
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso
@@ -69,34 +80,36 @@ SB_UNSIGNED_LOADER :=
 # TPM=1 attaches a software TPM (swtpm, state in build/tpm): with BOOT=uefi-secure the firmware
 # measures the boot loader and Secure Boot state, and the kernel measures itself and every task.
 TPM            :=
-# DISK=1 attaches build/disk.img (64 MiB, kept across runs) as a virtio block device;
+# DISK=1 attaches DISK_IMG (64 MiB, kept across runs) as a virtio block device;
 # DISK_RESET=1 starts it from zeros.
 DISK           :=
+DISK_IMG       := build/disk.img
 DISK_RESET     :=
 # DISK_CORRUPT=volume:block flips a byte of that data block before booting (integrity tests);
 # volume:header flips one in the volume's header.
 DISK_CORRUPT   :=
 # DISK_OLD=1 stamps the superblock of an earlier storage format (VNRSTOR2) on the disk.
 DISK_OLD       :=
-DISK_FLAGS     = $(if $(DISK),-drive file=build/disk.img$(,)if=none$(,)id=d0$(,)format=raw \
+DISK_FLAGS     = $(if $(DISK),-drive file=$(DISK_IMG)$(,)if=none$(,)id=d0$(,)format=raw \
                    -device virtio-blk-pci$(,)drive=d0$(,)disable-legacy=on)
 # Networks. NET adds the data NIC and NET_MGMT the management NIC, each a virtio-net device at a
 # fixed PCI address (data first, so it is the first one a manifest claims):
 #   user   QEMU's NAT (slirp, with DHCP); host port NET_PORT (NET_MGMT_PORT) is forwarded to the
-#          guest's port 80 (7)
+#          guest's port NET_GUEST_PORT, 80 by default (7)
 #   dgram  raw Ethernet frames in UDP datagrams between QEMU (port NET_DGRAM_PORT, or
 #          NET_MGMT_DGRAM_PORT) and tools/net-peer.py (the next port up); static addresses
 NET            :=
 NET_MGMT       :=
 NET_PORT       ?= 8080
 NET_MGMT_PORT  ?= 8081
+NET_GUEST_PORT := 80
 NET_DGRAM_PORT ?= 18090
 NET_MGMT_DGRAM_PORT ?= 18092
 # $(call nic,backend,id,host port,guest port,dgram port,peer port,PCI address,MAC)
 nic            = $(if $(1),$(if $(filter user,$(1)),-netdev user$(,)id=$(2)$(,)hostfwd=tcp:127.0.0.1:$(3)-:$(4),\
                    -netdev dgram$(,)id=$(2)$(,)local.type=inet$(,)local.host=127.0.0.1$(,)local.port=$(5)$(,)remote.type=inet$(,)remote.host=127.0.0.1$(,)remote.port=$(6)) \
                    -device virtio-net-pci$(,)netdev=$(2)$(,)disable-legacy=on$(,)addr=$(7)$(,)mac=$(8))
-NET_FLAGS      = $(call nic,$(NET),data,$(NET_PORT),80,$(NET_DGRAM_PORT),$(shell echo $$(($(NET_DGRAM_PORT)+1))),0x10,52:54:00:00:00:01) \
+NET_FLAGS      = $(call nic,$(NET),data,$(NET_PORT),$(NET_GUEST_PORT),$(NET_DGRAM_PORT),$(shell echo $$(($(NET_DGRAM_PORT)+1))),0x10,52:54:00:00:00:01) \
                  $(call nic,$(NET_MGMT),mgmt,$(NET_MGMT_PORT),7,$(NET_MGMT_DGRAM_PORT),$(shell echo $$(($(NET_MGMT_DGRAM_PORT)+1))),0x11,52:54:00:00:00:02)
 UEFI           := $(filter uefi-secure,$(BOOT))
 IMAGE          := $(if $(UEFI),esp,$(ISO))
@@ -121,7 +134,7 @@ USER_CARGO_FEATURES   := $(if $(filter-out agent/%,$(USER_FEATURES)),--features 
 AGENT_CARGO_FEATURES  := $(if $(filter agent/%,$(USER_FEATURES)),--features "$(filter agent/%,$(USER_FEATURES))")
 KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES))
 
-.PHONY: all iso esp image disk kernel user run run-debug test qemu-cmd clean distclean FORCE
+.PHONY: all iso esp image disk kernel user run run-debug run-service test qemu-cmd clean distclean FORCE
 
 all: $(ISO)
 
@@ -132,10 +145,10 @@ image: $(IMAGE) $(if $(DISK),disk)
 
 disk:
 	@mkdir -p build
-	$(if $(DISK_RESET),rm -f build/disk.img)
-	[ -f build/disk.img ] || truncate -s 64M build/disk.img
-	$(if $(DISK_OLD),printf VNRSTOR2 | dd of=build/disk.img conv=notrunc status=none)
-	$(if $(DISK_CORRUPT),tools/corrupt-disk.py build/disk.img $(DISK_CORRUPT))
+	$(if $(DISK_RESET),rm -f $(DISK_IMG))
+	[ -f $(DISK_IMG) ] || truncate -s 64M $(DISK_IMG)
+	$(if $(DISK_OLD),printf VNRSTOR2 | dd of=$(DISK_IMG) conv=notrunc status=none)
+	$(if $(DISK_CORRUPT),tools/corrupt-disk.py $(DISK_IMG) $(DISK_CORRUPT))
 
 $(SIGNING_KEY):
 	@mkdir -p $(dir $@)
@@ -235,6 +248,15 @@ run: image
 
 run-debug: image
 	$(QEMU) $(QEMU_FLAGS) -d int,cpu_reset -D qemu.log; s=$$?; [ $$s -eq 1 ] || exit $$s
+
+# One service on a node of its own (RFD 9, R4): the agent deploys it, and its port is forwarded.
+# USER_FEATURES and the other variables pass through (e.g. ACCEL=kvm).
+run-service:
+	@test -f $(SERVICE_DESC) || { echo "no descriptor $(SERVICE_DESC): set SERVICE_DESC" >&2; exit 2; }
+	@echo "run-service: $(SERVICE) ($(SERVICE_DESC)) on http://127.0.0.1:$(SERVICE_PORT)/ once the agent says it is serving; Ctrl-C ends it"
+	$(MAKE) run SERVE=1 APP=apps/service.toml USER_FEATURES="agent/script-serve $(USER_FEATURES)" \
+	    NET=user NET_PORT=$(SERVICE_PORT) NET_GUEST_PORT=$$(tools/sign-image.py port $(SERVICE_DESC)) \
+	    DISK=1 DISK_IMG=build/service-disk.img DISK_RESET=$(SERVICE_RESET)
 
 test:
 	ACCEL=$(ACCEL) tests/run.sh
