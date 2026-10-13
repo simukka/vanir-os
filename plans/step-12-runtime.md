@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1 implemented (R1a–R1c); R2 planned.
+Status: R1 and R2 implemented (R1a–R1c, R2a–R2d).
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -286,3 +286,37 @@ growth rule, but no server checks versions yet), and settings for fixed tasks (m
   place in each language (the kernel's `parse_descriptor`, `sign-image.py`); the fixture carries
   12 settings with keys at the edges (1 and 16 bytes). Refusal of a malformed signed descriptor
   isn't tested end to end (`sign-image.py` won't produce one); noted as a gap.
+
+### As built (R2)
+
+Where it departs from the plan:
+
+- **The death notice's length** is what was copied (the plan left it between that and the
+  record's size): a program that slices its buffer with the message length can't overrun it.
+- **`DeathRecord::from_bytes`** needs at least the id and kind (16 bytes); shorter is None.
+- **The descriptor's readers are lenient** (`vanir_abi::descriptor::u64_at` and the rest read
+  zero past the end) and **its checks stay in the kernel**: `format()` says what a slice is,
+  `valid_key()` is the key rule, and `parse_descriptor` decides what to refuse.
+- **The agent depends on `vanir-abi` directly** for `descriptor` (a system task; `vanir_user`
+  doesn't re-export it, as services don't read descriptors).
+- **Format 1 fixtures too:** `abi/tests/descriptor-v1.toml` and `.bin` beside the format-2 ones,
+  so `descriptor-format` checks both writers.
+- **`slot-settings` uses a web image** (`web-config`, no volume) rather than `counter-config`:
+  the test is about settings reaching the instance, and the `slots` app has no storage task.
+- **A fifth copy of the descriptor's length, missed in the plan:** the agent's `E` frame (an
+  image fetched from the control plane, `user/agent/src/control.rs`) took exactly 256 bytes. R2c's
+  first full suite failed 18 control-plane cases on it (every fetched image was ignored, so the
+  runs timed out); fixed in `e46c85d` through `vanir_abi::descriptor`. The plan's survey had
+  grepped for offsets, not for the frame's length.
+- **`slot-settings` raced** in that suite: the instance can print its settings before the agent
+  prints that it loaded it. The test now checks each line on its own.
+- **`counter-load` after R2** (KVM, 60 s): 1742 requests/s at 8 clients (1695 after R1, 1687
+  before), none lost or repeated.
+- **Suites:** R2a's full suite ran on its own (153 passed); R2b was checked by its targeted
+  cases (`abi-*`, `descriptor-format`, every `slot-*`) and then by R2c's full suite, which
+  includes everything R2b changed. After the `E` frame fix, R2c's full suite: 156 passed, 0
+  failed. `move-volume-digest` timed out once in a batch rerun before that (logs lost to the
+  next case) and passed in 4 runs alone and in the full suite; if it recurs, the suite runner
+  in the plan's notes keeps each failing case's two-node logs. The suites ran in a second git worktree while the next step
+  was written in the first (only one runs QEMU at a time: the tests use fixed host ports).
+

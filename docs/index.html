@@ -1326,16 +1326,35 @@ min_version = 1          # oldest version that may still run
 slot_class = "small"
 listen = [{ port = 80, max_connections = 64 }]
 drain = { default_secs = 30, max_secs = 300 }
-volume = { blocks = 256 }  # optional: the service's volume (RFD 3, <a href="#storage-services">13.5</a>)</code></pre>
+volume = { blocks = 256 }  # optional: the service's volume (RFD 3, <a href="#storage-services">13.5</a>)
+abi = "1.0"              # optional: the ABI it was built against (default: vanir-abi's)
+format = 2               # optional: 1 writes the older 256-byte format (no abi, no config)
 
-<p><code>tools/sign-image.py sign-slot KEY ELF DESC.toml OUT</code> compiles it to the fixed
-256-byte layout the kernel reads (<code>OUT.desc</code>) and writes a <code>VNRSIG02</code>
+[config]                 # optional: up to 12 settings (RFD 9, P5)
+persist_ticks = 1000     # keys: 1..16 of a-z, 0-9, _ (a letter first); integer values</code></pre>
+
+<p><code>tools/sign-image.py sign-slot KEY ELF DESC.toml OUT</code> compiles it to the layout
+the kernel reads (<code>OUT.desc</code>; <code>vanir_abi::descriptor</code>: format 2,
+<code>VNRDSC02</code>, 512 bytes, or format 1, <code>VNRDSC01</code>, 256 bytes; the first 160
+bytes are the same in both) and writes a <code>VNRSIG02</code>
 signature file (<code>OUT.sig</code>, 176 bytes) over the name, version, and SHA-256 of both the
 image and the descriptor, with the boot images' key. The Makefile builds the test images
 (<code>SLOT_IMAGES</code>) into <code>build/slots/</code>, then the agent, which carries them.
 <code>task_listen</code> answers for a slot from its descriptor, so <code>net</code> lets a
 service listen only on the ports it was signed with; it also returns the version, and
 <code>http</code> in a slot calls itself e.g. <code>web v1 on small-0</code>.</p>
+
+<p><strong>The ABI version and settings</strong> (RFD 9). A format-2 descriptor records the ABI
+version the image was built against (<code>sign-image.py</code> reads
+<code>ABI_MAJOR</code>.<code>ABI_MINOR</code> from <code>abi/src/lib.rs</code>), and the kernel
+loads it only if the major version is its own and the minor is no newer (else
+<code>REJECTED</code>: "built for an ABI this kernel doesn't serve"; <code>slot-abi-refused</code>).
+A format-1 descriptor counts as 1.0 with no settings. The settings are signed with the image,
+checked at load (valid keys, each once, the unused entries zero), and handed to the instance
+through <code>task_listen</code> (<code>ListenInfo::setting("persist_ticks")</code>);
+<code>http</code> prints its slot's settings at start (<code>slot-settings</code>). New settings
+mean a new descriptor, so a new signed statement and a new image name: changing them is a
+deployment, never a change to a running instance.</p>
 
 <h3 id="deploy-loading"><span class="num">15.2</span>Loading an image<a class="anchor" href="#deploy-loading">#</a></h3>
 
@@ -1346,6 +1365,7 @@ service listen only on the ports it was signed with; it also returns the version
   <li>checks the signature, and that it covers this image and this descriptor;</li>
   <li>checks the version against the descriptor's <code>min_version</code>;</li>
   <li>checks the descriptor names the slot's class;</li>
+  <li>checks the image was built for an ABI it serves (same major, minor no newer);</li>
   <li>builds the address space, and refuses if it needs more frames than the class allows;</li>
   <li>measures it (below), or fails with <code>BUSY</code> or <code>LOG_FULL</code> having
     changed nothing;</li>
@@ -1677,6 +1697,20 @@ names of codes); no syscalls, no <code>unsafe</code>, no dependencies. The host 
 <code>abi-snapshot</code> (<code>abi/tests/snapshot.rs</code>) pins every value and every
 record's size and field offsets, so a change shows up there before it shows up in a boot.</p>
 
+<p><strong>Versions.</strong> <code>vanir_abi::ABI_MAJOR</code>.<code>ABI_MINOR</code> is 1.0.
+A minor version may only add: syscalls, codes, flags, task states, rejection reasons, fields at
+the end of a record read by size, descriptor fields in reserved space. Anything else is a new
+major version. Slot images carry the version they were built for (<a href="#deploy-slots">15.1</a>).</p>
+
+<p><strong>Records are read by size.</strong> <code>stats</code>, <code>task_listen</code> and
+the supervisor's death notice copy as much of their record as fits in the caller's buffer and
+return the record's whole size (the death notice is as long as what was copied), so a record can
+grow at its end: an older program gets the fields it knows, and a newer one on an older kernel
+finds the new fields zero. <code>ListenInfo</code> grew this way from 136 to 440 bytes (the ABI
+version and settings); <code>abi-read-by-size</code> reads it into 64, 136 and 600 bytes.
+Records read as arrays (<code>Event</code>, the measurement and run-time log entries) can't
+grow.</p>
+
 <table>
 <tr><th>Syscall</th><th>No.</th><th>Notes</th></tr>
 <tr><td><code>write(ptr, len)</code></td><td>1</td><td>to the serial port; bad pointers return an error</td></tr>
@@ -1696,11 +1730,11 @@ record's size and field offsets, so a change shows up there before it shows up i
 <tr><td><code>pci_config_read(device, offset)</code></td><td>111</td><td>read-only, granted devices only</td></tr>
 <tr><td><code>dma_info()</code></td><td>112</td><td>&rarr; <code>(address, physical address, length)</code> of the DMA region</td></tr>
 <tr><td><code>read_events(buf, cap)</code></td><td>113</td><td>event reader only &rarr; <code>(count, dropped)</code></td></tr>
-<tr><td><code>stats(buf, cap)</code></td><td>114</td><td>event reader only: uptime, memory, interrupts, per-task state</td></tr>
+<tr><td><code>stats(buf, cap)</code></td><td>114</td><td>event reader only: uptime, memory, interrupts, per-task state; read by size &rarr; the record's size</td></tr>
 <tr><td><code>measurements(buf, cap)</code></td><td>115</td><td>TPM task only &rarr; <code>(count, TPM address)</code>; the boot measurement log</td></tr>
 <tr><td><code>notify(target, bits)</code></td><td>116</td><td>post bits, without waiting, to a task in <code>sends</code> or one that has the caller in its own <code>sends</code> (a server to its client); it gets them in <code>recv</code> as <code>NOTIFY_POST</code>, or from <code>posted()</code>, which only polls</td></tr>
 <tr><td><code>halt(code)</code></td><td>117</td><td>supervisor only: stop the system, reporting every task's state</td></tr>
-<tr><td><code>task_listen(id, buf, cap)</code></td><td>118</td><td>a task's service, flags (<code>routes</code>, <code>connects</code>), declared ports and signed version (<code>ListenInfo</code>); for a slot, from its descriptor</td></tr>
+<tr><td><code>task_listen(id, buf, cap)</code></td><td>118</td><td>a task's service, flags (<code>routes</code>, <code>connects</code>), declared ports and signed version (<code>ListenInfo</code>); for a slot, from its descriptor, with its ABI version and settings; read by size &rarr; the record's size</td></tr>
 <tr><td><code>slot_stage(slot, offset, buf, len)</code></td><td>119</td><td>loader only: copy part of an image into an empty slot's image area</td></tr>
 <tr><td><code>slot_load(slot, sig, sig_len, desc, desc_len)</code></td><td>120</td><td>loader only: check, measure and start the staged image &rarr; new id; <code>REJECTED</code> (reason in <code>rdx</code>), <code>BUSY</code>, <code>LOG_FULL</code></td></tr>
 <tr><td><code>slot_unload(slot)</code></td><td>121</td><td>loader only: empty a slot whose service has ended; measured</td></tr>
@@ -1918,7 +1952,8 @@ node's telemetry lands in <code>build/cp-telemetry.log</code>),
 test: run only with <code>tests/run.sh --bench</code> or <code>BENCH=1</code>). A <code>BUILD_FAILS</code> list
 before the cases names manifests that must not build, with the error they must give, and
 <code>HOST_CHECKS</code> runs commands on the host alone (the Noise test vectors, and
-<code>abi-snapshot</code>: the ABI's values and layouts).</p>
+<code>abi-snapshot</code>: the ABI's values and layouts; <code>descriptor-format</code>:
+<code>sign-image.py</code> still writes the fixtures <code>abi/tests/descriptor.rs</code> reads).</p>
 
 <h4>Load tests</h4>
 <p>Load tests are skipped unless asked for, since they take a minute and report numbers rather
@@ -1977,11 +2012,11 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>138 cases (and two load tests with <code>--bench</code>), one build check and two host checks (<code>noise-vectors</code>, <code>abi-snapshot</code>), run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>141 cases (and two load tests with <code>--bench</code>), one build check and three host checks (<code>noise-vectors</code>, <code>abi-snapshot</code>, <code>descriptor-format</code>), run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
-<tr><td>isolation, faults</td><td><code>normal</code> <code>bad-pointer</code> <code>poke-kernel</code> <code>exec-stack</code> <code>write-code</code> <code>smap</code></td><td></td></tr>
+<tr><td>isolation, faults</td><td><code>normal</code> <code>bad-pointer</code> <code>poke-kernel</code> <code>abi-read-by-size</code> <code>exec-stack</code> <code>write-code</code> <code>smap</code></td><td></td></tr>
 <tr><td>scheduling</td><td><code>timer-ticks</code> <code>preemption</code> <code>address-spaces</code> <code>cpu-budget</code> <code>no-leak</code> <code>fault-isolated</code></td><td></td></tr>
 <tr><td>IPC</td><td><code>ipc-echo</code> <code>ipc-queued</code> <code>ipc-bad-buffer</code> <code>ipc-not-allowed</code> <code>ipc-server-dies</code> <code>ipc-deadlock</code></td><td></td></tr>
 <tr><td>supervisor, sleep</td><td><code>supervisor-restart</code> <code>restart-no-leak</code> <code>crash-loop</code> <code>backoff-reset</code> <code>stale-id</code> <code>sleep-idle</code> <code>sleep-busy</code></td><td></td></tr>
@@ -1999,7 +2034,7 @@ attestation references earlier ones leave behind.</p>
 <tr><td>management network</td><td><code>mgmt-separate</code> <code>mgmt-under-flood</code></td><td>port 8081 too</td></tr>
 <tr><td>network telemetry</td><td><code>net-counters</code> <code>net-interval</code></td><td>vsock for <code>net-interval</code></td></tr>
 <tr><td>routing, draining</td><td><code>swap-under-load</code> <code>drain-deadline</code> <code>route-not-ready</code> <code>route-not-allowed</code></td><td></td></tr>
-<tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
+<tr><td>slots: loading</td><td><code>slot-load</code> <code>slot-unsigned</code> <code>slot-tampered-image</code> <code>slot-tampered-desc</code> <code>slot-boot-sig</code> <code>slot-rogue-key</code> <code>slot-below-floor</code> <code>slot-class</code> <code>slot-abi-refused</code> <code>slot-settings</code> <code>slot-memory</code> <code>slot-image-size</code> <code>slot-not-allowed</code> <code>slot-occupied</code> <code>slot-ports</code> <code>slot-restart</code> <code>slot-exit-clean</code> <code>slot-unload-no-leak</code> <code>slot-log-full</code></td><td>port 8080 for <code>slot-load</code>, <code>slot-ports</code></td></tr>
 <tr><td>deployments</td><td><code>deploy-under-load</code> <code>rollback-under-load</code> <code>deploy-not-ready</code> <code>drain-deadline-cap</code> <code>deploy-commit</code> <code>slot-exit-clean</code></td><td>port 8080; the first three are slow</td></tr>
 <tr><td>agent and control plane</td><td><code>noise-vectors</code> <code>agent-connect</code> <code>agent-wrong-cp-key</code> <code>agent-signed-state</code> <code>agent-deploy</code> <code>agent-volume</code> <code>agent-volume-cached</code> <code>agent-epoch-stale</code> <code>agent-reconnect</code> <code>agent-drain</code> <code>agent-attested</code> <code>agent-unbound-key</code> <code>agent-volume-key</code> <code>agent-volume-key-swap</code> <code>agent-volume-unattested</code></td><td>port 7000; KVM, swtpm for <code>agent-attested</code> to <code>agent-volume-key-swap</code></td></tr>
 <tr><td>two nodes</td><td><code>agent-update-refused</code> <code>move-under-load</code> <code>evacuate-update</code> <code>transfer-connect</code> <code>transfer-mirror</code> <code>transfer-stall</code> <code>transfer-corrupt</code> <code>move-volume-under-load</code> <code>move-volume-digest</code> <code>transfer-wrong-peer</code></td><td>ports 7000, 8000, 8080-8081, 8090-8091; the last two are slow</td></tr>

@@ -127,12 +127,14 @@ but re-exports nothing from it.
 - `vanir-abi` has `ABI_VERSION` (major.minor). Within a major version, changes are additive
   only: new syscalls and ops get new numbers, and records grow only at the end.
 - **Records are read by size.** The caller passes its buffer size and the kernel copies
-  `min(size, its own)`, returning its own size. Today `stats` refuses a smaller buffer with
-  `TOO_LONG`, so an old program breaks as soon as the record grows.
+  `min(size, its own)`, returning its own size. Before R2a, `stats` refused a smaller buffer
+  with `TOO_LONG`, so an old program broke as soon as the record grew. *(Built in R2a, for
+  `stats`, `task_listen` and the death notice; records read as arrays stay frozen.)*
 - **Images carry the version**, in the slot descriptor (format `VNRDSC02`, P5), so it is covered
   by the signature. The descriptor's TOML gets `abi = "1.0"`. The kernel refuses
   an image whose major version it doesn't support, with a reason in the `rejected` event, as it
-  does for a bad signature.
+  does for a bad signature. *(Built in R2b: the TOML's `abi` defaults to the version in
+  `vanir-abi`; the kernel also refuses a newer minor, `REJECT_ABI`.)*
 - The manifest's system tasks are built with the kernel, so the check matters for slot images.
 
 ### P3. The runtime
@@ -261,8 +263,8 @@ settings, signed with the image, and the runtime hands them to the service.
 5. **Testing on the host:** a host backend for `vanir-rt` would let service authors unit-test
    with `cargo test`. Is that worth a second backend? (Leaning: a small one: a volume faked in
    memory, `request()` called directly, no network.)
-6. **Where the version lives:** settled by P5 unless we object: the descriptor (`VNRDSC02`),
-   not an ELF note, since the kernel already parses and verifies the descriptor.
+6. ~~Where the version lives~~: in the descriptor (`VNRDSC02`, built in R2b), not an ELF note,
+   since the kernel already parses and verifies the descriptor.
 7. **Settings beyond integers:** strings (e.g. a name to greet) need more room than 8 bytes. Add
    a string area to `VNRDSC02` now, or wait for a service that needs one?
 8. ~~Does the kernel use `vanir-abi`?~~ Yes: determination 4.
