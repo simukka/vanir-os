@@ -40,6 +40,8 @@ make run                                # build and boot in QEMU
 make test                               # run all 123 test scenarios
 make test ACCEL=kvm                     # the same under KVM
 make run APP=tests/apps/storage.toml DISK=1   # choose a set of tasks; attach a disk
+make run-service ACCEL=kvm              # one service (counter) on 127.0.0.1:8080
+cargo test -p counter --target x86_64-unknown-linux-gnu   # its tests, on the host
 ```
 
 Limine is downloaded on the first build. The [manual](docs/index.html#build) covers the build

@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1, R2 and R3 implemented (R1a–R1c, R2a–R2d, R3a–R3d); R4 planned.
+Status: R1–R4 implemented (R1a–R1c, R2a–R2d, R3a–R3d, R4a–R4c).
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -530,3 +530,22 @@ outside builds (their own RFD); faking `Locked` or I/O errors in the host backen
   per target in `.cargo/config.toml`; `build.rs` checks the target. The host check shows it.
 - **The host backend drifts from the runtime** (a check made in one only). The request checks
   and the settings check are one function each, used by both.
+
+### As built (R4)
+
+Where it departs from the plan:
+
+- **`vanir-rt` has tests of its own backend** (`user/rt/tests/host.rs`, five: ticks when due,
+  settings over defaults, `fenced` once per refused write, `drain` before an exit, the checks
+  before `request`). `counter`'s tests alone didn't show `fenced` is called: `counter` drops its
+  cache on a failed write itself, so a `fenced()` that did nothing still passed them.
+- **A refused flush calls `fenced` too**, in a slot and on the host: storage fences flushes as
+  it fences writes, and the hook's purpose is the same.
+- **`Host::service()` works after an exit**, so a test can see that `drain` ran.
+- **The `run-service` test uses its own disk** (`build/service-test-disk.img`, reset each run),
+  so it doesn't touch the one `make run-service` keeps.
+- **`SERVICE` must be in `USER_PROGS`** (and the workspace) for its ELF to be built; the
+  manual says so.
+- **Results:** full suite 158 passed (156, `run-service` and `rt-host`). `make run-service`
+  by hand: `/count` answered 1, 2, then 3 after a second boot on the same disk. `counter-load`
+  at 8 clients 1621 requests/s (1644 after R3), none lost or repeated.

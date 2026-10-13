@@ -270,7 +270,8 @@ network stacks, with routing and draining between instances.</p>
 <pre><code>make run                                   # build the ISO and boot it in QEMU
 make test                                  # boot all 123 scenarios and check each one
 make test ACCEL=kvm                        # the same under KVM
-make run APP=tests/apps/two-spinners.toml  # boot a different set of tasks</code></pre>
+make run APP=tests/apps/two-spinners.toml  # boot a different set of tasks
+make run-service ACCEL=kvm                 # one service on 127.0.0.1:8080 (<a href="#deploy-runtime">15.8</a>)</code></pre>
 
 <p>A normal boot prints the banner, the kernel's setup steps, then each task's output, and ends
 when nothing is left to run:</p>
@@ -1685,7 +1686,9 @@ handoff off, and the control plane gives node a a new epoch)</figcaption>
 P3), not against <code>vanir_user</code>: it implements <code>Service</code>, and the runtime
 owns the event loop. <code>user/counter</code> is the example:</p>
 
-<pre><code>use vanir_rt::{Ctx, Error, Request, Response, Service, Volume};
+<pre><code>#![cfg_attr(target_os = "none", no_std, no_main)]   // a slot's image, or host tests
+
+use vanir_rt::{Ctx, Error, Request, Response, Service, Volume};
 
 struct Counter { volume: Volume, persist_ticks: u64, /* ... */ }
 
@@ -1720,7 +1723,7 @@ vanir_rt::service!(Counter, connections = 64);</code></pre>
     declares (<code>Error::NotDeclared</code> without), waiting while storage is locked.
     <code>Volume::read</code>, <code>write</code>, <code>flush</code> return
     <code>vanir_rt::Error</code> (<code>Fenced</code>, <code>Locked</code>,
-    <code>Integrity</code>, <code>OutOfRange</code>, ...). A write refused as
+    <code>Integrity</code>, <code>OutOfRange</code>, ...). A write or flush refused as
     <code>Fenced</code> makes the runtime call <code>fenced()</code> once the callback returns;
     when the instance becomes the writer, the handle prints it.</li>
   <li><strong>Sizes are fixed at build time:</strong> no heap; the connection table is a static
@@ -1736,6 +1739,48 @@ its own loop and test features; it shares the runtime's request parser
 moving <code>counter</code> from <code>http</code> to <code>vanir-rt</code> changed its
 throughput at 8 clients from 1687 to 1644 requests/s (a write per request) and from 14775 to
 14376 (cached): 2&ndash;3%, about the spread between runs of the same build (1687 to 1742).</p>
+
+<p><strong>Running one</strong> (RFD 9, R4). <code>make run-service SERVICE=counter</code> boots
+a node for one service (<code>apps/service.toml</code>: the network stack, storage and the
+agent): the program <code>SERVICE</code>, signed with <code>SERVICE_DESC</code> (default
+<code>apps/services/&lt;program&gt;.toml</code>), is slot image <code>service</code>, and the
+agent (feature <code>script-serve</code>) deploys it into <code>small-0</code>, as its volume's
+writer (epoch 1) if it has one. The descriptor's first port is forwarded to
+<code>127.0.0.1:SERVICE_PORT</code> (8080):</p>
+
+<pre><code>make run-service ACCEL=kvm         # ... agent: counter v1 is serving from small-0
+curl http://127.0.0.1:8080/count   # 1, 2, 3, ... (Ctrl-C in the QEMU terminal ends it)</code></pre>
+
+<p>The volume lives in <code>build/service-disk.img</code>, kept across runs (the count carries
+on) and apart from the tests' <code>build/disk.img</code>; <code>SERVICE_RESET=1</code> starts it
+from zeros. A new program must be in the workspace and <code>USER_PROGS</code>, with a
+<code>build.rs</code> like <code>counter</code>'s, and its descriptor must name slot class
+<code>small</code> (256 frames, a 512 KiB image). The test <code>run-service</code> boots the
+same node and counts twice through the forwarded port.</p>
+
+<p><strong>Testing one on the host</strong> (RFD 9, open question 5). On any target but
+<code>x86_64-unknown-none</code>, <code>vanir-rt</code> is a test backend:
+<code>vanir_rt::host::Host</code> calls the service as the runtime in a slot does
+(<code>start</code>, then the first <code>tick</code>; <code>tick</code> when due; the same
+checks before <code>request</code>; <code>fenced</code> after a call whose write was refused;
+<code>drain</code> before an exit), with the clock moved by the test and the volume in memory.
+No network and no QEMU: requests are bytes.</p>
+
+<pre><code>let mut h = Host::&lt;Counter&gt;::new("counter").volume(16).setting("persist_ticks", 100);
+h.start().unwrap();
+assert_eq!(h.get("/count").body, "1\n");
+h.get("/count");
+h.advance(100);                       // the timer's tick writes the count
+assert_eq!(h.block(0)[0], 2);
+h.restart().unwrap();                 // a crash: no drain, the volume kept
+h.fence(true);                        // another instance is the writer now</code></pre>
+
+<p><code>cargo test -p counter --target x86_64-unknown-linux-gnu</code> runs
+<code>counter</code>'s tests; the host check <code>rt-host</code> runs them with the backend's
+own (<code>user/rt/tests/host.rs</code>). <code>Ctx</code>, <code>Response</code> and the request
+and settings checks are one copy, used by both backends. The backend fakes only
+<code>Fenced</code>: not <code>Locked</code>, I/O errors, the network, or several instances
+at once.</p>
 
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
@@ -2151,7 +2196,8 @@ user/virtio-net/          NIC driver: frames in and out; crash-after-10-frames t
 user/nictest/             answers ARP and ping by hand (driver test, no stack)
 user/net/                 network stack (smoltcp): sockets, routing, limits, counters
 user/http/                HTTP/1.1 server (web); exit-on-request, crash and listen-81 test features
-user/rt/                  vanir-rt: the service runtime (Service trait, event loop, HTTP, volume, settings)
+user/rt/                  vanir-rt: the service runtime (Service trait, event loop, HTTP, volume, settings);
+                          on the host, a test backend (src/host.rs)
 user/counter/             counter: a service on vanir-rt with a volume; persist_ticks setting
 user/mgmt-echo/           TCP echo on the management stack (stands in for the agent)
 user/switcher/            routing scripts for tests (RFD 1)

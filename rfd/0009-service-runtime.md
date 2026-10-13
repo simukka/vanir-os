@@ -46,6 +46,9 @@ Decided in discussion (2026-10-13):
 4. **The kernel uses `vanir-abi`** (was open question 8; decided 2026-10-13, built in R1). It
    stays constants, records and safe functions that read them: no syscalls, no `unsafe`, no
    dependencies.
+5. **`vanir-rt` has a small host backend** (was open question 5; built in R4b): on any target
+   but `x86_64-unknown-none` it calls the service's callbacks as the runtime does, with a clock
+   the test moves and the volume in memory. No network.
 
 ## Background
 
@@ -261,6 +264,13 @@ signed with `persist_ticks = 1000`; `http` keeps only the web server and its tes
 4. **R4:** `make run-service` (a node with the agent in script mode, the service's port
    forwarded), and the host test backend if open question 5 says so.
 
+*Built in R4: `make run-service SERVICE=<program>` (R4a) signs the program with
+`apps/services/<program>.toml` as slot image `service`; agent feature `script-serve` deploys it
+into `small-0` with epoch 1 if it has a volume; the descriptor's first port is forwarded to
+`127.0.0.1:8080`; the volume is `build/service-disk.img`, kept across runs. The host backend
+(R4b) is `vanir_rt::host::Host`; `Ctx`, `Response` and the request and settings checks are
+shared by both backends, and `counter` has six tests on it (host check `rt-host`).*
+
 ## Open questions
 
 1. **Names:** `vanir-rt` or `vanir-os-runtime`; and whether `vanir-sys` keeps the `vanir_user`
@@ -273,9 +283,7 @@ signed with `persist_ticks = 1000`; `http` keeps only the web server and its tes
    costs complexity. (Leaning: a trait.)
 4. **Calling other services:** typed clients for IPC to other tasks (allowed by `sends`), or
    `vanir_rt::raw` until there is a second protocol to wrap? (Leaning: `raw` for now.)
-5. **Testing on the host:** a host backend for `vanir-rt` would let service authors unit-test
-   with `cargo test`. Is that worth a second backend? (Leaning: a small one: a volume faked in
-   memory, `request()` called directly, no network.)
+5. ~~Testing on the host~~: yes, a small backend (determination 5, built in R4b).
 6. ~~Where the version lives~~: in the descriptor (`VNRDSC02`, built in R2b), not an ELF note,
    since the kernel already parses and verifies the descriptor.
 7. **Settings beyond integers:** strings (e.g. a name to greet) need more room than 8 bytes. Add
