@@ -128,14 +128,7 @@ pub fn reboot() -> u64 {
 /// code 0 and the new id (u64) on success; otherwise 0x100 | the kernel error's low bits.
 pub mod supervisor {
     use super::send;
-
-    /// Stop the task: it is reported as stopped and not restarted.
-    pub const OP_STOP: u64 = 1;
-    /// Start a dead task again (e.g. a stopped slot, for a rollback), with its backoff reset.
-    pub const OP_START: u64 = 2;
-    /// Reboot the node into the image installed now (message: anything). Only answered if it
-    /// fails.
-    pub const OP_REBOOT: u64 = 3;
+    pub use vanir_abi::proto::supervisor::*;
 
     fn call(supervisor: u64, op: u64, id: u64) -> Result<u64, u64> {
         let mut out = [0u8; 8];
@@ -199,49 +192,11 @@ pub fn dma_info() -> Result<(u64, u64, u64), u64> {
 /// message is exactly one block.
 pub mod block {
     use super::{send, yield_now};
-
-    pub const BLOCK_SIZE: usize = 4096;
-
-    /// Reply: the block's 4096 bytes.
-    pub const OP_READ: u64 = 1;
-    /// Message: the block's 4096 bytes.
-    pub const OP_WRITE: u64 = 2;
-    /// Replied once everything written before it is on stable storage.
-    pub const OP_FLUSH: u64 = 3;
-    /// Reply: capacity in blocks (u64, little endian).
-    pub const OP_INFO: u64 = 4;
-
-    pub const CODE_OK: u64 = 0;
-    pub const CODE_BUSY: u64 = 1;
-    pub const CODE_BAD_OP: u64 = 2;
-    pub const CODE_OUT_OF_RANGE: u64 = 3;
-    pub const CODE_IO_ERROR: u64 = 4;
-    /// Storage task: no key yet (see F4); try again later.
-    pub const CODE_LOCKED: u64 = 5;
-    /// Storage task: the block failed its integrity check.
-    pub const CODE_INTEGRITY: u64 = 6;
-    /// Storage task: refused (e.g. OP_UNLOCK from a task that may not unlock).
-    pub const CODE_NOT_ALLOWED: u64 = 7;
-    /// Storage task (RFD 3): a write to a service's volume from an instance that doesn't hold
-    /// its writer epoch, or an epoch below the one recorded.
-    pub const CODE_FENCED: u64 = 8;
-
-    /// Storage task: message is the 32-byte master key. Only the tasks named "keys" or
-    /// "attest" may send it; until then every other request gets CODE_LOCKED. (A storage task
-    /// that may send to "keys" also asks it for the key itself when it starts: see `keys`.)
-    pub const OP_UNLOCK: u64 = 5;
+    pub use vanir_abi::proto::block::*;
 
     pub fn unlock(storage: u64, master_key: &[u8; 32]) -> Result<(), u64> {
         call(storage, OP_UNLOCK, master_key, &mut []).map(|_| ())
     }
-
-    /// Storage task (RFD 3, P1): message is epoch, lease_until and the writer's task id (u64s,
-    /// little endian). Makes that instance the writer of its service's volume at that epoch,
-    /// creating the volume if needed. Only the task with `loads = true` may send it. An epoch
-    /// above the recorded one is recorded and flushed before the reply; the recorded epoch again
-    /// is accepted while there is no writer or the writer's slot is unchanged; anything else
-    /// gets CODE_FENCED.
-    pub const OP_EPOCH: u64 = 6;
 
     pub fn epoch(storage: u64, epoch: u64, lease_until: u64, writer: u64) -> Result<(), u64> {
         let mut msg = [0u8; 24];
@@ -250,16 +205,6 @@ pub mod block {
         msg[16..].copy_from_slice(&writer.to_le_bytes());
         call(storage, OP_EPOCH, &msg, &mut []).map(|_| ())
     }
-
-    /// Storage task (RFD 3, P2): message is a service name (32 bytes, zero padded) and that
-    /// service's 32-byte key. Only "keys" and "attest" may send it. A service's volume answers
-    /// CODE_LOCKED until its key is here (a storage task that may send to "keys" asks it too).
-    /// The key it already has again is a no-op.
-    pub const OP_SERVICE_KEY: u64 = 7;
-    /// Storage task (RFD 3, P2): message is a service name (32 bytes, zero padded). Forget that
-    /// service's key, once no instance of it is left on the node. Only the task with
-    /// `loads = true` may send it.
-    pub const OP_FORGET_KEY: u64 = 8;
 
     /// A service name zero padded to 32 bytes, as `OP_SERVICE_KEY` and `OP_FORGET_KEY` carry it.
     pub fn service_name(service: &[u8]) -> [u8; 32] {
@@ -280,73 +225,11 @@ pub mod block {
         call(storage, OP_FORGET_KEY, &service_name(service), &mut []).map(|_| ())
     }
 
-    /// Storage task (RFD 3, P3): message is a service name (32 bytes, zero padded) and the
-    /// candidate's task id (u64, little endian), or 0. From now until the candidate holds the
-    /// service volume's epoch, its reads, writes and flushes are held and answered once it does.
-    /// 0, or another candidate, calls the handoff off: what was held is answered at once, as if
-    /// it had just arrived. Only the task with `loads = true` may send it.
-    pub const OP_HANDOFF: u64 = 9;
-
     pub fn handoff(storage: u64, service: &[u8], candidate: u64) -> Result<(), u64> {
         let mut msg = [0u8; 40];
         msg[..32].copy_from_slice(&service_name(service));
         msg[32..].copy_from_slice(&candidate.to_le_bytes());
         call(storage, OP_HANDOFF, &msg, &mut []).map(|_| ())
-    }
-
-    /// Storage task, moving a service's volume to another node (RFD 3, P4–P5). Only the task
-    /// with `loads = true` may send these; each message starts with the service name (32
-    /// bytes, zero padded). Blocks travel as they are on disk: ciphertext, write counter and tag.
-    ///
-    /// Source: the ciphertext of data block `b` (in the op's block field), whose counter and
-    /// tag `OP_EXPORT_ENTRY` then gives (b, counter, tag: 32 bytes), as they were when it was
-    /// read. A block never written has counter 0, and isn't sent.
-    pub const OP_EXPORT: u64 = 10;
-    pub const OP_EXPORT_ENTRY: u64 = 11;
-    /// Metadata block `m` as it is on disk: 170 (counter, tag) entries of 24 bytes.
-    pub const OP_EXPORT_META: u64 = 12;
-    /// The volume's size in data blocks (u64) and its header's 96 bytes (counter, tag, sealed
-    /// fields).
-    pub const OP_EXPORT_HEADER: u64 = 13;
-    /// Target: name, size (u64) and the source's header: the volume is made, or emptied, with
-    /// that header. Refused while an instance writes it or a handoff waits on it.
-    pub const OP_IMPORT_HEADER: u64 = 14;
-    /// Target: name, then b, counter (u64s) and tag (16) of the block `OP_IMPORT` brings next
-    /// (its message is the ciphertext alone, so it doesn't start with the name).
-    pub const OP_IMPORT_ENTRY: u64 = 15;
-    /// Target: block `b`'s ciphertext. It must open with the service key, the volume name, `b`
-    /// and the counter from `OP_IMPORT_ENTRY` (else CODE_INTEGRITY); then it is stored as it is.
-    /// A counter lower than the one the block has already is ignored.
-    pub const OP_IMPORT: u64 = 16;
-    /// Source: name and 1 or 0. While on, each write the writer makes is made and then held,
-    /// unanswered, until `OP_MIRROR_ACK`: the agent fetches it (`OP_MIRROR_PENDING` gives its
-    /// block number, or nothing) and sends it to the target. Off answers a held write.
-    pub const OP_MIRROR: u64 = 17;
-    pub const OP_MIRROR_PENDING: u64 = 18;
-    pub const OP_MIRROR_ACK: u64 = 19;
-    /// Source, at a move's handoff: the volume becomes read-only (no writer; writes get
-    /// CODE_FENCED, and the same epoch can't be asserted again) and is flushed. Only a higher
-    /// epoch (`OP_EPOCH`) makes it writable again.
-    pub const OP_HAND_OVER: u64 = 20;
-    /// SHA-256 over the volume's header (96 bytes) and every metadata block: it identifies the
-    /// volume's exact state without decrypting it (RFD 3, P1's volume digest).
-    pub const OP_DIGEST: u64 = 21;
-    /// Wipe the volume (header and counters: every block reads as never written) and free its
-    /// space for a volume of the same size. Refused while an instance writes it.
-    pub const OP_DROP: u64 = 22;
-
-    /// Bit the storage task posts (`notify`) to an instance that has just become its volume's
-    /// writer, before it answers any request it held (RFD 3, P1). From then on nobody else writes
-    /// the volume, so what the instance caches stays current.
-    pub const NOTIFY_WRITER: u64 = 1;
-
-    pub fn op(code: u64, block: u64) -> u64 {
-        code | block << 8
-    }
-
-    /// Split an `op` into (operation code, block number).
-    pub fn split(op: u64) -> (u64, u64) {
-        (op & 0xff, op >> 8)
     }
 
     /// Send `msg` with `op` to `server`, retrying while it is busy. Returns the reply length;
@@ -380,67 +263,12 @@ pub mod block {
         call(server, OP_INFO, &[], &mut out)?;
         Ok(u64::from_le_bytes(out))
     }
-
-    pub fn code_name(code: u64) -> &'static str {
-        match code {
-            CODE_OK => "OK",
-            CODE_BUSY => "BUSY",
-            CODE_BAD_OP => "BAD_OP",
-            CODE_OUT_OF_RANGE => "OUT_OF_RANGE",
-            CODE_IO_ERROR => "IO_ERROR",
-            CODE_LOCKED => "LOCKED",
-            CODE_INTEGRITY => "INTEGRITY",
-            CODE_NOT_ALLOWED => "NOT_ALLOWED",
-            CODE_FENCED => "FENCED",
-            _ => super::err::name(code),
-        }
-    }
 }
 
 /// The NIC driver's IPC interface (`user/virtio-net`): Ethernet frames in and out. The driver
 /// knows nothing about IP; its one client is the network stack task.
 pub mod nic {
-    /// Message: one Ethernet frame (14..=1514 bytes, no FCS). Replied once the device has it.
-    pub const OP_SEND_FRAME: u64 = 1;
-    /// Reply: the frames received so far, each a little-endian u16 length and then the frame,
-    /// as many as fit in 4 KiB. Never waits. If that empties the receive ring, the driver
-    /// re-enables its receive interrupt and posts `NOTIFY_RX` to the caller when the next frame
-    /// arrives; while frames keep coming the interrupt stays off and the caller polls (NAPI).
-    pub const OP_RECV_FRAMES: u64 = 2;
-    /// Reply: `Info`.
-    pub const OP_INFO: u64 = 3;
-
-    /// Bit posted to the receiving client when frames arrive.
-    pub const NOTIFY_RX: u64 = 1;
-
-    pub const CODE_OK: u64 = 0;
-    /// Every transmit buffer is in use; try again.
-    pub const CODE_BUSY: u64 = 1;
-    pub const CODE_BAD_OP: u64 = 2;
-    /// Not a frame we can send (too short or too long).
-    pub const CODE_BAD_FRAME: u64 = 3;
-
-    /// Largest frame: a 1500-byte payload and the 14-byte Ethernet header.
-    pub const MAX_FRAME: usize = 1514;
-
-    /// The interface's address and counters (cumulative since the driver started).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct Info {
-        pub mac: [u8; 6],
-        pub link_up: u8,
-        pub _pad: u8,
-        pub rx_packets: u64,
-        pub rx_bytes: u64,
-        pub tx_packets: u64,
-        pub tx_bytes: u64,
-        /// Times the receive ring was found full: the device drops frames while it is.
-        pub rx_ring_full: u64,
-        /// Frames refused: too short, too long, or no transmit buffer free.
-        pub errors: u64,
-        pub rx_multicast: u64,
-        pub rx_broadcast: u64,
-    }
+    pub use vanir_abi::proto::nic::*;
 
     /// Call `f` with each frame of an `OP_RECV_FRAMES` reply.
     pub fn frames(reply: &[u8], mut f: impl FnMut(&[u8])) {
@@ -466,17 +294,7 @@ pub mod nic {
 /// Client side of the console driver's IPC interface (`user/virtio-console`).
 pub mod console {
     use super::{err, send, yield_now};
-
-    /// Write the message's bytes to the host. Replied once the device has taken them.
-    pub const OP_WRITE: u64 = 1;
-    pub const CODE_OK: u64 = 0;
-    /// Every transmit slot is in flight; try again.
-    pub const CODE_BUSY: u64 = 1;
-    pub const CODE_BAD_OP: u64 = 2;
-    /// Read bytes the host sent (drivers with a host-to-guest path, e.g. virtio-vsock). The
-    /// message is the most bytes wanted (u32, little endian); the reply carries what arrived,
-    /// waiting until something does.
-    pub const OP_READ: u64 = 3;
+    pub use vanir_abi::proto::console::*;
 
     /// Wait for bytes from the host, into `buf`. Returns how many arrived.
     pub fn read(driver: u64, buf: &mut [u8]) -> Result<usize, u64> {
@@ -547,52 +365,18 @@ pub fn measurements(buf: &mut [u8]) -> Result<(usize, u64), u64> {
 
 /// Client side of the attestation task (`user/attest`).
 pub mod attest {
-    /// Message: a nonce (up to 32 bytes). Reply: one JSON line with the quote, which is over
-    /// SHA-256(nonce || the attest task's X25519 public key for this boot).
-    pub const OP_QUOTE: u64 = 1;
-    /// Message: the host's X25519 public key (32 bytes) and the master key sealed to ours (48
-    /// bytes). The attest task opens it and unlocks the storage task. Reply code 0 on success.
-    pub const OP_UNWRAP: u64 = 2;
-    /// Message: the first entry wanted (u64). Reply: one JSON line of run-time log entries from
-    /// there, up to the count the last quote covered; code 1 when there are none.
-    pub const OP_RUNTIME_LOG: u64 = 3;
-    /// From the agent only. Message: a nonce (32 bytes) and the agent's X25519 key (32 bytes).
-    /// Reply: the JSON quote line as for `OP_QUOTE`, with `kx_pub` the agent's key and
-    /// `seal_pub` the attest task's own key for this boot, over SHA-256(nonce || kx_pub ||
-    /// seal_pub): the control plane seals service keys to `seal_pub` (RFD 3, P2).
-    pub const OP_QUOTE_FOR: u64 = 4;
-    /// From the agent only (RFD 3, P2). Message: a service name (32 bytes, zero padded) and a
-    /// blob the control plane sealed to `seal_pub` (80 bytes: its X25519 public key, the sealed
-    /// key, the tag). The attest task opens it and gives the key to the storage task. Reply
-    /// code 0 when storage has it, 3 when the blob doesn't open (for this service), 4 or 5 when
-    /// storage isn't there or refused (try again).
-    pub const OP_UNWRAP_VOLUME: u64 = 5;
+    pub use vanir_abi::proto::attest::*;
 }
 
 /// The key server (the task named "keys", `user/unlocker`): a stand-in for a local key store.
 pub mod keys {
-    /// Reply: the 32-byte storage master key. Only the task named "disk" gets it.
-    pub const OP_MASTER_KEY: u64 = 1;
-    /// Message: a service name (up to 32 bytes). Reply: that service's 32-byte volume key (RFD 3,
-    /// P2). Only the task named "disk" gets it.
-    pub const OP_SERVICE_KEY: u64 = 2;
+    pub use vanir_abi::proto::keys::*;
 }
 
 /// Client side of the telemetry task (`user/telemetry`).
 pub mod telemetry {
     use super::send;
-
-    /// Forward a line of text to the host as a `log` event.
-    pub const OP_LOG: u64 = 1;
-    /// A storage event: kind (u64), block (u64), then a task name (the volume, or who unlocked).
-    pub const OP_STORAGE: u64 = 2;
-
-    /// Storage event kinds. VOLUME_CREATED: block = first block of the volume on the disk;
-    /// UNLOCKED: name = the task that gave the key; INTEGRITY_ERROR: block = the volume's block.
-    pub const VOLUME_CREATED: u64 = 1;
-    pub const STORAGE_LOCKED: u64 = 2;
-    pub const STORAGE_UNLOCKED: u64 = 3;
-    pub const INTEGRITY_ERROR: u64 = 4;
+    pub use vanir_abi::proto::telemetry::*;
 
     /// Send `text` to telemetry task `id`. Fails like `send`.
     pub fn log(id: u64, text: &[u8]) -> Result<(), u64> {
@@ -608,25 +392,6 @@ pub mod telemetry {
         msg[16..16 + n].copy_from_slice(&name[..n]);
         send(id, OP_STORAGE, &msg[..16 + n], &mut []).map(|_| ())
     }
-
-    /// A network event (`Record`: the event's name, then its fields), e.g. a routing change.
-    pub const OP_NET: u64 = 3;
-    /// A counter snapshot (`Record`: the scope, then the counters, cumulative). Reply: the
-    /// snapshot interval in ticks (u64), which the host may change; send the next one then.
-    pub const OP_COUNTERS: u64 = 4;
-    /// From the task named "control" or "agent" only: set the snapshot interval, in milliseconds (u64),
-    /// bounded to 100 ms..60 s.
-    pub const OP_SET_INTERVAL: u64 = 5;
-
-    /// Any other event (`Record`: the event's name, then its fields), e.g. a crash reported by
-    /// the supervisor.
-    pub const OP_EVENT: u64 = 6;
-    /// From the task named "agent", when there is no uplink driver: the JSON lines waiting to
-    /// go to the control plane (whole lines, at most 4 KiB), oldest first.
-    pub const OP_PULL: u64 = 7;
-
-    /// Counter snapshots go out this often until the host says otherwise (RFD 1: 1 s).
-    pub const DEFAULT_INTERVAL_TICKS: u64 = 100;
 
     /// A line of text, `name key=value key=value ...`, that telemetry turns into a JSON
     /// record: numbers stay numbers, anything else becomes a string. Built in a fixed buffer;
@@ -724,108 +489,7 @@ pub fn tsc_per_tick() -> u64 {
 /// wait, except `OP_WAIT`, which returns when any of the caller's handles has something to do.
 pub mod net {
     use super::send;
-
-    /// Message: the port (u16). Reply: a listener handle (u32). `CODE_NOT_ALLOWED` if the
-    /// caller's manifest entry doesn't declare the port.
-    pub const OP_LISTEN: u64 = 1;
-    /// Message: the most ticks to wait (u64; 0 = no limit). Reply: `Event`s for the caller's
-    /// handles that have something to do, or none if the time ran out.
-    pub const OP_WAIT: u64 = 2;
-    /// Message: a listener handle. Reply: `Accepted`, or `CODE_WOULD_BLOCK`.
-    pub const OP_ACCEPT: u64 = 3;
-    /// Message: a connection handle and the most bytes wanted (u32 each). Reply: received bytes,
-    /// `CODE_WOULD_BLOCK` if there are none yet, `CODE_CLOSED` once the peer has closed or reset.
-    pub const OP_RECV: u64 = 4;
-    /// Message: a connection handle (u32), then bytes. Reply: how many were taken (u32), maybe
-    /// 0; `EV_WRITE` comes when there is room again.
-    pub const OP_SEND: u64 = 5;
-    /// Message: a handle. Closes the connection (or stops listening) and frees the handle.
-    pub const OP_CLOSE: u64 = 6;
-    /// Message: a connection handle. Sends a FIN; reading goes on until the peer closes.
-    pub const OP_SHUTDOWN: u64 = 7;
-    /// The caller is ready to serve: only then can it become its service's live instance.
-    pub const OP_READY: u64 = 8;
-    /// A draining instance has finished its work (see `EV_DRAIN`).
-    pub const OP_DONE: u64 = 9;
-    /// Routing (tasks with `routes = true`): message an instance's task id (u64), which
-    /// becomes its service's live instance. `CODE_NOT_READY` if it hasn't said `OP_READY`.
-    pub const OP_ROUTE: u64 = 10;
-    /// Routing: message an instance's task id and a deadline in ticks (u64 each). The instance
-    /// gets no new connections and an `EV_DRAIN`; connections still open at the deadline are
-    /// reset. Replied when the instance is drained: connections reset at the deadline (u64).
-    pub const OP_DRAIN: u64 = 11;
-    /// Routing: message `Block`. Drop packets from that range until it expires.
-    pub const OP_BLOCK: u64 = 12;
-    /// From a task with `routes = true`. Message: an instance's task id (u64). Reply: its
-    /// status (u64, `STATUS_*`) and its `drain_forced` count (u64).
-    pub const OP_STATUS: u64 = 13;
-    /// From a task with `connects = true`. Message: IPv4 address (4 bytes) and port (u16).
-    /// Reply: a connection handle (u32), usable at once; `EV_WRITE` comes once it is connected,
-    /// `EV_CLOSED` if it fails. `CODE_NOT_READY` while the stack has no address.
-    pub const OP_CONNECT: u64 = 14;
-
-    /// `OP_STATUS` answers. UNKNOWN: not an instance (yet, or any more: it hasn't listened, or
-    /// it has gone).
-    pub const STATUS_UNKNOWN: u64 = 0;
-    pub const STATUS_GONE: u64 = STATUS_UNKNOWN;
-    /// Listening, but hasn't said `OP_READY`.
-    pub const STATUS_STARTING: u64 = 1;
-    pub const STATUS_READY: u64 = 2;
-    pub const STATUS_LIVE: u64 = 3;
-    pub const STATUS_DRAINING: u64 = 4;
-    pub const STATUS_DRAINED: u64 = 5;
-
-    /// `OP_DRAIN` flag (third u64 of the message): answer at once instead of when the drain is
-    /// over; follow it with `OP_STATUS`.
-    pub const DRAIN_NOWAIT: u64 = 1;
-
-    pub const CODE_OK: u64 = 0;
-    pub const CODE_WOULD_BLOCK: u64 = 1;
-    pub const CODE_BAD_OP: u64 = 2;
-    pub const CODE_NOT_ALLOWED: u64 = 3;
-    pub const CODE_BAD_HANDLE: u64 = 4;
-    /// The socket pool is used up.
-    pub const CODE_NO_SOCKETS: u64 = 5;
-    pub const CODE_CLOSED: u64 = 6;
-    pub const CODE_NOT_READY: u64 = 7;
-
-    /// A listener has a connection to accept.
-    pub const EV_ACCEPT: u32 = 1;
-    /// A connection has bytes to read, or the peer closed it (`OP_RECV` says which).
-    pub const EV_READ: u32 = 2;
-    /// A connection has room to send again after an `OP_SEND` took less than it was given.
-    pub const EV_WRITE: u32 = 4;
-    /// The connection is closed or reset: close the handle.
-    pub const EV_CLOSED: u32 = 8;
-    /// (Handle 0.) This instance is draining: finish the requests in flight, accept nothing new,
-    /// close connections as they go idle, then say `OP_DONE`.
-    pub const EV_DRAIN: u32 = 16;
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct Event {
-        pub handle: u32,
-        pub flags: u32,
-    }
-
-    /// A new connection: its handle, and the client's address and port.
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct Accepted {
-        pub handle: u32,
-        pub addr: [u8; 4],
-        pub port: u16,
-        pub _pad: u16,
-    }
-
-    /// An `OP_BLOCK` entry: addresses matching `addr` in the top `prefix` bits, for `ticks`.
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct Block {
-        pub addr: [u8; 4],
-        pub prefix: u32,
-        pub ticks: u64,
-    }
+    pub use vanir_abi::proto::net::*;
 
     /// Send a request whose reply is at most `reply.len()`; fails with the code or kernel error.
     fn call(net: u64, op: u64, msg: &[u8], reply: &mut [u8]) -> Result<usize, u64> {
@@ -941,20 +605,6 @@ pub mod net {
     pub fn block(net: u64, entry: &Block) -> Result<(), u64> {
         let bytes = unsafe { core::slice::from_raw_parts(entry as *const Block as *const u8, core::mem::size_of::<Block>()) };
         call(net, OP_BLOCK, bytes, &mut []).map(|_| ())
-    }
-
-    pub fn code_name(code: u64) -> &'static str {
-        match code {
-            CODE_OK => "OK",
-            CODE_WOULD_BLOCK => "WOULD_BLOCK",
-            CODE_BAD_OP => "BAD_OP",
-            CODE_NOT_ALLOWED => "NOT_ALLOWED",
-            CODE_BAD_HANDLE => "BAD_HANDLE",
-            CODE_NO_SOCKETS => "NO_SOCKETS",
-            CODE_CLOSED => "CLOSED",
-            CODE_NOT_READY => "NOT_READY",
-            _ => super::err::name(code),
-        }
     }
 }
 
