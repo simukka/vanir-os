@@ -190,12 +190,21 @@ vanir_rt::service!(Counter);
   syscalls and IPC, for what the runtime doesn't wrap yet (e.g. calling another service, open
   question 4). What services use it for shows which typed wrappers are missing.
 
+*Built in R3 (`user/rt`), with these differences: `every` is `tick` (it returns the ticks until
+its next call); sizes come from `service!(S, connections = N)`, since stable Rust can't size an
+array from a trait's associated constant; a failed `start` leaves the instance never ready
+rather than exiting (the agent fails the deployment); and each program still needs its own
+`build.rs` for the linker script, as a library's build script can't pass link arguments to the
+programs that use it.*
+
 ### P4. Capabilities come from the descriptor
 
 At start the runtime reads `task_listen` (service, ports, volume size) and offers only what the
 descriptor declares. `ctx.volume()` without a declared volume is `Error::NotDeclared`, and
 listening on an undeclared port can't be expressed. The kernel's checks stay as they are; this
-only makes mistakes show up early and readably.
+only makes mistakes show up early and readably. *(Built in R3: the runtime listens on the
+descriptor's first port, and refuses to become ready if the descriptor allows more connections
+than the build has room for.)*
 
 ### P5. Configuration in the signed descriptor
 
@@ -218,7 +227,8 @@ settings, signed with the image, and the runtime hands them to the service.
   kernel accepts both formats while any `VNRDSC01` image is in use.
 - **Reaching the service:** the kernel already copies descriptor fields to a slot's task through
   `task_listen` (`ListenInfo`). Settings are added at the end, read by size (P2). The runtime
-  offers `ctx.config(key) -> Option<u64>`.
+  offers `ctx.config(key) -> u64` (the descriptor's value, else the declared default). *(Built
+  in R2c and R3.)*
 - **Declared by the service:** a service lists its settings and defaults
   (`const CONFIG: &[(&str, u64)]`). The runtime refuses to start with a setting it doesn't
   list, so a typo in the descriptor is an error at load, not a silently ignored setting.
@@ -236,6 +246,9 @@ settings, signed with the image, and the runtime hands them to the service.
   RFD 1 and 2 tests.
 - Keep the load tests: `counter-load` and `counter-cached-load` should give the same numbers
   through the runtime, within noise. The runtime's overhead is part of what they measure.
+
+*Built in R3: `user/counter`, with `counter-v1-cached` and `counter-v2-cached` as the same ELF
+signed with `persist_ticks = 1000`; `http` keeps only the web server and its test features.*
 
 ## Phasing (rough)
 

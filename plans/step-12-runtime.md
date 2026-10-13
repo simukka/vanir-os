@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1 and R2 implemented (R1a–R1c, R2a–R2d); R3 planned.
+Status: R1, R2 and R3 implemented (R1a–R1c, R2a–R2d, R3a–R3d).
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -392,9 +392,8 @@ failed write until then), porting `http` itself to the runtime.
 1. `Service`, `Ctx` (name, `config`, `volume`, `uptime`), `Volume`, `Error`, `Runtime<N>`,
    `service!`; the loop from `http`, with the drain, ready, telemetry and writer bit; settings
    and connection checks at start; `raw` behind `unstable`.
-2. A first service to drive it before `counter` exists: `user/hello-rt`? No: R3c's `counter` is
-   the first service; R3b ends when `vanir-rt` builds and a minimal `counter` (`/`, `/count`
-   without features) serves `slot-load`'s peer as `web` would. (Kept in R3c's commit.)
+2. No separate example: R3c's `counter` is the runtime's first service, and its tests are the
+   runtime's tests.
 
 #### R3c: `counter` on the runtime
 
@@ -425,4 +424,29 @@ failed write until then), porting `http` itself to the runtime.
   `slot-memory`/`slot-image-size` and the boot lines (`frames of 256`) show it.
 - **A service that never returns from `request`** blocks the loop, as in `http` today; not
   changed by R3.
+
+### As built (R3)
+
+Where it departs from the plan:
+
+- **A failed start, or a descriptor that doesn't fit, waits instead of exiting:** the plan said
+  "exits 1"; exiting would make the supervisor restart it (or end a test run with
+  `halt-on-exit`). Never saying ready is what `http` did with a volume it couldn't open, and the
+  agent fails the deployment at its deadline either way.
+- **The writer line comes from the volume handle**, right after the storage request that
+  carried the bit (and from the runtime after each wait): `volume-fence` expects `now the
+  writer` before the first `writes OK`, as `http` printed them. Printing it after the callback
+  reversed them.
+- **Every program still needs a `build.rs` for the linker script:** a library's build script
+  can't pass link arguments to the programs that use it, so P5's "`vanir-rt` provides the
+  linker script" doesn't work as written. `user/counter/build.rs` is `http`'s; the first
+  `counter` images were refused as "not a loadable ELF image" without it.
+- **`ctx.exit_after_response(code)`** was added for the `exit-on-request` test feature; the
+  runtime calls `drain()` before exiting, so the cached count is written.
+- **`--image-suffix=-cached`** needs the `=`: argparse reads `-cached` alone as an option.
+- **`http` keeps `volume-probe`** for `volume-none` only (a web image, no volume).
+- **Results:** R3a's full suite 156 passed; R3c's (after the two fixes above) 156 passed.
+  Load tests at 8 clients, KVM, 60 s: `counter-load` 1644 requests/s (1687 before R1, 1695
+  after R1, 1742 after R2), `counter-cached-load` 14376 (14775 before); none lost or repeated.
+  The runtime costs at most a few percent, within the spread between runs.
 

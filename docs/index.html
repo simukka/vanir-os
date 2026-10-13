@@ -1030,10 +1030,12 @@ served as they are: reads succeed, writes get <code>FENCED</code>
 retries, if ever full). A restarted <code>disk</code> loses what it held (its callers get
 <code>DEAD</code>), and the agent sends the handoff again with the epochs.</p>
 
-<p><code>http</code> uses a volume when its descriptor declares one (<code>counter</code>,
-<code>tests/slots/counter-v*.toml</code>): <code>/count</code> reads a count from block 0, adds
-one and writes it back. It reads block 0 before it says it is ready, and never says so if that
-fails. A task named like a service still gets a volume of its own: the table records each
+<p><code>counter</code> (<code>user/counter</code>, a service on the runtime, <a
+href="#deploy-runtime">15.8</a>; <code>tests/slots/counter-v*.toml</code>) uses the volume its
+descriptor declares: <code>/count</code> reads a count from block 0, adds one and writes it
+back, or with the setting <code>persist_ticks</code> counts in memory and writes it every that
+many ticks and before it drains or exits. It opens the volume before it says it is ready, and
+never says so if that fails. A task named like a service still gets a volume of its own: the table records each
 volume's kind, and their keys use different salts (<code>volume-kinds</code>).</p>
 
 <p>Events: <code>epoch_changed</code> (volume, epoch, writer slot), <code>write_fenced</code>
@@ -1677,6 +1679,64 @@ handoff off, and the control plane gives node a a new epoch)</figcaption>
     Both are for a follow-up RFD.</li>
 </ul>
 
+<h3 id="deploy-runtime"><span class="num">15.8</span>Writing a service (<code>vanir-rt</code>)<a class="anchor" href="#deploy-runtime">#</a></h3>
+
+<p>A service in a slot is written against <code>vanir-rt</code> (<code>user/rt</code>, RFD 9,
+P3), not against <code>vanir_user</code>: it implements <code>Service</code>, and the runtime
+owns the event loop. <code>user/counter</code> is the example:</p>
+
+<pre><code>use vanir_rt::{Ctx, Error, Request, Response, Service, Volume};
+
+struct Counter { volume: Volume, persist_ticks: u64, /* ... */ }
+
+impl Service for Counter {
+    const CONFIG: &amp;'static [(&amp;'static str, u64)] = &amp;[("persist_ticks", 0)];
+    fn start(ctx: &amp;mut Ctx) -&gt; Result&lt;Self, Error&gt; {
+        Ok(Counter { volume: ctx.volume()?, persist_ticks: ctx.config("persist_ticks") })
+    }
+    fn request(&amp;mut self, ctx: &amp;mut Ctx, req: &amp;Request, res: &amp;mut Response) { /* write!(res, ...) */ }
+    fn tick(&amp;mut self, ctx: &amp;mut Ctx) -&gt; Option&lt;u64&gt; { /* persist; ticks until the next call */ }
+    fn drain(&amp;mut self, ctx: &amp;mut Ctx) { /* persist before done */ }
+    fn fenced(&amp;mut self, ctx: &amp;mut Ctx) { /* drop the cached count */ }
+}
+
+vanir_rt::service!(Counter, connections = 64);</code></pre>
+
+<ul>
+  <li><strong>The runtime owns the lifecycle.</strong> It finds <code>net</code>, listens on
+    the port the descriptor declares, says it is ready once <code>start</code> returns Ok (never,
+    if it returns Err: the agent fails the deployment), answers HTTP/1.1 with keep-alive and the
+    header and idle deadlines, and sends <code>http</code> telemetry counters. On a drain it stops
+    accepting, closes connections as their requests finish, calls <code>drain()</code>, then
+    says it is done; a service can't skip a step or reorder them. It finds <code>net</code> again
+    if the network stack restarts.</li>
+  <li><strong>Requests:</strong> <code>request</code> gets each GET or HEAD (the runtime answers
+    anything else: 405, 413, 501, ...), and writes a status and body (at most 448 bytes).</li>
+  <li><strong>Settings</strong> (<a href="#deploy-slots">15.1</a>): <code>CONFIG</code> lists
+    the service's settings and defaults; <code>ctx.config(key)</code> reads one. A descriptor
+    with a setting the service doesn't list, or allowing more connections than
+    <code>service!</code> made room for, never becomes ready, and says why.</li>
+  <li><strong>The volume:</strong> <code>ctx.volume()</code> opens the one the descriptor
+    declares (<code>Error::NotDeclared</code> without), waiting while storage is locked.
+    <code>Volume::read</code>, <code>write</code>, <code>flush</code> return
+    <code>vanir_rt::Error</code> (<code>Fenced</code>, <code>Locked</code>,
+    <code>Integrity</code>, <code>OutOfRange</code>, ...). A write refused as
+    <code>Fenced</code> makes the runtime call <code>fenced()</code> once the callback returns;
+    when the instance becomes the writer, the handle prints it.</li>
+  <li><strong>Sizes are fixed at build time:</strong> no heap; the connection table is a static
+    of <code>service!</code>'s size (stable Rust can't size an array from a trait's constant).</li>
+  <li><strong>Escape hatch:</strong> <code>vanir_rt::raw</code> (feature <code>unstable</code>)
+    gives the task's raw syscalls and IPC; <code>counter</code>'s <code>volume-probe</code> test
+    feature uses it to check it can't name itself the writer.</li>
+</ul>
+
+<p><code>http</code> stays the plain web server of the RFD 1 and 2 tests (<code>web</code>), with
+its own loop and test features; it shares the runtime's request parser
+(<code>vanir_rt::http</code>). The load tests (<a href="#build">20</a>) measure the runtime:
+moving <code>counter</code> from <code>http</code> to <code>vanir-rt</code> changed its
+throughput at 8 clients from 1687 to 1644 requests/s (a write per request) and from 14775 to
+14376 (cached): 2&ndash;3%, about the spread between runs of the same build (1687 to 1742).</p>
+
 <h2 id="syscalls"><span class="num">16</span>Syscalls<a class="anchor" href="#syscalls">#</a></h2>
 
 <p><code>int 0x80</code>. Number in <code>rax</code>; arguments in <code>rdi, rsi, rdx, r10,
@@ -1966,11 +2026,14 @@ guest's telemetry its CPU (all tasks, and each task), memory and I/O (disk block
 written, network bytes). The samples go to <code>build/bench/counter-load.csv</code>, and
 <code>tools/bench-chart.py</code> draws them, time along the x axis, as
 <code>build/bench/counter-load.svg</code>.</p>
-<p><code>counter-cached-load</code> is the same with <code>http/count-cached</code>: counter keeps
-the count in memory once it has read (and written) it on the volume, and writes it back every
-10 s and before it drains or exits. A crash loses up to 10 s of counts; a write that fails
+<p><code>counter-cached-load</code> is the same with <code>counter-v1-cached</code>: the same
+program, signed with <code>persist_ticks = 1000</code> (<a href="#deploy-slots">15.1</a>), so
+counter keeps the count in memory once it has read (and written) it on the volume, and writes
+it back every 10 s and before it drains or exits. A crash loses up to 10 s of counts; a write that fails
 (<code>FENCED</code>) drops the cached count, so the next request goes to the volume.
-<code>agent-volume-cached</code> checks that a deployment loses no count with it: v1 writes its
+<code>agent-volume-cached</code> (the control plane with <code>--image-suffix=-cached</code>,
+deploying <code>counter-v1-cached</code> and <code>counter-v2-cached</code>) checks that a
+deployment loses no count with it: v1 writes its
 count before it says it has drained, and v2's first request, held until v2 is the writer, reads
 it. One run under KVM (60 s, 1 to 32 clients):</p>
 <table>
@@ -2087,7 +2150,9 @@ user/unlocker/            key server "keys" (test stand-in)
 user/virtio-net/          NIC driver: frames in and out; crash-after-10-frames test feature
 user/nictest/             answers ARP and ping by hand (driver test, no stack)
 user/net/                 network stack (smoltcp): sockets, routing, limits, counters
-user/http/                HTTP/1.1 service; exit-on-request, crash and listen-81 test features
+user/http/                HTTP/1.1 server (web); exit-on-request, crash and listen-81 test features
+user/rt/                  vanir-rt: the service runtime (Service trait, event loop, HTTP, volume, settings)
+user/counter/             counter: a service on vanir-rt with a volume; persist_ticks setting
 user/mgmt-echo/           TCP echo on the management stack (stands in for the agent)
 user/switcher/            routing scripts for tests (RFD 1)
 user/agent/               the node agent: control plane connection, reconciliation, lifecycle, slot loading; test scripts (features)
