@@ -1,0 +1,6 @@
+# Format 1 (256 bytes, before RFD 9): no ABI version (reads as 1.0) and no settings.
+name = "fixture-service"
+version = 7
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+format = 1

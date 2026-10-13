@@ -135,15 +135,18 @@ pub fn script() -> Option<u64> {
     #[cfg(feature = "try-tampered-desc")]
     {
         // Listen on one more port than was signed.
-        let mut desc = [0u8; 256];
-        desc.copy_from_slice(WEB_V1.descriptor);
-        desc[80] += 1;
-        desc[96..98].copy_from_slice(&81u16.to_le_bytes());
-        desc[98..100].copy_from_slice(&64u16.to_le_bytes());
-        desc[100..102].copy_from_slice(&64u16.to_le_bytes());
+        use vanir_abi::descriptor::{AT_LISTEN, AT_LISTEN_COUNT, LEN_V2, LISTEN_ENTRY_LEN};
+        let n = WEB_V1.descriptor.len();
+        let mut desc = [0u8; LEN_V2];
+        desc[..n].copy_from_slice(WEB_V1.descriptor);
+        desc[AT_LISTEN_COUNT] += 1;
+        let at = AT_LISTEN + LISTEN_ENTRY_LEN;
+        desc[at..at + 2].copy_from_slice(&81u16.to_le_bytes());
+        desc[at + 2..at + 4].copy_from_slice(&64u16.to_le_bytes());
+        desc[at + 4..at + 6].copy_from_slice(&64u16.to_le_bytes());
         let slot = slot_id("small-0");
         slot::stage_all(slot, WEB_V1.elf).expect("stage");
-        report_refusal("web-v1 (descriptor changed)", slot::load(slot, WEB_V1.sig, &desc));
+        report_refusal("web-v1 (descriptor changed)", slot::load(slot, WEB_V1.sig, &desc[..n]));
         return Some(0);
     }
     #[cfg(feature = "try-boot-sig")]
@@ -160,6 +163,11 @@ pub fn script() -> Option<u64> {
     #[cfg(feature = "try-large")]
     {
         let _ = load_and_report("small-0", &image!("web-large"));
+        return Some(0);
+    }
+    #[cfg(feature = "try-abi-next")]
+    {
+        let _ = load_and_report("small-0", &image!("web-abi-next"));
         return Some(0);
     }
     #[cfg(feature = "try-occupied")]

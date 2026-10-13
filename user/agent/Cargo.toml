@@ -10,6 +10,7 @@ bench = false
 
 [dependencies]
 vanir-user = { path = "../lib" }
+vanir-abi = { path = "../../abi" }
 noise = { path = "../noise" }
 ed25519-compact = { version = "2.6.0", default-features = false, features = ["x25519"] }
 sha2 = { version = "0.11.0", default-features = false }
@@ -43,6 +44,7 @@ try-tampered-desc = ["test-images"]   # a byte of the descriptor changed after s
 try-boot-sig = ["test-images"]        # a boot image's signature file (VNRSIG01)
 try-floor = ["test-images"]           # version below the descriptor's min_version
 try-large = ["test-images"]           # descriptor asks for another slot class
+try-abi-next = ["test-images"]        # built for ABI 1.1 (RFD 9, P2)
 try-occupied = ["test-images"]        # load web v1, then stage over it while it runs
 try-web-v1 = ["test-images"]
 # deployments with the lifecycle (RFD 2, P3/P4), web v1 live in small-0 first:

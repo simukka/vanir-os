@@ -19,6 +19,7 @@ dependencies = [
  "ed25519-compact",
  "noise",
  "sha2",
+ "vanir-abi",
  "vanir-user",
 ]
 

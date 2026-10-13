@@ -18,6 +18,18 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+/// The ABI's version (RFD 9, P2). A slot image records the version it was built against in its
+/// descriptor; the kernel loads it if the major versions are equal and the image's minor is at
+/// most the kernel's (else `events::REJECT_ABI`).
+///
+/// **A minor version may only add:** syscalls, error codes, flags, notifications, task states,
+/// rejection reasons, fields at the end of a record read by size, and descriptor fields in
+/// reserved space. Anything else (renumbering, removing, changing a field's meaning, growing a
+/// record read as an array) is a new major version. `tests/snapshot.rs` fails on any change, so
+/// each one is made on purpose, with this number.
+pub const ABI_MAJOR: u32 = 1;
+pub const ABI_MINOR: u32 = 0;
+
 /// `int 0x80` system calls: rax = number; arguments in rdi, rsi, rdx, r10, r8, r9; results in
 /// rax (then rdx, rsi). Simple calls return `ERROR` when they fail; IPC calls return `err` codes.
 pub mod sys {
@@ -274,6 +286,8 @@ pub mod events {
     pub const REJECT_TOO_LARGE: u64 = 11;
     pub const REJECT_BAD_ELF: u64 = 12;
     pub const REJECT_BELOW_FLOOR: u64 = 13;
+    /// Built for an ABI this kernel doesn't serve (another major version, or a newer minor).
+    pub const REJECT_ABI: u64 = 14;
 
     pub const fn rejection(reason: u64) -> &'static str {
         match reason {
@@ -290,6 +304,7 @@ pub mod events {
             REJECT_TOO_LARGE => "image needs more memory than its slot class has",
             REJECT_BAD_ELF => "not a loadable ELF image",
             REJECT_BELOW_FLOOR => "version below its min_version",
+            REJECT_ABI => "built for an ABI this kernel doesn't serve",
             _ => "unknown",
         }
     }
@@ -749,6 +764,163 @@ pub mod proto {
                 _ => crate::err::name(code),
             }
         }
+    }
+}
+
+/// A slot image's descriptor (RFD 2, P1; RFD 9, P5): what the service may do, signed with its
+/// image. `tools/sign-image.py` writes it from TOML; the kernel checks it at `slot_load`; the
+/// agent reads it. Little endian; offsets are `AT_*`.
+///
+/// ```text
+///   0   8  magic: "VNRDSC01" (format 1, 256 bytes) or "VNRDSC02" (format 2, 512 bytes)
+///   8  32  name, zero padded (the service)
+///  40   8  version (must equal the signed version)
+///  48   8  min_version: the oldest version that may still run
+///  56  16  slot class, zero padded
+///  72   4  drain deadline default, seconds
+///  76   4  drain deadline maximum, seconds
+///  80   4  listen entries in use (at most 8)
+///  84   4  zero
+///  88  64  8 listen entries: port, max_connections, max_per_source, 0 (u16 each)
+/// 152   8  volume_blocks: data blocks of the service's volume (RFD 3), 0 = none
+/// Format 1: 160..256 zero. Format 2:
+/// 160   4  ABI major the image was built against
+/// 164   4  ABI minor
+/// 168   8  settings in use (at most 12)
+/// 176 288  12 settings: key (16 bytes, zero padded), value (u64)
+/// 464  48  zero
+/// ```
+pub mod descriptor {
+    pub const MAGIC_V1: &[u8; 8] = b"VNRDSC01";
+    pub const MAGIC_V2: &[u8; 8] = b"VNRDSC02";
+    pub const LEN_V1: usize = 256;
+    pub const LEN_V2: usize = 512;
+
+    pub const AT_NAME: usize = 8;
+    pub const NAME_LEN: usize = 32;
+    pub const AT_VERSION: usize = 40;
+    pub const AT_MIN_VERSION: usize = 48;
+    pub const AT_SLOT_CLASS: usize = 56;
+    pub const SLOT_CLASS_LEN: usize = 16;
+    pub const AT_DRAIN_DEFAULT: usize = 72;
+    pub const AT_DRAIN_MAX: usize = 76;
+    pub const AT_LISTEN_COUNT: usize = 80;
+    pub const AT_LISTEN: usize = 88;
+    pub const LISTEN_ENTRY_LEN: usize = 8;
+    pub const MAX_LISTEN: usize = 8;
+    pub const AT_VOLUME_BLOCKS: usize = 152;
+    /// Format 1's reserved bytes start here (all zero).
+    pub const AT_RESERVED_V1: usize = 160;
+    pub const AT_ABI_MAJOR: usize = 160;
+    pub const AT_ABI_MINOR: usize = 164;
+    pub const AT_SETTINGS_COUNT: usize = 168;
+    pub const AT_SETTINGS: usize = 176;
+    pub const KEY_LEN: usize = 16;
+    pub const SETTING_LEN: usize = 24;
+    pub const MAX_SETTINGS: usize = 12;
+    /// Format 2's reserved bytes start here (all zero).
+    pub const AT_RESERVED_V2: usize = 464;
+
+    fn bytes<const N: usize>(d: &[u8], at: usize) -> [u8; N] {
+        let mut out = [0; N];
+        if let Some(b) = d.get(at..at + N) {
+            out.copy_from_slice(b);
+        }
+        out
+    }
+
+    pub fn u16_at(d: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(bytes(d, at))
+    }
+
+    pub fn u32_at(d: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes(d, at))
+    }
+
+    pub fn u64_at(d: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes(d, at))
+    }
+
+    /// 1 or 2 if `d` has that format's magic and length; else None.
+    pub fn format(d: &[u8]) -> Option<u8> {
+        match (d.len(), d.get(..8)) {
+            (LEN_V1, Some(m)) if m == MAGIC_V1 => Some(1),
+            (LEN_V2, Some(m)) if m == MAGIC_V2 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// A zero-padded field up to its first zero.
+    pub fn padded(field: &[u8]) -> &[u8] {
+        &field[..field.iter().position(|&b| b == 0).unwrap_or(field.len())]
+    }
+
+    /// The service's name.
+    pub fn name(d: &[u8]) -> &[u8] {
+        padded(d.get(AT_NAME..AT_NAME + NAME_LEN).unwrap_or(&[]))
+    }
+
+    pub fn slot_class(d: &[u8]) -> &[u8] {
+        padded(d.get(AT_SLOT_CLASS..AT_SLOT_CLASS + SLOT_CLASS_LEN).unwrap_or(&[]))
+    }
+
+    pub fn version(d: &[u8]) -> u64 {
+        u64_at(d, AT_VERSION)
+    }
+
+    pub fn min_version(d: &[u8]) -> u64 {
+        u64_at(d, AT_MIN_VERSION)
+    }
+
+    /// The drain deadline's default and maximum, in seconds.
+    pub fn drain_secs(d: &[u8]) -> (u32, u32) {
+        (u32_at(d, AT_DRAIN_DEFAULT), u32_at(d, AT_DRAIN_MAX))
+    }
+
+    pub fn listen_count(d: &[u8]) -> usize {
+        u32_at(d, AT_LISTEN_COUNT) as usize
+    }
+
+    /// Listen entry `i`: (port, max_connections, max_per_source, the zero that follows).
+    pub fn listen(d: &[u8], i: usize) -> (u16, u16, u16, u16) {
+        let at = AT_LISTEN + LISTEN_ENTRY_LEN * i;
+        (u16_at(d, at), u16_at(d, at + 2), u16_at(d, at + 4), u16_at(d, at + 6))
+    }
+
+    pub fn volume_blocks(d: &[u8]) -> u64 {
+        u64_at(d, AT_VOLUME_BLOCKS)
+    }
+
+    /// The ABI version the image was built against: format 1 predates versions, so 1.0.
+    pub fn abi(d: &[u8]) -> (u32, u32) {
+        match format(d) {
+            Some(2) => (u32_at(d, AT_ABI_MAJOR), u32_at(d, AT_ABI_MINOR)),
+            _ => (1, 0),
+        }
+    }
+
+    /// Settings in use (0 for format 1).
+    pub fn settings_count(d: &[u8]) -> usize {
+        match format(d) {
+            Some(2) => u64_at(d, AT_SETTINGS_COUNT) as usize,
+            _ => 0,
+        }
+    }
+
+    /// Setting `i`: its key (zero padded) and value.
+    pub fn setting(d: &[u8], i: usize) -> ([u8; KEY_LEN], u64) {
+        let at = AT_SETTINGS + SETTING_LEN * i;
+        (bytes(d, at), u64_at(d, at + KEY_LEN))
+    }
+
+    /// A setting key's rule: 1 to 16 bytes of `a-z`, `0-9` and `_`, starting with a letter,
+    /// zero padded.
+    pub fn valid_key(key: &[u8; KEY_LEN]) -> bool {
+        let k = padded(key);
+        !k.is_empty()
+            && k[0].is_ascii_lowercase()
+            && k.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && key[k.len()..].iter().all(|&b| b == 0)
     }
 }
 

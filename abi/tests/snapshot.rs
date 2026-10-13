@@ -210,6 +210,20 @@ fn values() {
 }
 
 #[test]
+fn version_and_descriptor() {
+    // Added in R2b (RFD 9, P2 and P5), on purpose.
+    assert_eq!((ABI_MAJOR, ABI_MINOR), (1, 0));
+    assert_eq!(events::REJECT_ABI, 14);
+    use descriptor::*;
+    assert_eq!((MAGIC_V1, MAGIC_V2, LEN_V1, LEN_V2), (b"VNRDSC01", b"VNRDSC02", 256, 512));
+    assert_eq!((AT_NAME, NAME_LEN, AT_VERSION, AT_MIN_VERSION, AT_SLOT_CLASS, SLOT_CLASS_LEN), (8, 32, 40, 48, 56, 16));
+    assert_eq!((AT_DRAIN_DEFAULT, AT_DRAIN_MAX, AT_LISTEN_COUNT, AT_LISTEN, LISTEN_ENTRY_LEN, MAX_LISTEN), (72, 76, 80, 88, 8, 8));
+    assert_eq!((AT_VOLUME_BLOCKS, AT_RESERVED_V1, AT_ABI_MAJOR, AT_ABI_MINOR, AT_SETTINGS_COUNT), (152, 160, 160, 164, 168));
+    assert_eq!((AT_SETTINGS, KEY_LEN, SETTING_LEN, MAX_SETTINGS, AT_RESERVED_V2), (176, 16, 24, 12, 464));
+    assert_eq!(AT_SETTINGS + SETTING_LEN * MAX_SETTINGS, AT_RESERVED_V2);
+}
+
+#[test]
 fn rejection_names() {
     assert_eq!(events::rejection(1), "no image");
     assert_eq!(events::rejection(2), "no signature");
@@ -224,7 +238,9 @@ fn rejection_names() {
     assert_eq!(events::rejection(11), "image needs more memory than its slot class has");
     assert_eq!(events::rejection(12), "not a loadable ELF image");
     assert_eq!(events::rejection(13), "version below its min_version");
-    assert_eq!(events::rejection(14), "unknown");
+    // ABI 1.0, R2b (RFD 9, P2): added on purpose.
+    assert_eq!(events::rejection(14), "built for an ABI this kernel doesn't serve");
+    assert_eq!(events::rejection(15), "unknown");
 }
 
 #[test]

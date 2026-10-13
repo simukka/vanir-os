@@ -1303,7 +1303,7 @@ pub fn slot_load(frame: &mut TrapFrame) {
     };
     let (sig_ptr, sig_len, desc_ptr, desc_len) = (frame.rsi, frame.rdx, frame.r10, frame.r8);
     let mut sig = [0u8; verify::SIG_FILE_LEN_V2];
-    let mut desc = [0u8; verify::DESCRIPTOR_LEN];
+    let mut desc = [0u8; verify::DESCRIPTOR_MAX];
     let (Some(sig), Some(desc)) = (sig.get_mut(..sig_len as usize), desc.get_mut(..desc_len as usize)) else {
         frame.rax = err::TOO_LONG;
         return;

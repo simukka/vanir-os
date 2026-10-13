@@ -18,7 +18,7 @@ SLOT_IMAGES    := web-v1:http:tests/slots/web-v1.toml web-v2:http:tests/slots/we
                   web-floor:http:tests/slots/web-floor.toml web-large:http:tests/slots/web-large.toml \
                   hello:hello:tests/slots/hello.toml crasher:crasher:tests/slots/crasher.toml \
                   counter-v1:http:tests/slots/counter-v1.toml counter-v2:http:tests/slots/counter-v2.toml \
-                  counter-v3:http:tests/slots/counter-v3.toml
+                  counter-v3:http:tests/slots/counter-v3.toml web-abi-next:http:tests/slots/web-abi-next.toml
 USER_FEATURES  :=
 KERNEL_FEATURES:=
 ISO            := build/vanir-os.iso

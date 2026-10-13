@@ -1,0 +1,6 @@
+# Built for ABI 1.1, which a 1.0 kernel doesn't serve: refused at load (slot-abi-refused).
+name = "web"
+version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+abi = "1.1"

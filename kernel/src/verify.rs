@@ -32,6 +32,8 @@ pub enum Rejection {
     TooLarge = 11,
     BadElf = 12,
     BelowFloor = 13,
+    /// Built for an ABI this kernel doesn't serve (RFD 9, P2).
+    Abi = 14,
 }
 
 impl Rejection {
@@ -56,6 +58,7 @@ const _: () = {
     assert!(Rejection::TooLarge as u64 == REJECT_TOO_LARGE);
     assert!(Rejection::BadElf as u64 == REJECT_BAD_ELF);
     assert!(Rejection::BelowFloor as u64 == REJECT_BELOW_FLOOR);
+    assert!(Rejection::Abi as u64 == REJECT_ABI);
 };
 
 /// Check `image` against signature file `sig` for `program`. Returns the signed version and the
@@ -98,59 +101,40 @@ const MAGIC_V2: &[u8; 8] = b"VNRSIG02";
 pub const SIGNED_LEN_V2: usize = 112;
 pub const SIG_FILE_LEN_V2: usize = SIGNED_LEN_V2 + 64;
 
-const DESC_MAGIC: &[u8; 8] = b"VNRDSC01";
-/// A descriptor is exactly this long (tools/sign-image.py writes it).
-pub const DESCRIPTOR_LEN: usize = 256;
-const MAX_LISTEN: usize = 8;
+use vanir_abi::descriptor as desc;
+
+/// The longest descriptor `slot_load` takes.
+pub const DESCRIPTOR_MAX: usize = desc::LEN_V2;
 /// The largest volume a descriptor may declare: 256 MiB.
 const MAX_VOLUME_BLOCKS: u64 = 65536;
 
-/// What a service may do (RFD 2, P1), from its signed descriptor. Layout (little endian):
-///
-/// ```text
-///   0   8  magic "VNRDSC01"
-///   8  32  name, zero padded (the service)
-///  40   8  version (must equal the signed version)
-///  48   8  min_version: the oldest version that may still run
-///  56  16  slot class, zero padded
-///  72   4  drain deadline default, seconds
-///  76   4  drain deadline maximum, seconds
-///  80   4  listen entries in use (at most 8)
-///  84   4  zero
-///  88  64  8 listen entries: port, max_connections, max_per_source, 0 (u16 each)
-/// 152   8  volume_blocks: data blocks of the service's volume (RFD 3), 0 = none, at most 65536
-/// 160  96  zero (reserved)
-/// ```
+/// What a service may do (RFD 2, P1), from its signed descriptor: format 1 or 2, laid out as
+/// `vanir_abi::descriptor` says.
 #[derive(Clone, Copy)]
 pub struct Descriptor {
     name: [u8; 32],
     pub version: u64,
     pub min_version: u64,
     /// (port, max_connections, max_per_source); the first `listen_count` are in use.
-    pub listen: [(u16, u16, u16); MAX_LISTEN],
+    pub listen: [(u16, u16, u16); desc::MAX_LISTEN],
     pub listen_count: usize,
     /// Data blocks of the service's volume (RFD 3, P1); 0 if it has none.
     pub volume_blocks: u64,
+    /// The ABI version the image was built against (RFD 9, P2); 1.0 for format 1.
+    pub abi: (u32, u32),
+    /// Settings (RFD 9, P5): key (zero padded) and value; the first `settings_count` are in use.
+    #[allow(dead_code)] // task_listen hands them to the instance (R2c)
+    pub settings: [([u8; desc::KEY_LEN], u64); desc::MAX_SETTINGS],
+    #[allow(dead_code)]
+    pub settings_count: usize,
     /// SHA-256 of the signed statement: what the run-time log records.
     pub statement_hash: [u8; 32],
 }
 
 impl Descriptor {
     pub fn name(&self) -> &[u8] {
-        &self.name[..self.name.iter().position(|&b| b == 0).unwrap_or(32)]
+        desc::padded(&self.name)
     }
-}
-
-fn u16_at(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
-}
-
-fn u32_at(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
-}
-
-fn u64_at(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 /// A zero-padded name field: its bytes up to the first zero, which must all be printable with
@@ -162,41 +146,64 @@ fn padded_name(field: &[u8]) -> Option<&[u8]> {
 }
 
 fn parse_descriptor(d: &[u8]) -> Option<Descriptor> {
-    if d.len() != DESCRIPTOR_LEN || &d[..8] != DESC_MAGIC || u32_at(d, 84) != 0 || d[160..].iter().any(|&b| b != 0) {
+    let format = desc::format(d)?;
+    let reserved = if format == 1 { desc::AT_RESERVED_V1 } else { desc::AT_RESERVED_V2 };
+    if desc::u32_at(d, desc::AT_LISTEN_COUNT + 4) != 0 || d[reserved..].iter().any(|&b| b != 0) {
         return None;
     }
-    padded_name(&d[8..40])?;
-    padded_name(&d[56..72])?;
-    let listen_count = u32_at(d, 80) as usize;
-    if listen_count > MAX_LISTEN {
+    padded_name(&d[desc::AT_NAME..desc::AT_NAME + desc::NAME_LEN])?;
+    padded_name(&d[desc::AT_SLOT_CLASS..desc::AT_SLOT_CLASS + desc::SLOT_CLASS_LEN])?;
+    let listen_count = desc::listen_count(d);
+    if listen_count > desc::MAX_LISTEN {
         return None;
     }
-    let mut listen = [(0, 0, 0); MAX_LISTEN];
+    let mut listen = [(0, 0, 0); desc::MAX_LISTEN];
     for (i, entry) in listen.iter_mut().enumerate().take(listen_count) {
-        let at = 88 + 8 * i;
-        *entry = (u16_at(d, at), u16_at(d, at + 2), u16_at(d, at + 4));
-        let (port, max, per_source) = *entry;
-        if port == 0 || max == 0 || per_source == 0 || per_source > max || u16_at(d, at + 6) != 0 {
+        let (port, max, per_source, zero) = desc::listen(d, i);
+        if port == 0 || max == 0 || per_source == 0 || per_source > max || zero != 0 {
             return None;
         }
+        *entry = (port, max, per_source);
     }
     if (1..listen_count).any(|i| listen[..i].iter().any(|l| l.0 == listen[i].0)) {
         return None; // a port listed twice
     }
-    if u32_at(d, 72) > u32_at(d, 76) {
+    let (drain_default, drain_max) = desc::drain_secs(d);
+    if drain_default > drain_max {
         return None; // the drain deadline's default is above its maximum
     }
-    let volume_blocks = u64_at(d, 152);
+    let volume_blocks = desc::volume_blocks(d);
     if volume_blocks > MAX_VOLUME_BLOCKS {
         return None;
     }
+    // Settings (format 2): valid keys, each once; the unused entries all zero.
+    let settings_count = desc::settings_count(d);
+    let mut settings = [([0; desc::KEY_LEN], 0); desc::MAX_SETTINGS];
+    if format == 2 {
+        if settings_count > desc::MAX_SETTINGS {
+            return None;
+        }
+        for (i, s) in settings.iter_mut().enumerate() {
+            *s = desc::setting(d, i);
+            let used = i < settings_count;
+            if used != desc::valid_key(&s.0) || (!used && s.1 != 0) {
+                return None;
+            }
+        }
+        if (1..settings_count).any(|i| settings[..i].iter().any(|s| s.0 == settings[i].0)) {
+            return None; // a key given twice
+        }
+    }
     Some(Descriptor {
-        name: d[8..40].try_into().unwrap(),
-        version: u64_at(d, 40),
-        min_version: u64_at(d, 48),
+        name: d[desc::AT_NAME..desc::AT_NAME + desc::NAME_LEN].try_into().unwrap(),
+        version: desc::version(d),
+        min_version: desc::min_version(d),
         listen,
         listen_count,
         volume_blocks,
+        abi: desc::abi(d),
+        settings,
+        settings_count,
         statement_hash: [0; 32],
     })
 }
@@ -228,7 +235,7 @@ pub fn check_slot(image: &[u8], sig: &[u8], descriptor: &[u8], class: &str) -> R
         return Err(Rejection::WrongDescriptor);
     }
     let mut d = parse_descriptor(descriptor).ok_or(Rejection::BadDescriptor)?;
-    let version = u64_at(signed, 40);
+    let version = desc::u64_at(signed, 40);
     if d.name[..] != signed[8..40] || d.version != version {
         return Err(Rejection::BadDescriptor);
     }
@@ -236,8 +243,12 @@ pub fn check_slot(image: &[u8], sig: &[u8], descriptor: &[u8], class: &str) -> R
     if version < d.min_version {
         return Err(Rejection::BelowFloor);
     }
-    if padded_name(&descriptor[56..72]) != Some(class.as_bytes()) {
+    if padded_name(&descriptor[desc::AT_SLOT_CLASS..desc::AT_SLOT_CLASS + desc::SLOT_CLASS_LEN]) != Some(class.as_bytes()) {
         return Err(Rejection::ClassMismatch);
+    }
+    // Built for this ABI (RFD 9, P2): the same major version, and no newer minor.
+    if d.abi.0 != vanir_abi::ABI_MAJOR || d.abi.1 > vanir_abi::ABI_MINOR {
+        return Err(Rejection::Abi);
     }
     d.statement_hash = Sha256::digest(signed).into();
     Ok(d)

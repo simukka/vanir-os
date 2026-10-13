@@ -13,6 +13,7 @@ mod images;
 mod lifecycle;
 mod transfer;
 
+use vanir_abi::descriptor;
 use vanir_user::{err, events, lookup, println, slot};
 
 vanir_user::entry!(main);
@@ -29,12 +30,11 @@ pub struct Image {
 impl Image {
     /// The service it is an instance of, from its descriptor.
     pub fn service(&self) -> &'static [u8] {
-        let name = &self.descriptor[8..40];
-        &name[..name.iter().position(|&b| b == 0).unwrap_or(32)]
+        descriptor::name(self.descriptor)
     }
 
     pub fn version(&self) -> u64 {
-        u64::from_le_bytes(self.descriptor[40..48].try_into().unwrap())
+        descriptor::version(self.descriptor)
     }
 
     /// SHA-256 of its signed statement: how the control plane names an image.
@@ -45,13 +45,13 @@ impl Image {
 
     /// Data blocks of the service's volume (RFD 3), 0 for none.
     pub fn volume_blocks(&self) -> u64 {
-        self.descriptor.get(152..160).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+        descriptor::volume_blocks(self.descriptor)
     }
 
     /// The drain deadline's default and maximum, in seconds.
     pub fn drain_secs(&self) -> (u64, u64) {
-        let at = |i: usize| u32::from_le_bytes(self.descriptor[i..i + 4].try_into().unwrap()) as u64;
-        (at(72), at(76))
+        let (default, max) = descriptor::drain_secs(self.descriptor);
+        (default as u64, max as u64)
     }
 }
 

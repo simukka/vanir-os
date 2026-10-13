@@ -1,0 +1,25 @@
+# Every field set, and all 12 settings (keys of 1 and 16 bytes at the edges): what
+# tools/sign-image.py writes must read back the same through vanir_abi::descriptor
+# (abi/tests/descriptor.rs; the host check descriptor-format rebuilds the .bin and compares).
+name = "fixture-service"
+version = 7
+min_version = 3
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64, max_per_source = 16 }, { port = 8443, max_connections = 8 }]
+drain = { default_secs = 20, max_secs = 120 }
+volume = { blocks = 256 }
+abi = "1.0"
+
+[config]
+a = 1
+persist_ticks = 1000
+k2 = 2
+k3 = 3
+k4 = 4
+k5 = 5
+k6 = 6
+k7 = 7
+k8 = 8
+k9 = 9
+k10 = 10
+key_sixteen_byte = 18446744073709551615
