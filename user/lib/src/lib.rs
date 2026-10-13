@@ -10,77 +10,14 @@ use core::arch::{asm, global_asm};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_SCHED_YIELD: u64 = 24;
-pub const SYS_GETPID: u64 = 39;
-pub const SYS_EXIT: u64 = 60;
-pub const SYS_SEND: u64 = 100;
-pub const SYS_RECV: u64 = 101;
-pub const SYS_REPLY: u64 = 102;
-pub const SYS_RESTART: u64 = 103;
-pub const SYS_TASK_STATE: u64 = 104;
-pub const SYS_LOOKUP: u64 = 105;
-pub const SYS_SLEEP: u64 = 106;
-pub const SYS_UPTIME: u64 = 107;
-pub const SYS_TASK_NAME: u64 = 108;
-pub const SYS_DEVICE_BAR: u64 = 110;
-pub const SYS_PCI_CONFIG_READ: u64 = 111;
-pub const SYS_DMA_INFO: u64 = 112;
-pub const SYS_READ_EVENTS: u64 = 113;
-pub const SYS_STATS: u64 = 114;
-pub const SYS_MEASUREMENTS: u64 = 115;
-pub const SYS_NOTIFY: u64 = 116;
-pub const SYS_HALT: u64 = 117;
-pub const SYS_TASK_LISTEN: u64 = 118;
-pub const SYS_SLOT_STAGE: u64 = 119;
-pub const SYS_SLOT_LOAD: u64 = 120;
-pub const SYS_SLOT_UNLOAD: u64 = 121;
-pub const SYS_TPM_LOCK: u64 = 122;
-pub const SYS_TPM_UNLOCK: u64 = 123;
-pub const SYS_RUNTIME_LOG: u64 = 124;
-pub const SYS_STOP: u64 = 125;
-pub const SYS_REBOOT: u64 = 126;
-
-/// The most tasks (fixed tasks and slots) a manifest may declare; size per-task tables with it.
-pub const MAX_TASKS: usize = 64;
-
-/// Returned by the kernel when a simple syscall (write, getpid, ...) fails.
-pub const ERROR: u64 = u64::MAX;
-
-/// Errors from the IPC syscalls. The top bit is set; reply codes from servers never have it.
-pub mod err {
-    pub const DEAD: u64 = 1 << 63;
-    pub const NOT_ALLOWED: u64 = DEAD | 1;
-    pub const BAD_TARGET: u64 = DEAD | 2;
-    pub const BAD_BUFFER: u64 = DEAD | 3;
-    pub const TOO_LONG: u64 = DEAD | 4;
-    pub const BAD_ARGUMENT: u64 = DEAD | 5;
-    /// The TPM is in use; try again.
-    pub const BUSY: u64 = DEAD | 6;
-    /// The run-time measurement log is full: no more loads until the node reboots.
-    pub const LOG_FULL: u64 = DEAD | 7;
-    /// The image was refused (the reason comes with it: `events::rejection`).
-    pub const REJECTED: u64 = DEAD | 8;
-
-    pub fn is_error(code: u64) -> bool {
-        code & DEAD != 0
-    }
-
-    pub fn name(code: u64) -> &'static str {
-        match code {
-            DEAD => "DEAD",
-            NOT_ALLOWED => "NOT_ALLOWED",
-            BAD_TARGET => "BAD_TARGET",
-            BAD_BUFFER => "BAD_BUFFER",
-            TOO_LONG => "TOO_LONG",
-            BAD_ARGUMENT => "BAD_ARGUMENT",
-            BUSY => "BUSY",
-            LOG_FULL => "LOG_FULL",
-            REJECTED => "REJECTED",
-            _ => "OK",
-        }
-    }
-}
+// The ABI, defined once for the kernel and user code (RFD 9, P1); re-exported under the paths
+// programs have always used.
+pub use vanir_abi::err;
+pub use vanir_abi::ipc::{NOTIFY_DEATH, NOTIFY_IRQ, NOTIFY_POST, NOTIFY_TIMER, RECV_EXPECT_IRQ, RECV_TIMEOUT};
+pub use vanir_abi::layout::{BAR_STRIDE, DEVICE_BASE, DEVICE_STRIDE};
+pub use vanir_abi::listen::ListenInfo;
+pub use vanir_abi::sys::*;
+pub use vanir_abi::task::{DeathRecord, MAX_TASKS, RUNTIME_ENTRY_LEN};
 
 pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {
     let ret;
@@ -126,14 +63,6 @@ pub struct Message {
     pub len: usize,
 }
 
-/// Kernel notification (sender 0) op: device interrupts; `Message::len` holds the pending bits
-/// (one per granted device, in manifest order).
-pub const NOTIFY_IRQ: u64 = 2;
-
-/// `recv` flag: device work is in flight, so an interrupt will come. Without it, the kernel
-/// may end the run when nothing else can happen.
-pub const RECV_EXPECT_IRQ: u64 = 1;
-
 /// Wait for a message, written to the start of `buf`.
 pub fn recv(buf: &mut [u8]) -> Result<Message, u64> {
     recv_flags(buf, 0)
@@ -144,12 +73,6 @@ pub fn recv_flags(buf: &mut [u8], flags: u64) -> Result<Message, u64> {
     recv_raw(buf, flags, 0)
 }
 
-/// Kernel notification (sender 0) op: a `recv_timeout` expired.
-pub const NOTIFY_TIMER: u64 = 3;
-/// Kernel notification (sender 0) op: bits other tasks posted with `notify`; `Message::len`
-/// holds them.
-pub const NOTIFY_POST: u64 = 4;
-
 /// Post `bits` to task `target` (which must be in our `sends`, or have us in its own) without
 /// waiting: it gets them in its next `recv` as op `NOTIFY_POST`. Fails like `send` (DEAD,
 /// NOT_ALLOWED, ...).
@@ -157,8 +80,6 @@ pub fn notify(target: u64, bits: u64) -> Result<(), u64> {
     let (status, _, _) = syscall6(SYS_NOTIFY, [target, bits, 0, 0, 0, 0]);
     if status == 0 { Ok(()) } else { Err(status) }
 }
-/// `recv` flag: give up after a number of ticks with `NOTIFY_TIMER`.
-pub const RECV_TIMEOUT: u64 = 2;
 
 /// Wait for a message for at most `ticks`; then get sender 0, op `NOTIFY_TIMER`. With 0, only
 /// take a message (or notification) that is already waiting.
@@ -184,32 +105,6 @@ fn recv_raw(buf: &mut [u8], flags: u64, ticks: u64) -> Result<Message, u64> {
 pub fn reply(sender: u64, code: u64, data: &[u8]) -> Result<(), u64> {
     let (status, _, _) = syscall6(SYS_REPLY, [sender, code, data.as_ptr() as u64, data.len() as u64, 0, 0]);
     if status == 0 { Ok(()) } else { Err(status) }
-}
-
-/// Operation of a kernel notification (sender 0) telling the supervisor a task died; the message
-/// is a `DeathRecord`.
-pub const NOTIFY_DEATH: u64 = 1;
-
-/// How a task ended, as the kernel reports it to the supervisor.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DeathRecord {
-    pub id: u64,
-    /// 1 exited, 2 faulted, 3 over CPU budget, 4 image rejected at boot (`code` = reason).
-    pub kind: u64,
-    /// Exit code, or the fault's vector.
-    pub code: u64,
-    pub rip: u64,
-    pub cr2: u64,
-    pub error_code: u64,
-    pub ticks: u64,
-}
-
-impl DeathRecord {
-    pub fn from_bytes(bytes: &[u8]) -> Option<DeathRecord> {
-        (bytes.len() == core::mem::size_of::<DeathRecord>())
-            .then(|| unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DeathRecord) })
-    }
 }
 
 /// Supervisor only: reload a dead task into fresh memory. Returns its new id.
@@ -278,11 +173,6 @@ pub fn task_state(id: u64) -> Result<(u64, u64), u64> {
     let (state, current, _) = syscall6(SYS_TASK_STATE, [id, 0, 0, 0, 0, 0]);
     if err::is_error(state) { Err(state) } else { Ok((state, current)) }
 }
-
-/// Where the kernel maps granted devices' BARs (see `device_bar`).
-pub const DEVICE_BASE: u64 = 0x10_0000_0000;
-pub const DEVICE_STRIDE: u64 = 0x1000_0000;
-pub const BAR_STRIDE: u64 = 0x200_0000;
 
 /// Address and size of BAR `bar` of this task's granted device `device` (manifest order).
 /// Fails for missing devices, absent BARs, and the BAR holding the MSI-X table.
@@ -630,49 +520,7 @@ pub fn task_name(id: u64, buf: &mut [u8]) -> Result<&str, u64> {
 pub mod events {
     use super::{SYS_READ_EVENTS, SYS_STATS, err, syscall6};
 
-    pub const TASK_START: u64 = 1;
-    pub const EXIT: u64 = 2;
-    pub const FAULT: u64 = 3;
-    pub const OVER_BUDGET: u64 = 4;
-    pub const RESTART: u64 = 5;
-    pub const IPC_REFUSED: u64 = 6;
-    pub const IMAGE_REJECTED: u64 = 7;
-    pub const IMAGE_LOADED: u64 = 8;
-    pub const IMAGE_UNLOADED: u64 = 9;
-    pub const STOPPED: u64 = 10;
-
-    /// Why the kernel refused a task image (`IMAGE_REJECTED`'s `a`, a death record's `code`).
-    pub fn rejection(reason: u64) -> &'static str {
-        match reason {
-            1 => "no image",
-            2 => "no signature",
-            3 => "malformed signature file",
-            4 => "signature does not verify",
-            5 => "signed for another program",
-            6 => "image does not match its signature",
-            7 => "version older than the manifest allows",
-            8 => "malformed descriptor",
-            9 => "descriptor does not match its signature",
-            10 => "descriptor asks for another slot class",
-            11 => "image needs more memory than its slot class has",
-            12 => "not a loadable ELF image",
-            13 => "version below its min_version",
-            _ => "unknown",
-        }
-    }
-
-    /// See kernel/src/events.rs for what `a`, `b`, `c` hold for each kind.
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub struct Event {
-        pub seq: u64,
-        pub tick: u64,
-        pub kind: u64,
-        pub task: u64,
-        pub a: u64,
-        pub b: u64,
-        pub c: u64,
-    }
+    pub use vanir_abi::events::*;
 
     /// Events since the last read, oldest first: (how many were written to `out`, how many
     /// were lost because the kernel's ring wrapped first).
@@ -682,23 +530,8 @@ pub mod events {
         if err::is_error(count) { Err(count) } else { Ok((count as usize, dropped)) }
     }
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct Stats {
-        pub uptime_ticks: u64,
-        pub frames_in_use: u64,
-        pub device_interrupts: u64,
-        pub events_logged: u64,
-        pub tasks: u64,
-        /// Frames that can still be allocated.
-        pub frames_available: u64,
-        /// Per task slot: id, state (0 running/ready, 1 blocked, 2 exited, 3 faulted,
-        /// 4 over budget, 5 image rejected, 6 empty slot), CPU ticks.
-        pub task: [[u64; 3]; super::MAX_TASKS],
-    }
-
     pub fn stats() -> Result<Stats, u64> {
-        let mut s = Stats { uptime_ticks: 0, frames_in_use: 0, device_interrupts: 0, events_logged: 0, tasks: 0, frames_available: 0, task: [[0; 3]; super::MAX_TASKS] };
+        let mut s = Stats::ZERO;
         let size = core::mem::size_of::<Stats>() as u64;
         let (n, _, _) = syscall6(SYS_STATS, [&mut s as *mut Stats as u64, size, 0, 0, 0, 0]);
         if err::is_error(n) { Err(n) } else { Ok(s) }
@@ -1125,53 +958,6 @@ pub mod net {
     }
 }
 
-/// A task's network declarations (`task_listen`): from the manifest, or for a slot from its
-/// service's signed descriptor.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct ListenInfo {
-    service: [u8; 32],
-    service_len: u64,
-    /// Bit 0: may route (`routes = true`); bit 1: may connect out (`connects = true`); bit 2: is
-    /// a generic slot (RFD 2).
-    pub flags: u64,
-    pub count: u64,
-    /// (port, max_connections, max_per_source, 0)
-    pub ports: [[u16; 4]; 8],
-    /// The signed version running (0 for an empty slot).
-    pub version: u64,
-    /// Data blocks of its service's volume, from the signed descriptor (RFD 3); 0 for none.
-    pub volume_blocks: u64,
-}
-
-impl ListenInfo {
-    pub fn service(&self) -> &[u8] {
-        &self.service[..(self.service_len as usize).min(32)]
-    }
-
-    pub fn may_route(&self) -> bool {
-        self.flags & 1 != 0
-    }
-
-    pub fn may_connect(&self) -> bool {
-        self.flags & 2 != 0
-    }
-
-    pub fn is_slot(&self) -> bool {
-        self.flags & 4 != 0
-    }
-
-    /// The task with `loads = true`: the agent.
-    pub fn may_load(&self) -> bool {
-        self.flags & 8 != 0
-    }
-
-    /// (max_connections, max_per_source) if the task may listen on `port`.
-    pub fn port(&self, port: u16) -> Option<(u16, u16)> {
-        self.ports[..(self.count as usize).min(8)].iter().find(|p| p[0] == port).map(|p| (p[1], p[2]))
-    }
-}
-
 /// The network declarations of task `id` (any generation): its service, ports and flags.
 pub fn task_listen(id: u64) -> Result<ListenInfo, u64> {
     let mut info = ListenInfo::default();
@@ -1204,9 +990,6 @@ pub fn task_index(id: u64) -> u64 {
 pub fn yield_now() {
     syscall2(SYS_SCHED_YIELD, 0, 0);
 }
-
-/// Timer ticks (10 ms each) per second.
-pub const TICK_HZ: u64 = 100;
 
 /// Wait at least `ticks` timer ticks. Uses no CPU while waiting.
 pub fn sleep(ticks: u64) {
@@ -1395,10 +1178,6 @@ pub fn tpm_unlock() -> Result<(), u64> {
     let (status, _, _) = syscall6(SYS_TPM_UNLOCK, [0; 6]);
     if status == 0 { Ok(()) } else { Err(status) }
 }
-
-/// Bytes per run-time log entry: operation (1 load, 2 unload), slot index, 6 zero bytes,
-/// service name (32), version (8), SHA-256 of the signed statement (32).
-pub const RUNTIME_ENTRY_LEN: usize = 80;
 
 /// For the task with `tpm = true`: run-time log entries from `start` into `buf`. Returns
 /// (entries copied, entries in the log).

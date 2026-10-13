@@ -6,38 +6,7 @@ use crate::interrupts::TrapFrame;
 use crate::{process, serial};
 use crate::usercopy::{self, copy_from_user};
 
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_SCHED_YIELD: u64 = 24;
-pub const SYS_GETPID: u64 = 39;
-pub const SYS_EXIT: u64 = 60;
-pub const SYS_SEND: u64 = 100;
-pub const SYS_RECV: u64 = 101;
-pub const SYS_REPLY: u64 = 102;
-pub const SYS_RESTART: u64 = 103;
-pub const SYS_TASK_STATE: u64 = 104;
-pub const SYS_LOOKUP: u64 = 105;
-pub const SYS_SLEEP: u64 = 106;
-pub const SYS_UPTIME: u64 = 107;
-pub const SYS_TASK_NAME: u64 = 108;
-pub const SYS_DEVICE_BAR: u64 = 110;
-pub const SYS_PCI_CONFIG_READ: u64 = 111;
-pub const SYS_DMA_INFO: u64 = 112;
-pub const SYS_READ_EVENTS: u64 = 113;
-pub const SYS_STATS: u64 = 114;
-pub const SYS_MEASUREMENTS: u64 = 115;
-pub const SYS_NOTIFY: u64 = 116;
-pub const SYS_HALT: u64 = 117;
-pub const SYS_TASK_LISTEN: u64 = 118;
-pub const SYS_SLOT_STAGE: u64 = 119;
-pub const SYS_SLOT_LOAD: u64 = 120;
-pub const SYS_SLOT_UNLOAD: u64 = 121;
-pub const SYS_TPM_LOCK: u64 = 122;
-pub const SYS_TPM_UNLOCK: u64 = 123;
-pub const SYS_RUNTIME_LOG: u64 = 124;
-pub const SYS_STOP: u64 = 125;
-pub const SYS_REBOOT: u64 = 126;
-
-const ERROR: u64 = u64::MAX;
+pub use vanir_abi::sys::*;
 
 pub fn dispatch(frame: &mut TrapFrame) {
     assert!(frame.from_user(), "syscall from kernel mode");

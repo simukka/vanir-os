@@ -635,6 +635,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vanir-abi"
+version = "0.1.0"
+
+[[package]]
 name = "vanir-kernel"
 version = "0.1.0"
 dependencies = [
@@ -643,12 +647,16 @@ dependencies = [
  "sha2",
  "spin",
  "toml",
+ "vanir-abi",
  "x86_64",
 ]
 
 [[package]]
 name = "vanir-user"
 version = "0.1.0"
+dependencies = [
+ "vanir-abi",
+]
 
 [[package]]
 name = "virtio"

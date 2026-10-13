@@ -1,0 +1,11 @@
+[package]
+name = "vanir-abi"
+version = "0.1.0"
+edition = "2024"
+
+# Data only (RFD 9, P1): no dependencies, so the kernel can use it without depending on user code.
+[dependencies]
+
+[lib]
+test = false
+bench = false

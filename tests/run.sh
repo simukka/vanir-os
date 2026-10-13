@@ -194,6 +194,7 @@ BUILD_FAILS=(
 
 # Checks that run on the host alone: name | command that must succeed.
 HOST_CHECKS=(
+  "abi-snapshot | cargo test -q -p vanir-abi --target x86_64-unknown-linux-gnu"
   "noise-vectors | cargo test -q -p noise --target x86_64-unknown-linux-gnu && python3 -c 'import json, sys; sys.path.insert(0, \"tools\"); import vanir_noise; p = vanir_noise.check_vector(json.load(open(\"tests/vectors/noise-ik.json\"))); print(p or \"python: all match\"); sys.exit(bool(p))'"
 )
 

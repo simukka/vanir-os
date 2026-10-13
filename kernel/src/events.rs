@@ -11,37 +11,10 @@ use crate::apic;
 
 const CAPACITY: usize = 128;
 
-pub const TASK_START: u64 = 1;
-pub const EXIT: u64 = 2;
-pub const FAULT: u64 = 3;
-pub const OVER_BUDGET: u64 = 4;
-pub const RESTART: u64 = 5;
-/// An IPC send refused: a = target id, b = error code.
-pub const IPC_REFUSED: u64 = 6;
-/// A task image failed its signature check at boot: a = reason (verify::Rejection).
-pub const IMAGE_REJECTED: u64 = 7;
-/// A service image was loaded into a slot (the task is the slot): a = version.
-pub const IMAGE_LOADED: u64 = 8;
-/// A slot was emptied: a = the version it held.
-pub const IMAGE_UNLOADED: u64 = 9;
-/// The supervisor stopped a task on purpose.
-pub const STOPPED: u64 = 10;
-
-/// One event, as the reader receives it. Fields `a`, `b`, `c` depend on `kind`:
-/// TASK_START a = signed version; EXIT a = code; FAULT a = vector, b = rip, c = cr2; OVER_BUDGET a = budget;
-/// RESTART a = previous id; IPC_REFUSED a = target, b = error; IMAGE_REJECTED a = reason;
-/// IMAGE_LOADED, IMAGE_UNLOADED a = version.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Event {
-    pub seq: u64,
-    pub tick: u64,
-    pub kind: u64,
-    pub task: u64,
-    pub a: u64,
-    pub b: u64,
-    pub c: u64,
-}
+/// Event kinds and the record (what `a`, `b`, `c` hold for each kind is documented there).
+pub use vanir_abi::events::{
+    EXIT, Event, FAULT, IMAGE_LOADED, IMAGE_REJECTED, IMAGE_UNLOADED, IPC_REFUSED, OVER_BUDGET, RESTART, STOPPED, TASK_START,
+};
 
 pub const EVENT_SIZE: usize = size_of::<Event>();
 

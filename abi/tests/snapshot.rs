@@ -1,0 +1,160 @@
+//! Every value and record layout of the ABI, as it was before `vanir-abi` existed (taken from
+//! the kernel's and `vanir_user`'s copies, which agreed). A failure here means the ABI changed:
+//! if that was meant, change the value here in the same commit, and say so in its message.
+use core::mem::{offset_of, size_of};
+use vanir_abi::*;
+
+#[test]
+fn values() {
+    assert_eq!(layout::BAR_STRIDE as u128, 33554432, "layout::BAR_STRIDE");
+    assert_eq!(layout::DEVICE_BASE as u128, 68719476736, "layout::DEVICE_BASE");
+    assert_eq!(layout::DEVICE_STRIDE as u128, 268435456, "layout::DEVICE_STRIDE");
+    assert_eq!(sys::ERROR as u128, 18446744073709551615, "sys::ERROR");
+    assert_eq!(task::MAX_TASKS as u128, 64, "task::MAX_TASKS");
+    assert_eq!(ipc::NOTIFY_DEATH as u128, 1, "ipc::NOTIFY_DEATH");
+    assert_eq!(ipc::NOTIFY_IRQ as u128, 2, "ipc::NOTIFY_IRQ");
+    assert_eq!(ipc::NOTIFY_POST as u128, 4, "ipc::NOTIFY_POST");
+    assert_eq!(ipc::NOTIFY_TIMER as u128, 3, "ipc::NOTIFY_TIMER");
+    assert_eq!(ipc::RECV_EXPECT_IRQ as u128, 1, "ipc::RECV_EXPECT_IRQ");
+    assert_eq!(ipc::RECV_TIMEOUT as u128, 2, "ipc::RECV_TIMEOUT");
+    assert_eq!(task::RUNTIME_ENTRY_LEN as u128, 80, "task::RUNTIME_ENTRY_LEN");
+    assert_eq!(sys::SYS_DEVICE_BAR as u128, 110, "sys::SYS_DEVICE_BAR");
+    assert_eq!(sys::SYS_DMA_INFO as u128, 112, "sys::SYS_DMA_INFO");
+    assert_eq!(sys::SYS_EXIT as u128, 60, "sys::SYS_EXIT");
+    assert_eq!(sys::SYS_GETPID as u128, 39, "sys::SYS_GETPID");
+    assert_eq!(sys::SYS_HALT as u128, 117, "sys::SYS_HALT");
+    assert_eq!(sys::SYS_LOOKUP as u128, 105, "sys::SYS_LOOKUP");
+    assert_eq!(sys::SYS_MEASUREMENTS as u128, 115, "sys::SYS_MEASUREMENTS");
+    assert_eq!(sys::SYS_NOTIFY as u128, 116, "sys::SYS_NOTIFY");
+    assert_eq!(sys::SYS_PCI_CONFIG_READ as u128, 111, "sys::SYS_PCI_CONFIG_READ");
+    assert_eq!(sys::SYS_READ_EVENTS as u128, 113, "sys::SYS_READ_EVENTS");
+    assert_eq!(sys::SYS_REBOOT as u128, 126, "sys::SYS_REBOOT");
+    assert_eq!(sys::SYS_RECV as u128, 101, "sys::SYS_RECV");
+    assert_eq!(sys::SYS_REPLY as u128, 102, "sys::SYS_REPLY");
+    assert_eq!(sys::SYS_RESTART as u128, 103, "sys::SYS_RESTART");
+    assert_eq!(sys::SYS_RUNTIME_LOG as u128, 124, "sys::SYS_RUNTIME_LOG");
+    assert_eq!(sys::SYS_SCHED_YIELD as u128, 24, "sys::SYS_SCHED_YIELD");
+    assert_eq!(sys::SYS_SEND as u128, 100, "sys::SYS_SEND");
+    assert_eq!(sys::SYS_SLEEP as u128, 106, "sys::SYS_SLEEP");
+    assert_eq!(sys::SYS_SLOT_LOAD as u128, 120, "sys::SYS_SLOT_LOAD");
+    assert_eq!(sys::SYS_SLOT_STAGE as u128, 119, "sys::SYS_SLOT_STAGE");
+    assert_eq!(sys::SYS_SLOT_UNLOAD as u128, 121, "sys::SYS_SLOT_UNLOAD");
+    assert_eq!(sys::SYS_STATS as u128, 114, "sys::SYS_STATS");
+    assert_eq!(sys::SYS_STOP as u128, 125, "sys::SYS_STOP");
+    assert_eq!(sys::SYS_TASK_LISTEN as u128, 118, "sys::SYS_TASK_LISTEN");
+    assert_eq!(sys::SYS_TASK_NAME as u128, 108, "sys::SYS_TASK_NAME");
+    assert_eq!(sys::SYS_TASK_STATE as u128, 104, "sys::SYS_TASK_STATE");
+    assert_eq!(sys::SYS_TPM_LOCK as u128, 122, "sys::SYS_TPM_LOCK");
+    assert_eq!(sys::SYS_TPM_UNLOCK as u128, 123, "sys::SYS_TPM_UNLOCK");
+    assert_eq!(sys::SYS_UPTIME as u128, 107, "sys::SYS_UPTIME");
+    assert_eq!(sys::SYS_WRITE as u128, 1, "sys::SYS_WRITE");
+    assert_eq!(sys::TICK_HZ as u128, 100, "sys::TICK_HZ");
+    assert_eq!(err::BAD_ARGUMENT as u128, 9223372036854775813, "err::BAD_ARGUMENT");
+    assert_eq!(err::BAD_BUFFER as u128, 9223372036854775811, "err::BAD_BUFFER");
+    assert_eq!(err::BAD_TARGET as u128, 9223372036854775810, "err::BAD_TARGET");
+    assert_eq!(err::BUSY as u128, 9223372036854775814, "err::BUSY");
+    assert_eq!(err::DEAD as u128, 9223372036854775808, "err::DEAD");
+    assert_eq!(err::LOG_FULL as u128, 9223372036854775815, "err::LOG_FULL");
+    assert_eq!(err::NOT_ALLOWED as u128, 9223372036854775809, "err::NOT_ALLOWED");
+    assert_eq!(err::REJECTED as u128, 9223372036854775816, "err::REJECTED");
+    assert_eq!(err::TOO_LONG as u128, 9223372036854775812, "err::TOO_LONG");
+    assert_eq!(events::EXIT as u128, 2, "events::EXIT");
+    assert_eq!(events::FAULT as u128, 3, "events::FAULT");
+    assert_eq!(events::IMAGE_LOADED as u128, 8, "events::IMAGE_LOADED");
+    assert_eq!(events::IMAGE_REJECTED as u128, 7, "events::IMAGE_REJECTED");
+    assert_eq!(events::IMAGE_UNLOADED as u128, 9, "events::IMAGE_UNLOADED");
+    assert_eq!(events::IPC_REFUSED as u128, 6, "events::IPC_REFUSED");
+    assert_eq!(events::OVER_BUDGET as u128, 4, "events::OVER_BUDGET");
+    assert_eq!(events::RESTART as u128, 5, "events::RESTART");
+    assert_eq!(events::STOPPED as u128, 10, "events::STOPPED");
+    assert_eq!(events::TASK_START as u128, 1, "events::TASK_START");
+    assert_eq!(ipc::MAX_MESSAGE as u128, 4096, "ipc::MAX_MESSAGE");
+    assert_eq!(layout::DMA_BASE as u128, 137438953472, "layout::DMA_BASE");
+    assert_eq!(layout::TPM_BASE as u128, 206158430208, "layout::TPM_BASE");
+    assert_eq!(task::MEASUREMENT_ENTRY_LEN as u128, 48, "task::MEASUREMENT_ENTRY_LEN");
+    assert_eq!(task::STATE_RUNNING as u128, 0, "task::STATE_RUNNING");
+    assert_eq!(task::STATE_BLOCKED as u128, 1, "task::STATE_BLOCKED");
+    assert_eq!(task::STATE_EXITED as u128, 2, "task::STATE_EXITED");
+    assert_eq!(task::STATE_FAULTED as u128, 3, "task::STATE_FAULTED");
+    assert_eq!(task::STATE_OVER_BUDGET as u128, 4, "task::STATE_OVER_BUDGET");
+    assert_eq!(task::STATE_REJECTED as u128, 5, "task::STATE_REJECTED");
+    assert_eq!(task::STATE_EMPTY as u128, 6, "task::STATE_EMPTY");
+    assert_eq!(task::STATE_STOPPED as u128, 7, "task::STATE_STOPPED");
+    assert_eq!(task::DEATH_EXITED as u128, 1, "task::DEATH_EXITED");
+    assert_eq!(task::DEATH_FAULTED as u128, 2, "task::DEATH_FAULTED");
+    assert_eq!(task::DEATH_OVER_BUDGET as u128, 3, "task::DEATH_OVER_BUDGET");
+    assert_eq!(task::DEATH_REJECTED as u128, 4, "task::DEATH_REJECTED");
+    assert_eq!(task::DEATH_STOPPED as u128, 5, "task::DEATH_STOPPED");
+    assert_eq!(listen::ROUTES as u128, 1, "listen::ROUTES");
+    assert_eq!(listen::CONNECTS as u128, 2, "listen::CONNECTS");
+    assert_eq!(listen::SLOT as u128, 4, "listen::SLOT");
+    assert_eq!(listen::LOADS as u128, 8, "listen::LOADS");
+    assert_eq!(listen::MAX_PORTS as u128, 8, "listen::MAX_PORTS");
+    assert_eq!(events::REJECT_NO_IMAGE as u128, 1, "events::REJECT_NO_IMAGE");
+    assert_eq!(events::REJECT_NO_SIGNATURE as u128, 2, "events::REJECT_NO_SIGNATURE");
+    assert_eq!(events::REJECT_MALFORMED as u128, 3, "events::REJECT_MALFORMED");
+    assert_eq!(events::REJECT_BAD_SIGNATURE as u128, 4, "events::REJECT_BAD_SIGNATURE");
+    assert_eq!(events::REJECT_WRONG_PROGRAM as u128, 5, "events::REJECT_WRONG_PROGRAM");
+    assert_eq!(events::REJECT_WRONG_HASH as u128, 6, "events::REJECT_WRONG_HASH");
+    assert_eq!(events::REJECT_TOO_OLD as u128, 7, "events::REJECT_TOO_OLD");
+    assert_eq!(events::REJECT_BAD_DESCRIPTOR as u128, 8, "events::REJECT_BAD_DESCRIPTOR");
+    assert_eq!(events::REJECT_WRONG_DESCRIPTOR as u128, 9, "events::REJECT_WRONG_DESCRIPTOR");
+    assert_eq!(events::REJECT_CLASS_MISMATCH as u128, 10, "events::REJECT_CLASS_MISMATCH");
+    assert_eq!(events::REJECT_TOO_LARGE as u128, 11, "events::REJECT_TOO_LARGE");
+    assert_eq!(events::REJECT_BAD_ELF as u128, 12, "events::REJECT_BAD_ELF");
+    assert_eq!(events::REJECT_BELOW_FLOOR as u128, 13, "events::REJECT_BELOW_FLOOR");
+}
+
+#[test]
+fn rejection_names() {
+    assert_eq!(events::rejection(1), "no image");
+    assert_eq!(events::rejection(2), "no signature");
+    assert_eq!(events::rejection(3), "malformed signature file");
+    assert_eq!(events::rejection(4), "signature does not verify");
+    assert_eq!(events::rejection(5), "signed for another program");
+    assert_eq!(events::rejection(6), "image does not match its signature");
+    assert_eq!(events::rejection(7), "version older than the manifest allows");
+    assert_eq!(events::rejection(8), "malformed descriptor");
+    assert_eq!(events::rejection(9), "descriptor does not match its signature");
+    assert_eq!(events::rejection(10), "descriptor asks for another slot class");
+    assert_eq!(events::rejection(11), "image needs more memory than its slot class has");
+    assert_eq!(events::rejection(12), "not a loadable ELF image");
+    assert_eq!(events::rejection(13), "version below its min_version");
+    assert_eq!(events::rejection(14), "unknown");
+}
+
+#[test]
+fn layouts() {
+    assert_eq!(size_of::<task::DeathRecord>(), 56, "task::DeathRecord");
+    assert_eq!(offset_of!(task::DeathRecord, id), 0, "task::DeathRecord.id");
+    assert_eq!(offset_of!(task::DeathRecord, kind), 8, "task::DeathRecord.kind");
+    assert_eq!(offset_of!(task::DeathRecord, code), 16, "task::DeathRecord.code");
+    assert_eq!(offset_of!(task::DeathRecord, rip), 24, "task::DeathRecord.rip");
+    assert_eq!(offset_of!(task::DeathRecord, cr2), 32, "task::DeathRecord.cr2");
+    assert_eq!(offset_of!(task::DeathRecord, error_code), 40, "task::DeathRecord.error_code");
+    assert_eq!(offset_of!(task::DeathRecord, ticks), 48, "task::DeathRecord.ticks");
+    assert_eq!(size_of::<events::Event>(), 56, "events::Event");
+    assert_eq!(offset_of!(events::Event, seq), 0, "events::Event.seq");
+    assert_eq!(offset_of!(events::Event, tick), 8, "events::Event.tick");
+    assert_eq!(offset_of!(events::Event, kind), 16, "events::Event.kind");
+    assert_eq!(offset_of!(events::Event, task), 24, "events::Event.task");
+    assert_eq!(offset_of!(events::Event, a), 32, "events::Event.a");
+    assert_eq!(offset_of!(events::Event, b), 40, "events::Event.b");
+    assert_eq!(offset_of!(events::Event, c), 48, "events::Event.c");
+    assert_eq!(size_of::<events::Stats>(), 1584, "events::Stats");
+    assert_eq!(offset_of!(events::Stats, uptime_ticks), 0, "events::Stats.uptime_ticks");
+    assert_eq!(offset_of!(events::Stats, frames_in_use), 8, "events::Stats.frames_in_use");
+    assert_eq!(offset_of!(events::Stats, device_interrupts), 16, "events::Stats.device_interrupts");
+    assert_eq!(offset_of!(events::Stats, events_logged), 24, "events::Stats.events_logged");
+    assert_eq!(offset_of!(events::Stats, tasks), 32, "events::Stats.tasks");
+    assert_eq!(offset_of!(events::Stats, frames_available), 40, "events::Stats.frames_available");
+    assert_eq!(offset_of!(events::Stats, task), 48, "events::Stats.task");
+    assert_eq!(size_of::<listen::ListenInfo>(), 136, "listen::ListenInfo");
+    assert_eq!(offset_of!(listen::ListenInfo, service), 0, "listen::ListenInfo.service");
+    assert_eq!(offset_of!(listen::ListenInfo, service_len), 32, "listen::ListenInfo.service_len");
+    assert_eq!(offset_of!(listen::ListenInfo, flags), 40, "listen::ListenInfo.flags");
+    assert_eq!(offset_of!(listen::ListenInfo, count), 48, "listen::ListenInfo.count");
+    assert_eq!(offset_of!(listen::ListenInfo, ports), 56, "listen::ListenInfo.ports");
+    assert_eq!(offset_of!(listen::ListenInfo, version), 120, "listen::ListenInfo.version");
+    assert_eq!(offset_of!(listen::ListenInfo, volume_blocks), 128, "listen::ListenInfo.volume_blocks");
+}

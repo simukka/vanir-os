@@ -20,6 +20,10 @@ use spin::Mutex;
 use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace, PAGE_SIZE};
 use crate::verify::{self, Rejection};
+use vanir_abi::events::Stats;
+use vanir_abi::layout::{BAR_STRIDE, DEVICE_BASE, DEVICE_STRIDE, DMA_BASE, TPM_BASE};
+use vanir_abi::listen::{self, ListenInfo};
+use vanir_abi::task::{self, DeathRecord, MAX_TASKS, MEASUREMENT_ENTRY_LEN};
 use crate::{apic, elf, events, gdt, irq, measure, modules, pci, tpm};
 
 /// A process the image runs, declared in the app manifest (see apps/README.md, kernel/build.rs).
@@ -77,28 +81,16 @@ pub struct Listen {
 
 include!(concat!(env!("OUT_DIR"), "/tasks.rs"));
 
-/// Rows in the `Stats` record user code reads (`vanir_user::MAX_TASKS`); the manifest's
-/// `MAX_PROCESSES` is at most this.
-const STATS_TASKS: usize = 64;
-const _: () = assert!(MAX_PROCESSES <= STATS_TASKS);
+// Rows in the `Stats` record user code reads: the manifest's `MAX_PROCESSES` is at most this.
+const _: () = assert!(MAX_PROCESSES <= MAX_TASKS);
 const USER_STACK_TOP: u64 = 0x7fff_ffff_f000;
 /// 64 KiB: drivers and servers keep several 4 KiB block or message buffers on their stacks.
 const USER_STACK_PAGES: u64 = 16;
 
-/// Largest message or reply, in bytes; bounds the time one syscall spends copying.
-pub const MAX_MESSAGE: u64 = 4096;
+pub use vanir_abi::ipc::MAX_MESSAGE;
 
 /// Most devices one task may be granted.
 const MAX_TASK_DEVICES: usize = 4;
-/// Where granted devices' BARs appear in a task: device `d`'s BAR `b` is mapped at
-/// `DEVICE_BASE + d * DEVICE_STRIDE + b * BAR_STRIDE`.
-const DEVICE_BASE: u64 = 0x10_0000_0000;
-const DEVICE_STRIDE: u64 = 0x1000_0000;
-const BAR_STRIDE: u64 = 0x200_0000;
-/// Where a task's DMA region appears.
-const DMA_BASE: u64 = 0x20_0000_0000;
-/// Where the TPM's CRB page appears in the task granted `tpm = true`.
-const TPM_BASE: u64 = 0x30_0000_0000;
 
 /// What a task slot is given at boot and keeps across restarts.
 #[derive(Clone, Copy)]
@@ -115,22 +107,8 @@ struct Grants {
     dma: Option<(u64, u64)>,
 }
 
-/// Kernel error codes returned by IPC syscalls. The top bit is set, so they never collide with a
-/// server's reply codes (which must have it clear).
-pub mod err {
-    pub const DEAD: u64 = 1 << 63;
-    pub const NOT_ALLOWED: u64 = DEAD | 1;
-    pub const BAD_TARGET: u64 = DEAD | 2;
-    pub const BAD_BUFFER: u64 = DEAD | 3;
-    pub const TOO_LONG: u64 = DEAD | 4;
-    pub const BAD_ARGUMENT: u64 = DEAD | 5;
-    /// The TPM is in use (the attestation task holds its lock); try again.
-    pub const BUSY: u64 = DEAD | 6;
-    /// The run-time measurement log is full: no more loads until the node reboots.
-    pub const LOG_FULL: u64 = DEAD | 7;
-    /// The image was refused; rdx holds the reason (`verify::Rejection`).
-    pub const REJECTED: u64 = DEAD | 8;
-}
+/// Kernel error codes returned by IPC syscalls (top bit set).
+pub use vanir_abi::err;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -172,34 +150,7 @@ struct Death {
     unreported: bool,
 }
 
-/// What the supervisor's `recv` gets when a task dies: sender 0, op `NOTIFY_DEATH`.
-#[repr(C)]
-struct DeathRecord {
-    id: u64,
-    /// 1 exited, 2 faulted, 3 over CPU budget, 4 image rejected, 5 stopped.
-    kind: u64,
-    /// Exit code, or the fault's vector.
-    code: u64,
-    rip: u64,
-    cr2: u64,
-    error_code: u64,
-    ticks: u64,
-}
-
-pub const NOTIFY_DEATH: u64 = 1;
-/// `recv` from sender 0 with this op: device interrupts; the length register holds the bits.
-pub const NOTIFY_IRQ: u64 = 2;
-/// `recv` from sender 0 with this op: the timeout given with `RECV_TIMEOUT` expired.
-pub const NOTIFY_TIMER: u64 = 3;
-/// `recv` flag (in rdx): give up after r10 ticks with a `NOTIFY_TIMER` notification.
-pub const RECV_TIMEOUT: u64 = 2;
-/// `recv` from sender 0 with this op: bits another task posted with `notify`; the length
-/// register holds them.
-pub const NOTIFY_POST: u64 = 4;
-
-/// `recv` flag (in rdx): this task has device work in flight and an interrupt will come, so the
-/// kernel should idle for it rather than conclude that nothing can ever run again.
-pub const RECV_EXPECT_IRQ: u64 = 1;
+pub use vanir_abi::ipc::{NOTIFY_DEATH, NOTIFY_IRQ, NOTIFY_POST, NOTIFY_TIMER, RECV_EXPECT_IRQ, RECV_TIMEOUT};
 
 /// Give up idling if no process has become ready for this many ticks (5 s) while tasks wait on
 /// interrupts: something is stuck, and a test should not hang forever.
@@ -631,11 +582,11 @@ fn report_death(table: &mut Table, sup: usize, buf: u64, cap: u64, regs: &mut Tr
     let Some(dead) = table.procs.iter().flatten().position(|p| p.death.unreported) else { return false };
     let p = table.get(dead);
     let (kind, code) = match p.state {
-        State::Exited(code) => (1, code),
-        State::Faulted(vector) => (2, vector),
-        State::OverBudget => (3, 0),
-        State::Rejected(why) => (4, why as u64),
-        State::Stopped => (5, 0),
+        State::Exited(code) => (task::DEATH_EXITED, code),
+        State::Faulted(vector) => (task::DEATH_FAULTED, vector),
+        State::OverBudget => (task::DEATH_OVER_BUDGET, 0),
+        State::Rejected(why) => (task::DEATH_REJECTED, why as u64),
+        State::Stopped => (task::DEATH_STOPPED, 0),
         _ => unreachable!("only dead processes have deaths to report"),
     };
     let record = DeathRecord {
@@ -1067,14 +1018,14 @@ pub fn task_state(frame: &mut TrapFrame) {
 /// rejected, 6 empty slot, 7 stopped.
 fn state_code(state: State) -> u64 {
     match state {
-        State::Ready | State::Running => 0,
-        State::SendBlocked(_) | State::ReplyBlocked(_) | State::RecvBlocked | State::Sleeping(_) => 1,
-        State::Exited(_) => 2,
-        State::Faulted(_) => 3,
-        State::OverBudget => 4,
-        State::Rejected(_) => 5,
-        State::Empty => 6,
-        State::Stopped => 7,
+        State::Ready | State::Running => task::STATE_RUNNING,
+        State::SendBlocked(_) | State::ReplyBlocked(_) | State::RecvBlocked | State::Sleeping(_) => task::STATE_BLOCKED,
+        State::Exited(_) => task::STATE_EXITED,
+        State::Faulted(_) => task::STATE_FAULTED,
+        State::OverBudget => task::STATE_OVER_BUDGET,
+        State::Rejected(_) => task::STATE_REJECTED,
+        State::Empty => task::STATE_EMPTY,
+        State::Stopped => task::STATE_STOPPED,
     }
 }
 
@@ -1101,20 +1052,21 @@ pub fn measurements(frame: &mut TrapFrame) {
         frame.rax = err::BAD_ARGUMENT;
         return;
     }
-    let mut out = [0u8; 48 * 16];
+    const E: usize = MEASUREMENT_ENTRY_LEN;
+    let mut out = [0u8; E * 16];
     let mut count = 0;
     for entry in measure::log().iter().flatten() {
-        let record = &mut out[48 * count..48 * (count + 1)];
+        let record = &mut out[E * count..E * (count + 1)];
         let name = entry.what.as_bytes();
         record[..name.len().min(16)].copy_from_slice(&name[..name.len().min(16)]);
         record[16..].copy_from_slice(&entry.digest);
         count += 1;
     }
-    if frame.rsi < (48 * count) as u64 {
+    if frame.rsi < (E * count) as u64 {
         frame.rax = err::TOO_LONG;
         return;
     }
-    match memory::copy_to_user_space(table.current().space(), frame.rdi, &out[..48 * count]) {
+    match memory::copy_to_user_space(table.current().space(), frame.rdi, &out[..E * count]) {
         Ok(()) => {
             frame.rax = count as u64;
             frame.rdx = TPM_BASE;
@@ -1184,19 +1136,6 @@ pub fn read_events(frame: &mut TrapFrame) {
     frame.rdx = dropped;
 }
 
-/// System statistics for heartbeats, as written by `stats(buf)`.
-#[repr(C)]
-struct Stats {
-    uptime_ticks: u64,
-    frames_in_use: u64,
-    device_interrupts: u64,
-    events_logged: u64,
-    tasks: u64,
-    /// Frames that can still be allocated.
-    frames_available: u64,
-    /// Per task: id, state (as `task_state`), CPU ticks.
-    task: [[u64; 3]; STATS_TASKS],
-}
 
 /// `stats(buf, cap) -> bytes`: a `Stats` record. Only for the task with `events = true`.
 pub fn stats(frame: &mut TrapFrame) {
@@ -1212,7 +1151,7 @@ pub fn stats(frame: &mut TrapFrame) {
         events_logged: events::logged(),
         tasks: 0,
         frames_available: memory::frames_available(),
-        task: [[0; 3]; STATS_TASKS],
+        task: [[0; 3]; MAX_TASKS],
     };
     for p in table.procs.iter().flatten() {
         stats.task[p.slot] = [p.id(), state_code(p.state), p.ticks];
@@ -1249,19 +1188,6 @@ pub fn task_name(frame: &mut TrapFrame) {
     }
 }
 
-/// What `task_listen` writes: a task's service, flags (bit 0: may route; bit 1: may connect
-/// out; bit 2: is a generic slot; bit 3: may load slots) and ports, each as (port,
-/// max_connections, max_per_source, 0), its signed version, and its volume's size (RFD 3).
-#[repr(C)]
-struct ListenInfo {
-    service: [u8; 32],
-    service_len: u64,
-    flags: u64,
-    count: u64,
-    ports: [[u16; 4]; 8],
-    version: u64,
-    volume_blocks: u64,
-}
 
 /// `task_listen(id, buf, cap) -> bytes`: the network declarations of task `id` (any generation)
 /// as a `ListenInfo`: from the manifest, or for a slot from its service's signed descriptor. The
@@ -1275,7 +1201,11 @@ pub fn task_listen(frame: &mut TrapFrame) {
     };
     let p = table.get(slot);
     let task = p.task;
-    let flags = task.routes as u64 | (task.connects as u64) << 1 | (task.class.is_some() as u64) << 2 | (task.loads as u64) << 3;
+    let bit = |on: bool, flag: u64| if on { flag } else { 0 };
+    let flags = bit(task.routes, listen::ROUTES)
+        | bit(task.connects, listen::CONNECTS)
+        | bit(task.class.is_some(), listen::SLOT)
+        | bit(task.loads, listen::LOADS);
     let volume_blocks = p.loaded.map_or(0, |d| d.volume_blocks);
     let mut info =
         ListenInfo { service: [0; 32], service_len: 0, flags, count: 0, ports: [[0; 4]; 8], version: p.version, volume_blocks };

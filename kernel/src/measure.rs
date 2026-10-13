@@ -89,7 +89,7 @@ pub const UNLOAD: u8 = 2;
 /// 40   8  version
 /// 48  32  SHA-256 of the image's signed statement (which covers image and descriptor)
 /// ```
-pub const ENTRY_LEN: usize = 80;
+pub const ENTRY_LEN: usize = vanir_abi::task::RUNTIME_ENTRY_LEN;
 
 struct Runtime {
     entries: [[u8; ENTRY_LEN]; RUNTIME_LOG],

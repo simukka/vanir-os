@@ -13,7 +13,7 @@ use crate::memory;
 pub const PIC_VECTORS: core::ops::Range<u64> = 0x20..0x30;
 pub const TIMER_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
-pub const TICK_HZ: u32 = 100;
+pub const TICK_HZ: u32 = vanir_abi::sys::TICK_HZ as u32;
 
 /// Where the APIC's registers are mapped (uncached), just below the kernel image.
 const LAPIC_VIRT: u64 = 0xffff_ffff_7fff_f000;

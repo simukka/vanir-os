@@ -36,23 +36,27 @@ pub enum Rejection {
 
 impl Rejection {
     pub fn describe(self) -> &'static str {
-        match self {
-            Rejection::NoImage => "no image",
-            Rejection::NoSignature => "no signature",
-            Rejection::Malformed => "malformed signature file",
-            Rejection::BadSignature => "signature does not verify",
-            Rejection::WrongProgram => "signed for another program",
-            Rejection::WrongHash => "image does not match its signature",
-            Rejection::TooOld => "version older than the manifest allows",
-            Rejection::BadDescriptor => "malformed descriptor",
-            Rejection::WrongDescriptor => "descriptor does not match its signature",
-            Rejection::ClassMismatch => "descriptor asks for another slot class",
-            Rejection::TooLarge => "image needs more memory than its slot class has",
-            Rejection::BadElf => "not a loadable ELF image",
-            Rejection::BelowFloor => "version below its min_version",
-        }
+        vanir_abi::events::rejection(self as u64)
     }
 }
+
+// The reasons user code sees (`vanir_abi::events::REJECT_*`) are these numbers.
+const _: () = {
+    use vanir_abi::events::*;
+    assert!(Rejection::NoImage as u64 == REJECT_NO_IMAGE);
+    assert!(Rejection::NoSignature as u64 == REJECT_NO_SIGNATURE);
+    assert!(Rejection::Malformed as u64 == REJECT_MALFORMED);
+    assert!(Rejection::BadSignature as u64 == REJECT_BAD_SIGNATURE);
+    assert!(Rejection::WrongProgram as u64 == REJECT_WRONG_PROGRAM);
+    assert!(Rejection::WrongHash as u64 == REJECT_WRONG_HASH);
+    assert!(Rejection::TooOld as u64 == REJECT_TOO_OLD);
+    assert!(Rejection::BadDescriptor as u64 == REJECT_BAD_DESCRIPTOR);
+    assert!(Rejection::WrongDescriptor as u64 == REJECT_WRONG_DESCRIPTOR);
+    assert!(Rejection::ClassMismatch as u64 == REJECT_CLASS_MISMATCH);
+    assert!(Rejection::TooLarge as u64 == REJECT_TOO_LARGE);
+    assert!(Rejection::BadElf as u64 == REJECT_BAD_ELF);
+    assert!(Rejection::BelowFloor as u64 == REJECT_BELOW_FLOOR);
+};
 
 /// Check `image` against signature file `sig` for `program`. Returns the signed version and the
 /// signed statement (program, version, hash: what gets measured into the TPM).
