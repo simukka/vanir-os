@@ -324,6 +324,21 @@ pub mod listen {
     /// Most ports one task may declare.
     pub const MAX_PORTS: usize = 8;
 
+    /// A slot image's setting (RFD 9, P5), from its signed descriptor.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Setting {
+        /// Zero padded (`descriptor::KEY_LEN`).
+        pub key: [u8; 16],
+        pub value: u64,
+    }
+
+    impl Setting {
+        pub fn key(&self) -> &[u8] {
+            crate::descriptor::padded(&self.key)
+        }
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     pub struct ListenInfo {
@@ -339,6 +354,13 @@ pub mod listen {
         pub version: u64,
         /// Data blocks of its service's volume, from the signed descriptor (RFD 3); 0 for none.
         pub volume_blocks: u64,
+        // ABI 1.0, grown in R2c (RFD 9, P5): a program built before reads the fields above.
+        /// The ABI version its image was built against; 0.0 for a fixed task or an empty slot.
+        pub abi_major: u32,
+        pub abi_minor: u32,
+        /// Settings from its signed descriptor; the first `settings_count` are in use.
+        pub settings_count: u64,
+        pub settings: [Setting; 12],
     }
 
     impl ListenInfo {
@@ -361,6 +383,16 @@ pub mod listen {
         /// The task with `loads = true`: the agent.
         pub const fn may_load(&self) -> bool {
             self.flags & LOADS != 0
+        }
+
+        /// The settings in use.
+        pub fn settings(&self) -> &[Setting] {
+            &self.settings[..(self.settings_count as usize).min(12)]
+        }
+
+        /// The value of setting `key`, if its descriptor has it.
+        pub fn setting(&self, key: &str) -> Option<u64> {
+            self.settings().iter().find(|s| s.key() == key.as_bytes()).map(|s| s.value)
         }
 
         /// (max_connections, max_per_source) if the task may listen on `port`.
@@ -931,7 +963,8 @@ const _: () = {
     assert!(size_of::<task::DeathRecord>() == 56);
     assert!(size_of::<events::Event>() == 56);
     assert!(size_of::<events::Stats>() == 1584);
-    assert!(size_of::<listen::ListenInfo>() == 136);
+    assert!(size_of::<listen::ListenInfo>() == 440);
+    assert!(size_of::<listen::Setting>() == descriptor::SETTING_LEN);
     assert!(size_of::<proto::nic::Info>() == 72);
     assert!(size_of::<proto::net::Event>() == 8);
     assert!(size_of::<proto::net::Accepted>() == 12);

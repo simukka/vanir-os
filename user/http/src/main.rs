@@ -732,6 +732,10 @@ fn main() -> u64 {
         let slot = core::str::from_utf8(&name[..me]).unwrap_or("?");
         let _ = write!(w, "{} v{} on {}", service, info.version, slot);
         s.name_len = w.len;
+        // Settings from the signed descriptor (RFD 9, P5); the runtime (R3) will hand them out.
+        for setting in info.settings() {
+            println!("{}: setting {} = {}", s.name(), core::str::from_utf8(setting.key()).unwrap_or("?"), setting.value);
+        }
         if info.volume_blocks > 0 {
             match lookup("disk") {
                 Ok(disk) => s.disk = Some(disk),

@@ -123,9 +123,7 @@ pub struct Descriptor {
     /// The ABI version the image was built against (RFD 9, P2); 1.0 for format 1.
     pub abi: (u32, u32),
     /// Settings (RFD 9, P5): key (zero padded) and value; the first `settings_count` are in use.
-    #[allow(dead_code)] // task_listen hands them to the instance (R2c)
     pub settings: [([u8; desc::KEY_LEN], u64); desc::MAX_SETTINGS],
-    #[allow(dead_code)]
     pub settings_count: usize,
     /// SHA-256 of the signed statement: what the run-time log records.
     pub statement_hash: [u8; 32],

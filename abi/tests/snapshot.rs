@@ -269,7 +269,14 @@ fn layouts() {
     assert_eq!(offset_of!(events::Stats, tasks), 32, "events::Stats.tasks");
     assert_eq!(offset_of!(events::Stats, frames_available), 40, "events::Stats.frames_available");
     assert_eq!(offset_of!(events::Stats, task), 48, "events::Stats.task");
-    assert_eq!(size_of::<listen::ListenInfo>(), 136, "listen::ListenInfo");
+    // Grown at its end in R2c (RFD 9, P5), on purpose; the offsets above are unchanged.
+    assert_eq!(size_of::<listen::ListenInfo>(), 440, "listen::ListenInfo");
+    assert_eq!(offset_of!(listen::ListenInfo, abi_major), 136);
+    assert_eq!(offset_of!(listen::ListenInfo, abi_minor), 140);
+    assert_eq!(offset_of!(listen::ListenInfo, settings_count), 144);
+    assert_eq!(offset_of!(listen::ListenInfo, settings), 152);
+    assert_eq!(size_of::<listen::Setting>(), 24);
+    assert_eq!(offset_of!(listen::Setting, value), 16);
     assert_eq!(offset_of!(listen::ListenInfo, service), 0, "listen::ListenInfo.service");
     assert_eq!(offset_of!(listen::ListenInfo, service_len), 32, "listen::ListenInfo.service_len");
     assert_eq!(offset_of!(listen::ListenInfo, flags), 40, "listen::ListenInfo.flags");

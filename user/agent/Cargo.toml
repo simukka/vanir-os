@@ -45,6 +45,7 @@ try-boot-sig = ["test-images"]        # a boot image's signature file (VNRSIG01)
 try-floor = ["test-images"]           # version below the descriptor's min_version
 try-large = ["test-images"]           # descriptor asks for another slot class
 try-abi-next = ["test-images"]        # built for ABI 1.1 (RFD 9, P2)
+try-settings = ["test-images"]        # web v1 with settings in its descriptor (RFD 9, P5), then wait
 try-occupied = ["test-images"]        # load web v1, then stage over it while it runs
 try-web-v1 = ["test-images"]
 # deployments with the lifecycle (RFD 2, P3/P4), web v1 live in small-0 first:

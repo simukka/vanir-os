@@ -1204,14 +1204,20 @@ pub fn task_listen(frame: &mut TrapFrame) {
         | bit(task.class.is_some(), listen::SLOT)
         | bit(task.loads, listen::LOADS);
     let volume_blocks = p.loaded.map_or(0, |d| d.volume_blocks);
-    let mut info =
-        ListenInfo { service: [0; 32], service_len: 0, flags, count: 0, ports: [[0; 4]; 8], version: p.version, volume_blocks };
+    let mut info = ListenInfo { flags, version: p.version, volume_blocks, ..ListenInfo::default() };
     let service = match &p.loaded {
         Some(d) => d.name(),
         None => task.service.as_bytes(),
     };
     info.service[..service.len()].copy_from_slice(service);
     info.service_len = service.len() as u64;
+    if let Some(d) = &p.loaded {
+        (info.abi_major, info.abi_minor) = d.abi;
+        for (out, &(key, value)) in info.settings.iter_mut().zip(&d.settings[..d.settings_count]) {
+            *out = listen::Setting { key, value };
+        }
+        info.settings_count = d.settings_count as u64;
+    }
     match &p.loaded {
         Some(d) => {
             for (out, &(port, max, per_source)) in info.ports.iter_mut().zip(&d.listen[..d.listen_count]) {

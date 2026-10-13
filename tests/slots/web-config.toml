@@ -1,0 +1,9 @@
+# web v1 with settings (RFD 9, P5): http prints them at start (slot-settings).
+name = "web"
+version = 1
+slot_class = "small"
+listen = [{ port = 80, max_connections = 64 }]
+
+[config]
+persist_ticks = 1000
+greeting_count = 3

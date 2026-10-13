@@ -165,6 +165,11 @@ pub fn script() -> Option<u64> {
         let _ = load_and_report("small-0", &image!("web-large"));
         return Some(0);
     }
+    #[cfg(feature = "try-settings")]
+    {
+        let _ = load_and_report("small-0", &image!("web-config"));
+        wait();
+    }
     #[cfg(feature = "try-abi-next")]
     {
         let _ = load_and_report("small-0", &image!("web-abi-next"));
