@@ -19,11 +19,12 @@ writes and without refusing new ones. This RFD covers:
 - handing the writer from one instance to the next without refusing writes
 - keys per service, released only to attested nodes
 - moving volumes between nodes
-- transferring volumes directly between nodes *(sparse: questions only)*
+- transferring volumes directly between nodes
 - replicating volumes so a node's loss doesn't lose data *(sparse: questions only)*
 
-The first four are decided and ready for a plan. The last two record the direction and the
-questions; their design comes later.
+The first five are decided and ready for a plan. The last records the direction and the
+questions; its design comes later. Recovering from a failure after a move's handoff and before
+its commit is left to a follow-up RFD (P4).
 
 ## Determinations
 
@@ -49,6 +50,16 @@ Revised in discussion (2026-10-12):
    round trip to the control plane (P1).
 8. **Writer epochs are leases,** recorded in the volume's metadata from V1, though only
    replication (P6) acts on their expiry.
+
+Revised in discussion (2026-10-13):
+
+9. **The new writer is told with a notify bit,** posted before its held requests are answered
+   (P1, P3).
+10. **Transfers use Noise `IK`,** with both nodes' keys named in their tickets (P5).
+11. **Recovering from a failure after a move's handoff and before its commit** (mirroring back,
+    and the control plane giving the epoch back to the source) moves to a follow-up RFD (P4).
+    Until then, determination 4's "no acknowledged write is lost during planned moves" holds
+    for failures before the handoff.
 
 ## Background
 
@@ -118,9 +129,13 @@ version can't change the data format before it's live. Formats have to stay comp
 while either version can run, so rollback works. This is a rule for services; vanir-os can't
 enforce it.
 
-**Becoming the writer.** When the candidate takes the epoch, `storage` tells it, in the reply to
-its first request after the switch. The instance must throw away anything it cached while it was
-read-only, because the old instance may have changed those blocks since.
+**Becoming the writer.** When the candidate takes the epoch, `storage` tells it with a notify
+bit, posted before it answers any of the candidate's held requests (P3). Until an instance has
+seen the bit, it must not use anything it cached while it was read-only, because the old
+instance may have changed those blocks since: it reads through instead, and after routing
+changes those reads wait for the switch (P3), so they are current. From the bit on, nobody else
+writes the volume, so what it caches stays current. (Decided 2026-10-13: a bit rather than a
+code in a reply, because a read's reply already carries its data and its code.)
 
 ### P2. Keys belong to the service, not the node
 
@@ -170,6 +185,16 @@ Where this meets RFD 2's flows:
 A local swap is the same, without the copy and mirror: both instances share one disk and one
 `storage` task.
 
+**How requests wait** (decided 2026-10-13). The agent tells `storage` which instance is the
+candidate just before it routes to it; in a move, the target's agent does so before the control
+plane adds the target to its load balancer. From then on `storage` holds the candidate's reads,
+writes and flushes without answering them. The kernel lets a server answer a blocked caller
+later, so nothing else is needed. When the epoch moves to the candidate, `storage` posts the
+writer bit (P1) and answers the held requests in order. If the handoff is called off (the epoch
+is refused, or the deployment rolls back), the held requests are answered as if they had just
+arrived: reads succeed and writes get `CODE_FENCED`. An IPC call blocks its caller, so each
+instance has at most one request held, and the queue needs one entry per slot (P8).
+
 ### P4. Moving a volume between nodes
 
 What a move must guarantee, whatever the transfer protocol (P5):
@@ -188,20 +213,27 @@ What a move must guarantee, whatever the transfer protocol (P5):
   the move.
 - **Check before the handoff.** Once the source has flushed the old instance's last writes, it
   and the target compare volume digests. The epoch moves only if they match.
-- **Mirror back until the commit.** After the handoff the mirror reverses: each of the target's
-  writes also goes to the source before it is acknowledged. The source's copy stays whole, so if
-  anything fails before the commit, the control plane can give the epoch back to the source
-  without losing writes.
-- **No takeback without the control plane.** Only the control plane can give the epoch back.
-  If it can't be reached during a handoff, whichever node holds the epoch keeps it, and keeps
-  mirroring to the other if it can.
+- **The source stops writing at the handoff.** Once the epoch has moved, the source's copy is
+  read-only: the instance there has drained, and `storage` refuses writes to the volume until the
+  control plane commits or the node is told otherwise.
 - **Commit.** The source wipes its copy only after the control plane commits the move.
 
-No acknowledged write can be lost: until the epoch moves, every acknowledged write is on the
-source (and on the target once mirroring starts); after it moves until the commit, every
-acknowledged write is on both; after the commit, every write is made on the target.
+No acknowledged write can be lost to a failure **before the handoff**: until the epoch moves,
+every acknowledged write is on the source (and on the target once mirroring starts), and the
+source keeps serving if the target or the link fails. After the handoff, every write is made on
+the target only.
 
-### P5. Transfer protocol *(sparse)*
+**Deferred to a follow-up RFD** (decided 2026-10-13): recovering from a failure **after the
+handoff and before the commit**. The design sketched here was to mirror back (each of the
+target's writes also goes to the source before it is acknowledged, so the source's copy stays
+whole) and to let only the control plane give the epoch back to the source; if it can't be
+reached, whichever node holds the epoch keeps it. Mirroring back is only useful together with
+giving the epoch back, so both move to the follow-up. Until then, if the target fails between
+the handoff and the commit, the service is down until the target's instance restarts, and the
+writes since the handoff are only on the target's disk. The source's copy, as it was at the
+handoff, is kept until the commit but not used.
+
+### P5. Transfer protocol
 
 Transfers go directly between nodes over the management network (determination 3, RFD 1 P1).
 The control plane only sets them up:
@@ -220,33 +252,61 @@ Why direct: volumes can be large, and routing every byte through the control pla
 bandwidth bottleneck and a single point of failure for every move in the fleet. The cost is
 that nodes, which normally only dial out, have to accept a connection from each other.
 
-Starting points:
+Decided 2026-10-13:
 
-- **Transfer tickets.** The control plane gives both nodes a signed ticket naming the peer (its
-  address and per-boot key), the volume, the epoch and an expiry. A node accepts only the
-  connection the ticket names, only while the ticket is valid.
-- **Who dials whom.** Probably the target dials the source, so the source, which is serving
-  traffic, accepts exactly one expected connection.
-- **Channel.** A Noise `KK` handshake, both nodes' per-boot keys (each bound to an attestation
-  quote, RFD 2 P7) named in the ticket. The control plane already holds the volume keys (P2),
-  so trusting its ticket for the peer's identity adds no new trust; the ticket doesn't need to
-  carry attestation evidence.
-- **One connection, four phases:** bulk copy, catch-up rounds, mirroring until the handoff, then
-  mirroring back until the commit or an abort. A dropped connection resumes from what the target
-  already holds.
+- **Transfer tickets.** A ticket is part of each node's signed desired state, so it needs no
+  signature of its own. It names the volume, the peer node, the peer's address on the
+  management network and its key, the epoch the target will take, and an expiry. The source's
+  ticket says "send", the target's "receive". A node accepts only the connection its ticket
+  names, and only while the ticket is valid.
+- **The peer's key** is the key the peer's agent uses with the control plane, which that node's
+  attestation quote binds (RFD 2, P7). The control plane already holds the volume keys (P2), so
+  trusting its ticket for the peer's identity adds no new trust; the ticket doesn't need to carry
+  attestation evidence.
+- **The target dials the source,** so the source, which is serving traffic, accepts exactly one
+  expected connection. Its agent listens on the management network only while it holds a
+  "send" ticket.
+- **Channel: Noise `IK`,** the pattern the agent already uses with the control plane. The target
+  starts it knowing the source's key from its ticket; the source learns the target's key in the
+  first message and closes the connection unless it is the one its ticket names. That gives
+  both sides the same assurance as `KK`, without a second handshake pattern to implement and
+  test. (The agent gains the responder's side.)
+- **One connection, four phases:**
+  1. *Bulk copy.* The source sends the header and every block as it is on disk: ciphertext,
+     write counter and tag. The seal binds only the volume name, the volume-relative block
+     number and the counter, so the target checks each block with the service key and stores
+     it unchanged.
+  2. *Catch-up.* The target sends the counters it holds; the source sends every block whose
+     counter is higher. Rounds repeat until a round finds few enough changed blocks.
+  3. *Mirroring.* Each write the source acknowledges has reached the target first.
+  4. *Handoff.* Once the source's instance has drained and its writes are flushed, the source
+     sends its volume digest. The target compares it with its own; if they match, its agent
+     gives the target's instance the epoch from its ticket, and the source's copy becomes
+     read-only (P4). If they don't, the move is aborted.
+- **Resuming.** A connection dropped before the handoff resumes with a catch-up round, from the
+  counters the target already holds, as long as the tickets are valid.
+
+**Failure cases:**
+
+| Failure | What happens |
+|---|---|
+| The target dies, or the link fails, before the handoff | The source's mirrored writes stall for at most the mirror timeout; then it writes alone and reports the move aborted. The control plane can retry with new tickets |
+| The source dies before the handoff | The service is down on the source until it restarts there (RFD 2's crash policy); every acknowledged write is on its disk. Losing the node is P6 |
+| A ticket expires before the handoff | Both sides abort as above; the handoff never starts after expiry. After the handoff, expiry no longer matters |
+| The digests don't match | No handoff; the move is aborted and reported, and the source keeps serving |
+| The control plane is unreachable | The transfer and handoff go ahead, because the tickets carry everything they need. The commit waits for the control plane |
+| Anything after the handoff, before the commit | Deferred to a follow-up RFD (P4) |
 
 Questions:
 
 1. **Rate limiting.** A bulk copy shouldn't starve the service's own disk I/O, or the
-   management network the control plane needs. Who sets the limit?
+   management network the control plane needs. Who sets the limit? (Volumes are small so far,
+   1 MiB in the tests, so the first implementation has none.)
 2. **Throughput.** Each block crosses `storage`, the agent and `mgmt-net` by IPC copy (at most
    4 KiB per message). Fast enough, or does this need leases (RFD 1, P8)? Step 8's benchmarks
    should measure it.
 3. **Mirror latency.** Mirroring adds a round trip between nodes to every write. Is there a
    latency limit above which the control plane shouldn't pick a target (e.g. across sites)?
-4. **Failure cases to specify:** the source dies during bulk copy or mirroring, the target dies,
-   a ticket expires mid-transfer. (The control plane being unreachable during a handoff is
-   covered in P4.)
 
 ### P6. Replication *(sparse)*
 
@@ -304,8 +364,9 @@ mirrored, handed off, committed and aborted.
 - **Disk space.** A local swap shares the volume, so it costs nothing. A move needs a full copy
   of the volume on the target node, so each node keeps free space for incoming volumes, and the
   control plane has to know each node's free space.
-- **Memory.** Requests queued during a handoff need a fixed-size queue in `storage`. When it is
-  full, further requests wait for space rather than fail.
+- **Memory.** Requests queued during a handoff need a fixed-size queue in `storage`. Each
+  instance has at most one request outstanding (an IPC call blocks its caller), so one entry per
+  slot is enough. If it is ever full anyway, further requests wait for space rather than fail.
 
 ## Phasing (rough; the plan will detail it)
 
@@ -314,8 +375,8 @@ mirrored, handed off, committed and aborted.
 | V1 | service-owned volumes, writer epochs and lease fields, read-only candidates (P1) | a fenced writer is refused; a candidate can't write | D2 |
 | V2 | keys per service, released by attestation (P2) | a node without the epoch gets no key; volume opens on a node with the key | D2 |
 | V3 | handoff in a local swap (P3) | swap under read-modify-write load with no acknowledged write lost, no write refused, and no update made from stale data | D3 |
-| V4 | direct transfer, mirroring both ways, digests and moves (P4, P5) | two QEMU nodes: move under write load, nothing lost or refused; a partition or failure before commit leaves the source whole and serving | D5 |
-| later | leases enforced, replication (P6) | | |
+| V4 | direct transfer, mirroring, digests and moves (P4, P5) | two QEMU nodes: move under write load, nothing lost or refused; a partition or failure before the handoff leaves the source whole and serving | D5 |
+| later | recovery after the handoff (follow-up RFD); leases enforced, replication (P6) | | |
 
 ## Open questions
 
