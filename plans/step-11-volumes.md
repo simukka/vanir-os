@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3), and V4a–V4b; V4c planned.
+Status: implemented (V1a–V1c, V2a–V2b, V3, V4a–V4c).
 
 ## Goal
 
@@ -587,3 +587,20 @@ Where it departs from the plan so far:
   run with every request answered: the switcher printed "web-1 drained" before `net` did, and
   the test's regex wants `net`'s line first. It passed when run again; nothing in V4 touches
   either task.
+- **V4c: the target's epoch comes from its `live` line,** offered once the transfer has taken
+  the volume, as to any live instance whose epoch differs; the plan had the transfer give it.
+  The two are the same epoch (the control plane writes both), and this way the instance gets
+  the control plane's lease. Until then the agent holds back the `live` line's deployment
+  (until the volume is mirrored) and its epoch (until the handoff), and `Promote` holds the new
+  instance's requests without the epoch.
+- **V4c: the source hands over when no instance of the service runs on it** (none starting,
+  ready, live, draining or drained), with no mirrored write outstanding. Read-only survives the
+  same epoch asserted again (`OP_EPOCH` refuses it), but only in memory: a source whose
+  `storage` restarts or that reboots before the commit has a writable copy at the old epoch
+  again, which the control plane must not hand out (the manual's limitations say so).
+- **V4c: tests.** `move-volume-digest` uses `agent/transfer-drop-writes` (the target answers
+  mirrored writes after the first without storing them; dropping just one would be overwritten
+  by the next write to the same block) and `http/volume-probe` for the writes, with no peer. In
+  the run that was checked, `move-volume-under-load` handed over after 13 mirrored writes, the
+  target's held request waited 6 ticks, and the peer's 1091 counts were all answered, none
+  lost, repeated or FENCED.

@@ -27,6 +27,9 @@
 //!   | `M` | source | mirroring from now on |
 //!   | `W` | source | a mirrored write, as `B` |
 //!   | `A` | target | the mirrored write is stored |
+//!   | `D` | source | its volume digest, at the handoff (32) |
+//!   | `Y` | target | the digests match: it takes the epoch |
+//!   | `X` | target | the digests differ: no handoff |
 //!   | `Q` | either | giving up (text) |
 //!
 //! - **Copy, catch up, mirror** (P4). The source sends every block that has been written, as
@@ -38,6 +41,16 @@
 //!   mirrored write within `MIRROR_TIMEOUT`, the source gives up and writes alone.
 //! - **Giving up** (either side, an expired ticket, or a ticket withdrawn) stops the source
 //!   mirroring, and the target drops what it received.
+//! - **The target's instance** starts only once the volume is mirrored; when it is routed to,
+//!   its requests are held (`block::OP_HANDOFF`), but it doesn't get the epoch yet.
+//! - **The handoff.** Once no instance of the service runs on the source (the control plane has
+//!   moved its load balancer to the target, then drained and stopped the source's), the source
+//!   hands its volume over (`block::OP_HAND_OVER`: read-only, flushed) and sends its digest. If
+//!   the target's matches, it says `Y`, and its instance is offered the epoch its `live` line
+//!   names (the ticket's), as any live instance is, which answers the held requests; if not, it calls its handoff off and says `X`, and the control plane
+//!   gives the source a new epoch. Read-only comes first so two writers can't happen, whatever
+//!   the link does. After the handoff the ticket's expiry no longer matters.
+//! - **The commit** of a service whose volume moved away drops the source's copy.
 //!
 //! One transfer at a time: tickets for a second one wait until the first is withdrawn.
 
@@ -164,6 +177,14 @@ pub enum Phase {
     Connected,
     Copying,
     Mirroring,
+    /// Source: handed over, digest sent, waiting for the answer.
+    HandingOver,
+    /// Source: the target took the volume.
+    HandedOver,
+    /// Target: the digests matched; the epoch is ours.
+    Taken,
+    /// The digests differed: no handoff.
+    RefusedDigest,
     /// Given up, and why.
     Aborted(&'static str),
 }
@@ -175,6 +196,10 @@ impl Phase {
             Phase::Connected => "connected",
             Phase::Copying => "copying",
             Phase::Mirroring => "mirroring",
+            Phase::HandingOver => "handing-over",
+            Phase::HandedOver => "handed-over",
+            Phase::Taken => "taken",
+            Phase::RefusedDigest => "refused-digest",
             Phase::Aborted(_) => "aborted",
         }
     }
@@ -200,6 +225,12 @@ pub struct Transfer {
     received: bool,
 }
 
+/// Whether an instance of `service` still runs here (it may still write).
+fn runs(agent: &Agent, service: &[u8]) -> bool {
+    use crate::lifecycle::State;
+    agent.slots.iter().flatten().any(|s| s.service() == service && matches!(s.state, State::Starting | State::Ready | State::Live | State::Draining | State::Drained))
+}
+
 /// The node's side of every transfer: the listener, and the one transfer under way.
 pub struct Transfers {
     mgmt: u64,
@@ -211,11 +242,13 @@ pub struct Transfers {
     pub current: Option<Transfer>,
     /// Something changed that the control plane should hear about.
     pub changed: bool,
+    /// A service whose volume another node took, to drop at its commit.
+    moved_away: Option<[u8; 32]>,
 }
 
 impl Transfers {
     pub fn new(mgmt: u64) -> Transfers {
-        Transfers { mgmt, disk: None, listener: None, ready: false, current: None, changed: false }
+        Transfers { mgmt, disk: None, listener: None, ready: false, current: None, changed: false, moved_away: None }
     }
 
     /// The handles we want events for.
@@ -361,8 +394,11 @@ impl Transfers {
     /// Move the connection along: dial, time out, expire.
     pub fn step(&mut self, now: u64, agent: &mut Agent) {
         self.disk = agent.disk();
+        // The target's instance waits for its epoch until the transfer gives it.
+        agent.incoming = self.current.as_ref().filter(|t| t.ticket.role == Role::Receive && t.phase != Phase::Taken).map(|t| t.ticket.service);
         let Some(t) = &self.current else { return };
-        if now >= t.ticket.expires && !matches!(t.link, Link::Closed) {
+        let before_handoff = !matches!(t.phase, Phase::HandingOver | Phase::HandedOver | Phase::Taken | Phase::RefusedDigest);
+        if now >= t.ticket.expires && !matches!(t.link, Link::Closed) && before_handoff {
             return self.abort("ticket expired");
         }
         if t.ticket.role == Role::Send && matches!(t.link, Link::Up { .. }) {
@@ -371,6 +407,7 @@ impl Transfers {
                 Phase::Mirroring => match t.outstanding {
                     Some((_, since)) if now - since > MIRROR_TIMEOUT => return self.abort("mirror timeout"),
                     Some(_) => return,
+                    None if !runs(agent, t.ticket.service()) => return self.hand_over(),
                     None => return self.mirror_next(),
                 },
                 _ => {}
@@ -711,6 +748,90 @@ impl Transfers {
         }
     }
 
+    /// Source: nothing writes the volume here any more; make it read-only and send its digest.
+    fn hand_over(&mut self) {
+        let service = self.current.as_ref().unwrap().ticket.service;
+        let mut pending = [0u8; 8];
+        if self.storage(block::OP_MIRROR_PENDING, 0, &service, &[], &mut pending) != Ok(0) {
+            return; // a last write to send first
+        }
+        let mut digest = [0u8; 32];
+        let handed = self.storage(block::OP_HAND_OVER, 0, &service, &[], &mut []).and_then(|_| self.storage(block::OP_DIGEST, 0, &service, &[], &mut digest));
+        if let Err(e) = handed {
+            println!("agent: transfer: handing over: {}", block::code_name(e));
+            return self.abort("storage would not hand over");
+        }
+        let t = self.current.as_mut().unwrap();
+        println!(
+            "agent: transfer {}: our instance has stopped; handed over after {} mirrored writes; sending the digest",
+            core::str::from_utf8(t.ticket.service()).unwrap_or("?"),
+            t.mirrored
+        );
+        t.phase = Phase::HandingOver;
+        self.changed = true;
+        let _ = self.send_frame(b'D', &digest);
+    }
+
+    /// Target: the source's digest; take the volume if it matches ours.
+    fn digest(&mut self, theirs: &[u8]) {
+        let t = self.current.as_ref().unwrap();
+        let (service, epoch) = (t.ticket.service, t.ticket.epoch);
+        let name = &service[..service.iter().position(|&b| b == 0).unwrap_or(32)];
+        let shown = core::str::from_utf8(name).unwrap_or("?");
+        let mut ours = [0u8; 32];
+        if self.storage(block::OP_DIGEST, 0, &service, &[], &mut ours).is_err() {
+            return self.abort("no digest of our copy");
+        }
+        let t = self.current.as_mut().unwrap();
+        if ours[..] == *theirs {
+            println!("agent: transfer {}: the digests match; taking epoch {}", shown, epoch);
+            t.phase = Phase::Taken;
+            t.received = false; // ours now: never dropped
+            let _ = self.send_frame(b'Y', &[]);
+        } else {
+            println!("agent: transfer {}: the digests differ; not taking the volume", shown);
+            t.phase = Phase::RefusedDigest;
+            let _ = self.send_frame(b'X', &[]);
+            // Our instance's held requests are answered as they are: it isn't the writer.
+            if let Some(disk) = self.disk
+                && let Err(e) = block::handoff(disk, name, 0)
+            {
+                println!("agent: transfer {}: calling the handoff off: {}", shown, block::code_name(e));
+            }
+        }
+        self.changed = true;
+        self.finish();
+    }
+
+    /// The handoff is decided: close the connection (the ticket stays until withdrawn).
+    fn finish(&mut self) {
+        let Some(t) = self.current.as_mut() else { return };
+        if let Link::Up { conn, .. } = t.link {
+            let _ = net::close(self.mgmt, conn);
+        }
+        t.link = Link::Closed;
+    }
+
+    /// At the commit of `service`: drop our copy if its volume moved away.
+    pub fn committed(&mut self, service: &[u8]) {
+        let name = block::service_name(service);
+        if self.moved_away != Some(name) {
+            return;
+        }
+        self.moved_away = None;
+        let shown = core::str::from_utf8(service).unwrap_or("?");
+        match self.storage(block::OP_DROP, 0, &name, &[], &mut []) {
+            Ok(_) => println!("agent: transfer {}: committed; our copy is dropped", shown),
+            Err(e) => println!("agent: transfer {}: dropping our copy: {}", shown, block::code_name(e)),
+        }
+    }
+
+    /// Whether a transfer is bringing `service`'s volume here and hasn't finished: until then
+    /// its instance must not start before the volume is mirrored, nor get the epoch.
+    pub fn receiving(&self, service: &[u8]) -> Option<Phase> {
+        self.current.as_ref().filter(|t| t.ticket.role == Role::Receive && t.ticket.service() == service && t.phase != Phase::Taken).map(|t| t.phase)
+    }
+
     fn message(&mut self, n: usize, _agent: &mut Agent) {
         let frame = unsafe { &*(&raw const FRAME) };
         let body = &frame[1..n];
@@ -747,6 +868,16 @@ impl Transfers {
                     t.mirrored += 1;
                     return;
                 }
+                // Test: after the first, mirrored writes are answered but not stored.
+                if mirrored && cfg!(feature = "transfer-drop-writes") && t.mirrored > 0 {
+                    if t.mirrored == 1 {
+                        println!("agent: transfer {}: (test) answering mirrored writes without storing them", shown);
+                    }
+                    t.mirrored += 1;
+                    let b = u64::from_le_bytes(body[..8].try_into().unwrap());
+                    let _ = self.send_frame(b'A', &b.to_le_bytes());
+                    return;
+                }
                 let b = u64::from_le_bytes(body[..8].try_into().unwrap());
                 let stored = self.storage(block::OP_IMPORT_ENTRY, 0, &service, &body[..32], &mut []).and_then(|_| {
                     let disk = self.disk.ok_or(err::DEAD)?;
@@ -772,6 +903,24 @@ impl Transfers {
                 t.phase = Phase::Mirroring;
                 self.changed = true;
                 println!("agent: transfer {}: received {} blocks in {} rounds; mirroring", shown, t.copied, t.rounds);
+            }
+            (Role::Receive, b'D') if body.len() == 32 && t.phase == Phase::Mirroring => {
+                let mut theirs = [0u8; 32];
+                theirs.copy_from_slice(body);
+                self.digest(&theirs)
+            }
+            (Role::Send, b'Y') if t.phase == Phase::HandingOver => {
+                println!("agent: transfer {}: node {} took the volume; ours stays read-only until the commit", shown, t.ticket.peer());
+                t.phase = Phase::HandedOver;
+                self.moved_away = Some(service);
+                self.changed = true;
+                self.finish();
+            }
+            (Role::Send, b'X') if t.phase == Phase::HandingOver => {
+                println!("agent: transfer {}: node {}'s digest differs; ours stays read-only until a new epoch", shown, t.ticket.peer());
+                t.phase = Phase::RefusedDigest;
+                self.changed = true;
+                self.finish();
             }
             (Role::Send, b'A') if t.outstanding.is_some() => {
                 let (_, since) = t.outstanding.take().unwrap();

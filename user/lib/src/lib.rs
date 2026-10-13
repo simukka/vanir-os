@@ -434,6 +434,13 @@ pub mod block {
     pub const OP_MIRROR: u64 = 17;
     pub const OP_MIRROR_PENDING: u64 = 18;
     pub const OP_MIRROR_ACK: u64 = 19;
+    /// Source, at a move's handoff: the volume becomes read-only (no writer; writes get
+    /// CODE_FENCED, and the same epoch can't be asserted again) and is flushed. Only a higher
+    /// epoch (`OP_EPOCH`) makes it writable again.
+    pub const OP_HAND_OVER: u64 = 20;
+    /// SHA-256 over the volume's header (96 bytes) and every metadata block: it identifies the
+    /// volume's exact state without decrypting it (RFD 3, P1's volume digest).
+    pub const OP_DIGEST: u64 = 21;
     /// Wipe the volume (header and counters: every block reads as never written) and free its
     /// space for a volume of the same size. Refused while an instance writes it.
     pub const OP_DROP: u64 = 22;

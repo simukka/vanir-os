@@ -581,7 +581,19 @@ def count_under_deploy(args):
     while the agent deploys counter v2 over v1 (RFD 3). Every request must be answered 200 (V3:
     the new instance's requests wait during the handoff, so none is FENCED), and the counts must
     be exactly 1..N: a repeat would be an update made from stale data, a gap a lost write."""
-    path = ["counter v1 on small-0", "counter v2 on small-1"]
+    return count_through(args, ["counter v1 on small-0", "counter v2 on small-1"], 30)
+
+
+@scenario
+def count_under_move(args):
+    """As count-under-deploy, while counter and its volume move from node a to node b, through
+    the control plane's load balancer (RFD 3, V4c)."""
+    return count_through(args, ["counter v1 on small-0", "counter v1 on small-1"], 60)
+
+
+def count_through(args, path, last):
+    """Four clients count through the instances in `path`, until each has had `last` answers
+    from the last one."""
     deadline = time.monotonic() + args.timeout - 5
     if not wait_for_instance(path[0], deadline):
         say(f"{path[0]} never answered")
@@ -620,7 +632,7 @@ def count_under_deploy(args):
     threads = [threading.Thread(target=client, args=(i,)) for i in range(4)]
     for t in threads:
         t.start()
-    while time.monotonic() < deadline and not all(seen(list(a)) == path and list(a).count(path[1]) >= 30 for a in answers):
+    while time.monotonic() < deadline and not all(seen(list(a)) == path and list(a).count(path[-1]) >= last for a in answers):
         time.sleep(0.1)
     stop.set()
     for t in threads:

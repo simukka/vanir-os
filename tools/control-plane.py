@@ -415,6 +415,7 @@ class ControlPlane:
         self.tell(src, [*src_lines, send])
         self.wait_transfer(f"node {src} listening", src, service, "waiting")
         self.tell(dst, [*dst_lines, receive])
+        return send, receive
 
     def transfer(self, node, service):
         """The transfer of `service` in `node`'s last report, or None."""
@@ -787,6 +788,60 @@ def transfer_corrupt(cp):
     cp.tell("a", [live])
     cp.tell("b", ["end"])
     return ok
+
+
+def move_counter(cp):
+    """Move counter and its volume from node a to node b (RFD 3, P3-P5): tickets; once node b
+    mirrors, counter v1 on node b (its requests wait); new connections to node b; node a drains
+    and stops; the handoff. Returns (node b's transfer phase, node b's live line)."""
+    live_a = counter_on_a(cp)
+    time.sleep(3)
+    live_b = cp.live("counter", "small-1", "counter-v1")  # epoch 2
+    send, receive = cp.start_transfer("counter", "a", "b", epoch=2, src_lines=[live_a], expires=120)
+    cp.wait_transfer("node b mirroring", "b", "counter", "mirroring")
+    cp.tell("b", [live_b, receive])
+    cp.wait_slots("counter live on node b", node="b", small_1=("counter", 1, "LIVE"))
+    cp.route("b")
+    cp.tell("a", ["stop counter drain 30", send])
+    t = cp.wait_transfer("node b deciding", "b", "counter", "taken", "refused-digest")
+    cp.wait_transfer("node a hearing it", "a", "counter", "handed-over", "refused-digest")
+    return t["phase"], live_b
+
+
+@scenario
+def move_volume(cp):
+    """RFD 3, V4c: counter moves from node a to node b under load, with its volume; node a's
+    copy is dropped at the commit. The peer ends the run (through node b)."""
+    phase, _ = move_counter(cp)
+    if phase != "taken":
+        return False
+    # (Node b's last report stays here even once the peer has ended its run.)
+    cp.wait(lambda: slot_epoch(cp, "small-1", node="b")[0] == 2, "node b's instance with epoch 2")
+    say("reached: node b's instance holds epoch 2")
+    cp.tell("a", ["commit counter"])
+    cp.wait_slots("counter unloaded from node a", node="a", small_0="EMPTY")
+    cp.tell("a", ["end"])
+    return True
+
+
+@scenario
+def move_volume_digest(cp):
+    """RFD 3, V4c: node b answers mirrored writes without storing them
+    (agent/transfer-drop-writes), so the digests differ at the handoff: no handoff; node b's
+    instance never writes, and counter goes back to node a with epoch 3."""
+    phase, _ = move_counter(cp)
+    if phase != "refused-digest":
+        return False
+    cp.route("a")
+    cp.tell("b", ["stop counter drain 1"])
+    cp.tell("a", [cp.live("counter", "small-0", "counter-v1", epoch=3)])
+    cp.wait(lambda: slot_epoch(cp, "small-0", node="a")[0] == 3, "counter on node a with epoch 3")
+    say("reached: counter back on node a with epoch 3")
+    cp.wait_slots("counter stopped on node b", node="b", small_1="STOPPED")
+    cp.tell("b", ["end"])
+    time.sleep(2)  # node a's probe writes again
+    cp.tell("a", ["end"])
+    return True
 
 
 @scenario

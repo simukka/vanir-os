@@ -59,5 +59,6 @@ script-volume-resize = ["test-images"]   # v1 with epoch 1, then v3 (another vol
 script-volume-none = ["test-images"]     # web v1 (no volume) in small-0; exit
 script-volume-forget = ["test-images"]   # v1 with epoch 1, drained and committed (key forgotten), then v1 again; exit
 transfer-stall = []                       # a target that stops answering mirrored writes (RFD 3, V4b)
+transfer-drop-writes = []                 # a target that answers mirrored writes after the first without storing them
 transfer-corrupt = []                     # a source that changes a bit of the first block it sends
 script-volume-handoff-off = ["test-images"] # v1 with epoch 1, then v2 with epoch 1 (refused after the drain: handoff called off); exit

@@ -41,7 +41,9 @@
 //! (`OP_EXPORT*`), and the target imports them (`OP_IMPORT*`), checking each block opens with
 //! the service key before storing it. While the source mirrors (`OP_MIRROR`), each write by the
 //! writer is held after it is made, until the agent says the target has it too. A dropped volume
-//! (`OP_DROP`) is wiped and its space reused by the next volume of the same size.
+//! (`OP_DROP`) is wiped and its space reused by the next volume of the same size. At the handoff
+//! the source's volume is handed over (`OP_HAND_OVER`: read-only until a higher epoch) and both
+//! sides compare digests (`OP_DIGEST`).
 //!
 //! Keys are only ever in memory. The task starts locked, answering CODE_LOCKED: it asks the key
 //! server ("keys") for the master key if it may send to one, and otherwise waits for OP_UNLOCK
@@ -67,12 +69,12 @@
 
 use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use vanir_user::block::{
     self, BLOCK_SIZE, CODE_BAD_OP, CODE_FENCED, CODE_INTEGRITY, CODE_IO_ERROR, CODE_LOCKED, CODE_NOT_ALLOWED, CODE_OK, CODE_OUT_OF_RANGE,
     NOTIFY_WRITER, OP_DROP, OP_EPOCH, OP_EXPORT, OP_EXPORT_ENTRY, OP_EXPORT_HEADER, OP_EXPORT_META, OP_FLUSH, OP_FORGET_KEY, OP_HANDOFF,
-    OP_IMPORT, OP_IMPORT_ENTRY, OP_IMPORT_HEADER, OP_INFO, OP_MIRROR, OP_MIRROR_ACK, OP_MIRROR_PENDING, OP_READ, OP_SERVICE_KEY,
-    OP_UNLOCK, OP_WRITE, split,
+    OP_DIGEST, OP_HAND_OVER, OP_IMPORT, OP_IMPORT_ENTRY, OP_IMPORT_HEADER, OP_INFO, OP_MIRROR, OP_MIRROR_ACK, OP_MIRROR_PENDING,
+    OP_READ, OP_SERVICE_KEY, OP_UNLOCK, OP_WRITE, split,
 };
 use vanir_user::keys::{self, OP_MASTER_KEY};
 use vanir_user::telemetry::{self, INTEGRITY_ERROR, Record, STORAGE_LOCKED, STORAGE_UNLOCKED, VOLUME_CREATED};
@@ -133,6 +135,8 @@ struct Volume {
     /// answered (its id and block), until the agent says the target has it.
     mirror: bool,
     mirror_pending: Option<(u64, u64)>,
+    /// Handed over to another node in a move: read-only until a higher epoch.
+    handed_over: bool,
 }
 
 /// Metadata blocks for `blocks` data blocks.
@@ -265,6 +269,7 @@ impl Storage {
                     candidate: None,
                     mirror: false,
                     mirror_pending: None,
+                    handed_over: false,
                 });
             }
         }
@@ -328,6 +333,7 @@ impl Storage {
             candidate: None,
             mirror: false,
             mirror_pending: None,
+            handed_over: false,
         };
         if free.is_none() && self.next_free + v.footprint() > self.capacity {
             return Err(CODE_OUT_OF_RANGE);
@@ -458,13 +464,14 @@ impl Storage {
             v.lease_until = lease_until;
             v.writer = Some(slot);
             v.fenced_seen = 0;
+            v.handed_over = false;
             self.write_header(&mut v)?;
             self.flush()?;
             self.volumes[i] = Some(v);
             println!("storage: {}: epoch {}, writer task {} (recorded in {} ticks)", service, epoch, slot, uptime() - started);
             // Tell the new writer, before any request it has waiting is answered.
             let _ = notify(writer, NOTIFY_WRITER);
-        } else if epoch == v.epoch && epoch != 0 && v.writer.is_none_or(|w| w == slot) {
+        } else if epoch == v.epoch && epoch != 0 && v.writer.is_none_or(|w| w == slot) && !v.handed_over {
             v.writer = Some(slot);
             self.volumes[i] = Some(v);
             println!("storage: {}: epoch {} again, writer task {}", service, epoch, slot);
@@ -667,6 +674,27 @@ impl Storage {
                     let _ = reply(writer, CODE_OK, &[]);
                 }
                 Ok(0)
+            }
+            OP_HAND_OVER => {
+                let mut v = v;
+                v.writer = None;
+                v.handed_over = true;
+                v.mirror = false;
+                self.volumes[i] = Some(v);
+                self.flush()?;
+                println!("storage: {}: handed over at epoch {}; read-only", shown, v.epoch);
+                Ok(0)
+            }
+            OP_DIGEST => {
+                let mut buf = [0u8; BLOCK_SIZE];
+                self.read(v.start, &mut buf)?;
+                let mut h = Sha256::new().chain_update(&buf[..HEADER_BYTES]);
+                for m in 0..meta_blocks(v.blocks) {
+                    self.read(v.start + 1 + m, &mut buf)?;
+                    h.update(&buf);
+                }
+                msg[..32].copy_from_slice(&h.finalize());
+                Ok(32)
             }
             OP_DROP => {
                 if v.writer.is_some() || v.candidate.is_some() || v.mirror {

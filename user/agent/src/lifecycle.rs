@@ -131,6 +131,9 @@ pub struct Agent {
     resend_epochs: bool,
     /// A slot changed state since this was last cleared (the control plane wants a report).
     pub changed: bool,
+    /// A service whose volume is coming from another node (RFD 3, P5): its new instance's
+    /// requests are held from routing on, and its epoch comes with the transfer's handoff.
+    pub incoming: Option<[u8; 32]>,
 }
 
 /// The drain deadline in ticks for an instance of `image`: the descriptor's default, or `asked`
@@ -164,6 +167,7 @@ impl Agent {
             disk: lookup("disk").ok(),
             resend_epochs: false,
             changed: false,
+            incoming: None,
         }
     }
 
@@ -405,8 +409,21 @@ impl Agent {
                 _ => d.step,
             },
             Step::Promote => {
+                // A volume coming from another node: the new instance's requests wait from
+                // routing on, and the epoch comes when the transfer hands over.
+                let incoming = self.incoming == Some(block::service_name(new.service()));
+                if d.old.is_none()
+                    && d.epoch.is_some()
+                    && incoming
+                    && let Some(disk) = self.disk
+                    && let Err(e) = block::handoff(disk, new.service(), new.id)
+                {
+                    println!("agent: holding {}'s requests: {}", new.name, block::code_name(e));
+                    return d.step;
+                }
                 // With no old instance, the new one becomes the writer before it gets traffic.
                 if d.old.is_none()
+                    && !incoming
                     && let Some(epoch) = d.epoch
                 {
                     match self.assign_epoch(d.new, epoch) {

@@ -513,6 +513,7 @@ impl Control {
     /// Commit `service`, and drop its volume key once no instance of it is left.
     fn commit(&mut self, agent: &mut Agent, service: &[u8]) {
         agent.commit(service);
+        self.transfers.committed(service);
         if !agent.holds(service) {
             let name = vanir_user::block::service_name(service);
             for k in self.keys.iter_mut() {
@@ -598,11 +599,18 @@ impl Control {
                     if agent.busy(service) {
                         continue;
                     }
+                    // Its volume is on its way here: start the instance once it is mirrored,
+                    // and leave the epoch to the transfer (RFD 3, P5).
+                    let receiving = self.transfers.receiving(service);
+                    if receiving.is_some_and(|p| p != crate::transfer::Phase::Mirroring) && agent.live(service).is_none() {
+                        continue;
+                    }
                     let live = agent.live(service);
                     if let Some(k) = live.filter(|&k| agent.get(k).image.is_some_and(|i| i.hash() == hash)) {
                         // The right instance is live: offer it the epoch asked for, once.
                         let s = agent.get(k);
                         if let Some(epoch) = self.epoch_for(service)
+                            && receiving.is_none()
                             && s.epoch.map(|e| e.0) != Some(epoch.0)
                             && s.epoch_refused != Some(epoch.0)
                         {
