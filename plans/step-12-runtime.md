@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1, R2 and R3 implemented (R1a–R1c, R2a–R2d, R3a–R3d).
+Status: R1, R2 and R3 implemented (R1a–R1c, R2a–R2d, R3a–R3d); R4 planned.
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -450,3 +450,83 @@ Where it departs from the plan:
   after R1, 1742 after R2), `counter-cached-load` 14376 (14775 before); none lost or repeated.
   The runtime costs at most a few percent, within the spread between runs.
 
+
+## R4: `make run-service`, and services tested on the host (RFD 9, phasing step 4; open question 5)
+
+### Goal
+
+Implement RFD 9, phase R4. After R4:
+
+- `make run-service SERVICE=<program>` boots a node that runs one service: the program signed
+  with its descriptor (default `apps/services/<program>.toml`), deployed by the agent in script
+  mode into slot `small-0`, holding epoch 1 if it has a volume, with the descriptor's first port
+  forwarded to `127.0.0.1:$(SERVICE_PORT)` (8080). Its volume lives in
+  `build/service-disk.img`, kept across runs (`SERVICE_RESET=1` starts it from zeros) and apart
+  from the tests' `build/disk.img`. Ctrl-C ends it
+- a service can be unit-tested with `cargo test --target x86_64-unknown-linux-gnu`: on any
+  target but `x86_64-unknown-none`, `vanir-rt` is a host backend (`vanir_rt::host::Host<S>`)
+  that calls the service's `start`, `request`, `tick`, `drain` and `fenced` as the runtime
+  does, with the clock driven by the test and the volume in memory. No network, no QEMU
+- `counter` has such tests, run by a host check (`counter-host`)
+
+Out of scope: the other open questions (1, 2, 4, 7), which R4 doesn't need; packaging and
+outside builds (their own RFD); faking `Locked` or I/O errors in the host backend (only
+`Fenced`, which a service must handle).
+
+### What we have
+
+- **The agent's volume scripts** deploy a counter image with an epoch and keep the agent's loop
+  turning (`script-volume-serve`); every image is embedded at build time from `build/slots`.
+- **The Makefile** forwards `NET_PORT` to the guest's port 80 only, and puts every disk in
+  `build/disk.img`, which the tests reset.
+- **`vanir-rt`** depends on `vanir-user`, which has a `#[panic_handler]` and the syscalls: it
+  can't be linked into a host program. `Ctx`, `Response` and the request checks are in
+  `runtime.rs` with the event loop. Fences are reported through a static flag.
+- **`counter`'s `build.rs`** passes the linker script whatever the target.
+
+### Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| What `run-service` builds | `SERVICE` (program) and `SERVICE_DESC` (descriptor) add slot image `service`; agent feature `script-serve` deploys it into `small-0` (with epoch 1 if its descriptor has a volume) and keeps the loop turning; app `apps/service.toml` (the tasks of `counter-bench`) | the pieces the load tests already use; one image, one slot |
+| The port | `tools/sign-image.py port <desc>` prints the descriptor's first listen port; the Makefile's data NIC forwards `NET_PORT` to `NET_GUEST_PORT` (default 80, as before) | a service that listens on 8000 works without editing the Makefile |
+| The disk | `DISK_IMG` (default `build/disk.img`); `run-service` uses `build/service-disk.img` | the tests reset `build/disk.img` and leave other epochs in it; a service's data should survive them and its own restarts |
+| The epoch | always 1 | storage accepts the epoch it has recorded again (`volume-persist`), and nothing else writes that disk |
+| Host backend selection | `cfg(target_os = "none")`: the runtime; anything else: the host backend. `vanir-user` becomes a dependency for `target_os = "none"` only | no feature to remember; `cargo test --target <host>` just works |
+| Shared code | `Ctx`, `Response`, `Error` and the request checks (405, 413, 501 before the service is called) move out of `runtime.rs` and are used by both backends; `Ctx`'s clock and volume come from the backend | the host tests test the code the slot runs, not a copy |
+| The host API | `Host::<S>::new(service)`, `.volume(blocks)`, `.setting(key, value)`, `.version(v)`; `start()` (refuses settings `CONFIG` doesn't list, like the runtime; runs the first `tick`); `get(path)`, `request(bytes)` returning a `Reply { status, body }`; `advance(ticks)` (runs `tick` when due); `drain()`; `restart()` (a crash: the instance is dropped without `drain`, the volume kept); `fence(bool)` (writes answer `Fenced`, and `fenced()` is called as in a slot); `block(n)`, `writes()`; `exit_code()` | what `counter`'s behaviour needs to be checked; small (open question 5's leaning) |
+| A program's attributes | `#![cfg_attr(target_os = "none", no_std, no_main)]`; on the host, `service!` defines a `main` that says to run it in a slot or test it | one source for both; `cargo test` builds the bin with std |
+| `build.rs` | passes the linker script only for `target_os = "none"` | the host linker doesn't take it |
+
+### Sub-steps
+
+#### R4a: `make run-service`
+
+1. Makefile: `DISK_IMG`, `NET_GUEST_PORT`, `SERVICE`, `SERVICE_DESC`, `SERVICE_PORT`,
+   `SERVICE_RESET`, the `service` slot image, `run-service`. `tools/sign-image.py port`.
+2. Agent: `script-serve`. `apps/service.toml`, `apps/services/counter.toml`.
+3. Test `run-service`: the same build (`SERVICE=counter`, `agent/script-serve`) with peer
+   scenario `serve-count`, which asks `/count` twice and checks the counts follow on, then
+   ends the run (`counter/exit-on-request`).
+
+#### R4b: the host backend
+
+1. `vanir-rt`: shared `Ctx`/`Response`/checks; `host` module; `vanir-user` for `none` only;
+   `service!` and `println!` for the host.
+2. `counter`: attributes, `build.rs`, tests (counts on the volume; cached counts written on
+   the timer and at the drain, lost at a crash; a fence drops the cache; 404, 405; a setting it
+   doesn't have; no volume). Host check `counter-host`.
+
+#### R4c: documentation
+
+- The manual's section 15.8: running a service and testing it; the README's quick start; RFD 9
+  open question 5 as decided, and R4 as built; the plan's notes.
+
+### Risks and how we'll know
+
+- **The shared code changes the slot runtime's behaviour.** The volume and counter cases, and
+  a full suite.
+- **`cargo test` on the host picks up the target's rustflags or linker script.** The flags are
+  per target in `.cargo/config.toml`; `build.rs` checks the target. The host check shows it.
+- **The host backend drifts from the runtime** (a check made in one only). The request checks
+  and the settings check are one function each, used by both.
