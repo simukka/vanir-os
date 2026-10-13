@@ -43,6 +43,9 @@ Decided in discussion (2026-10-13):
    higher epoch is set. The runtime will turn that bit into a `fenced` hook once it exists
    (P3); until then a failed write is the only signal.
 3. **Configuration in the signed descriptor is in scope** (P5, was open question 7).
+4. **The kernel uses `vanir-abi`** (was open question 8; decided 2026-10-13, built in R1). It
+   stays constants, records and safe functions that read them: no syscalls, no `unsafe`, no
+   dependencies.
 
 ## Background
 
@@ -262,9 +265,7 @@ settings, signed with the image, and the runtime hands them to the service.
    not an ELF note, since the kernel already parses and verifies the descriptor.
 7. **Settings beyond integers:** strings (e.g. a name to greet) need more room than 8 bytes. Add
    a string area to `VNRDSC02` now, or wait for a service that needs one?
-8. **Does the kernel use `vanir-abi`?** It removes the duplication, at the cost of the kernel
-   depending on a crate user code also uses. (Leaning: yes, as long as `vanir-abi` stays
-   constants and types only.)
+8. ~~Does the kernel use `vanir-abi`?~~ Yes: determination 4.
 
 ## References
 

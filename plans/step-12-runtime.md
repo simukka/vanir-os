@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1 implemented (R1a–R1c).
+Status: R1 implemented (R1a–R1c); R2 planned.
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -149,6 +149,140 @@ Where it departs from the plan:
 - **`counter-load` after R1b** (KVM, 60 s): 1695 requests/s at 8 clients, against 1687 before
   R1; 97,430 counts with none lost or repeated. Within noise, as expected: nothing on the
   request path changed.
-- **RFD 9's open question 8** (the kernel uses `vanir-abi`) is what R1 assumed; it stays open in
-  the RFD until the discussion settles it.
+- **RFD 9's open question 8** (the kernel uses `vanir-abi`), which R1 assumed, was decided yes
+  after R1 landed: RFD 9, determination 4.
 
+## R2: versioning, records read by size, settings in the descriptor (RFD 9, P2 and P5)
+
+### Goal
+
+Implement RFD 9, phase R2. After R2:
+
+- a record the kernel writes into a task (`Stats`, `ListenInfo`, `DeathRecord`) can grow at its
+  end without breaking a program built against the smaller one, and a program built against a
+  larger one works on an older kernel (the new fields read as zero)
+- `vanir-abi` has a version, `ABI_VERSION` (major 1, minor 0), with written rules for what a
+  minor version may change
+- a slot image records the ABI version it was built against, in its signed descriptor, and the
+  kernel refuses one it can't serve, with a reason (`REJECT_ABI`)
+- a slot image's descriptor carries up to 12 integer **settings** (`[config]` in its TOML),
+  signed with the image, which its instance reads through `task_listen`
+  (`ListenInfo::setting("persist_ticks")`)
+- the descriptor's layout is defined once for Rust (`vanir_abi::descriptor`: the kernel parses
+  it, the agent reads it), and checked against `tools/sign-image.py`, which writes it
+
+Out of scope: the runtime and `ctx.config` (R3; R2 gives the raw `ListenInfo::setting`), moving
+`count-cached` to a setting (R3, with the port of `counter`), string settings (RFD 9, open
+question 7), versioning the IPC protocols between tasks (their records follow the same
+growth rule, but no server checks versions yet), and settings for fixed tasks (manifests).
+
+### What we have
+
+- **Records written whole or not at all:** `stats` and `task_listen` refuse a buffer smaller
+  than the kernel's record with `TOO_LONG`, and the supervisor's death notice
+  (`report_death`) does the same. `vanir_user` passes `size_of` of its own copy, so today the
+  two must be identical. `read_events` copies whole `Event`s (an array: its stride is the
+  record's size). `measurements` and `runtime_log` copy fixed-size entries.
+- **Records have already grown in the middle:** `frames_available` went in before `Stats`'
+  task array (load tests, `1bcb805`), which moved the array. Within a version that must not
+  happen again; `vanir-abi`'s snapshot would now catch it.
+- **The descriptor** (`VNRDSC01`, 256 bytes, `kernel/src/verify.rs`) is compiled from TOML by
+  `tools/sign-image.py` (`descriptor()`), hashed into the signed statement (`VNRSIG02`), and
+  parsed by `verify::parse_descriptor`; bytes 160..256 must be zero. `slot_load` copies it
+  into a 256-byte buffer, so a longer one is `TOO_LONG`.
+- **Four readers of its layout:** the kernel (`parse_descriptor`), `tools/sign-image.py`
+  (writes it), the agent (`Image::service`, `version`, `volume_blocks`, `drain_secs` read
+  offsets 8, 40, 152, 72), and `tools/control-plane.py` / `tools/expected-pcrs.py` (offsets 8,
+  40, 152). The agent's `try-tampered-desc` test copies a descriptor into a `[u8; 256]`.
+- **Nine slot images** (`SLOT_IMAGES` in the Makefile, `tests/slots/*.toml`), embedded in the
+  agent (`include_bytes!` from `VANIR_SLOTS`). The control plane names an image by the SHA-256
+  of its signed statement, which covers the descriptor's hash, so a new descriptor is a new
+  image name; that is expected (RFD 9, P5: a change of settings is a deployment).
+- **Rejections** are numbered 1–13 (`vanir_abi::events::REJECT_*`, checked against the
+  kernel's `Rejection` at compile time).
+
+### Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Reading by size | `stats`, `task_listen` and the death notice copy `min(cap, size_of)` bytes and return the kernel's full size (`stats`, `task_listen`: rax; the death notice: the message length, as for any `recv`). No more `TOO_LONG` for a short buffer. `vanir_user` zeroes its record before the call | RFD 9, P2. A program's fields past what the kernel wrote stay zero; fields past what the program knows are dropped |
+| `DeathRecord::from_bytes` | accepts any length: the fields present are read, the rest are zero | the supervisor built against a newer `vanir-abi` still reads an older kernel's notice |
+| Arrays of records | `Event` (`read_events`), the measurement and run-time log entries are **frozen** for major version 1; growing one needs a new syscall | their size is their stride: a reader can't skip unknown bytes without knowing the writer's size |
+| Version | `vanir_abi::ABI_VERSION = (1, 0)` (major, minor; `u32` each). Minor versions may add syscalls, error codes, flags, record fields at the end, and descriptor fields in reserved space; anything else is a new major | P2. The rules are in the crate's docs, next to the number |
+| What the kernel accepts | an image whose major equals the kernel's and whose minor is at most the kernel's; else `REJECT_ABI` (14), "built for an ABI this kernel doesn't serve" | an image built for minor 3 may call what a minor-1 kernel lacks; failing at load is clearer than `BAD_ARGUMENT` at run time |
+| Where the image's version comes from | `abi = "1.0"` in the descriptor TOML if given (tests); otherwise `sign-image.py` reads `ABI_VERSION` from `abi/src/lib.rs` | the version an image was built against is the crate's; writing it by hand in every TOML would drift. The override lets a test sign an image for an ABI the kernel doesn't serve |
+| Descriptor format 2 | `VNRDSC02`, 512 bytes. 0..160 as format 1; 160: ABI major (`u32`), minor (`u32`); 168: settings in use (`u64`, at most 12); 176..464: 12 settings, each a 16-byte zero-padded key and a `u64` value; 464..512 zero | RFD 9, P5 (determination 3). The first 160 bytes don't move, so the Python tools that read offsets 8, 40 and 152 keep working |
+| Format 1 still accepted | a 256-byte `VNRDSC01` descriptor loads as ABI 1.0 with no settings. `sign-image.py` writes format 2 unless the TOML says `format = 1`; `tests/slots/hello.toml` does, so the slot tests that load `hello` keep the format-1 path tested | images signed before R2 keep loading; dropping format 1 is a later decision |
+| Settings' keys | 1–16 bytes of `[a-z0-9_]`, starting with a letter, each key once; unused entries all zero. Anything else is `REJECT_BAD_DESCRIPTOR`. `sign-image.py` refuses the same at compile time | keys are names a service declares (RFD 9, P5); the kernel checks because a descriptor can be signed by any tool |
+| The layout in Rust | `vanir_abi::descriptor`: magics, lengths, offsets, `MAX_SETTINGS`, `KEY_LEN`, and safe readers (`name`, `version`, `volume_blocks`, `drain_secs`, `abi`, `settings`) over `&[u8]`. The kernel's `parse_descriptor` and the agent's `Image` use them | the third and fourth copies of the layout go; the kernel keeps its validation, which is policy |
+| Layout across languages | a fixture, `abi/tests/descriptor-v2.bin`, made by `sign-image.py` from `abi/tests/descriptor-v2.toml` (every field set, 12 settings). `abi/tests/descriptor.rs` reads it with `vanir_abi::descriptor`; the host check `descriptor-format` rebuilds it with `sign-image.py` and compares bytes | the Python writer and the Rust readers can't drift apart silently |
+| Reaching the task | `ListenInfo` grows at its end: ABI major and minor of the image (`u32` each; 0 for fixed tasks), settings in use (`u64`), 12 × (key `[u8; 16]`, value `u64`): 136 → 440 bytes. `ListenInfo::setting(key) -> Option<u64>` | the first record to grow under R2a's rule; fixed tasks get none |
+| Who reads settings in R2 | `http` prints its slot's settings once at start (`counter v1 on small-0: setting persist_ticks = 1000`) | the test needs an instance to show what it got; R3's runtime replaces this |
+
+### Sub-steps
+
+#### R2a: records read by size
+
+1. Kernel: `stats`, `task_listen` and `report_death` copy `min(cap, size)` and return the full
+   size; the doc comments of those syscalls say so.
+2. `vanir-abi`: `DeathRecord::from_bytes` accepts any length; the growth rules in the crate's
+   docs.
+3. A test program feature, `hello/abi-sizes` (a fixed task), calls `task_listen` with buffers
+   of 64 bytes, exactly 136, and 200 (zeroed first) and prints what came back: the returned
+   size and whether the bytes past 136 stayed zero. Test case `abi-read-by-size`.
+4. `abi-snapshot` unchanged (no value or layout changes); full suite.
+
+#### R2b: the ABI version and format-2 descriptors
+
+1. `vanir-abi`: `ABI_VERSION`; `events::REJECT_ABI` = 14 and its name; `descriptor` module
+   (format 1 and 2 layouts, readers). Snapshot: the new values, on purpose, in this commit.
+2. `sign-image.py`: format 2 by default, `format = 1`, `abi = "M.N"` and `[config]` in the TOML,
+   with the key rules; reads `ABI_VERSION` from `abi/src/lib.rs`.
+3. Kernel: `slot_load` takes up to 512 bytes; `parse_descriptor` accepts both formats through
+   `vanir_abi::descriptor`, checks the settings, and `check_slot` refuses an unserved ABI with
+   `Rejection::Abi`. `verify::Descriptor` keeps the ABI version and the settings.
+4. Agent: `Image` reads through `vanir_abi::descriptor`; `try-tampered-desc` copies a
+   descriptor of any length.
+5. `tests/slots/hello.toml`: `format = 1`. A new slot image, `web-abi-next` (http, `abi =
+   "1.1"`), and an agent feature `try-abi-next`; test case `slot-abi-refused` expects
+   `REJECT_ABI` and its name in the agent's report and telemetry.
+6. Fixture and host check `descriptor-format`. Full suite (every slot image is rebuilt in
+   format 2; the control plane names them by their new hashes without other changes).
+
+#### R2c: settings reach the instance
+
+1. `vanir-abi`: `ListenInfo` grows (snapshot updated on purpose); `ListenInfo::setting`.
+2. Kernel: `task_listen` fills the ABI version and settings from the loaded descriptor.
+3. `http`: prints its slot's settings at start.
+4. A slot image `counter-config` (http with a volume and `[config] persist_ticks = 1000`) and an
+   agent feature `try-settings` that loads it; test case `slot-settings` expects the line from
+   `http`. `abi-read-by-size` now also shows a 136-byte buffer still working against the
+   440-byte record.
+5. Full suite, and `counter-load` once with `--bench`.
+
+#### R2d: documentation
+
+- The manual: descriptor format 2 and settings (15, deployment; the TOML keys), the ABI
+  version and the rules for a minor version (16, syscalls), records read by size, the new
+  rejection reason, the new tests and host check; `apps/README.md` if it documents slot TOML.
+- RFD 9: open question 6 recorded as settled by P5 (version in the descriptor), and P2's "records
+  read by size" as built.
+- The plan's "As built" notes.
+
+### Risks and how we'll know
+
+- **A short buffer hides a real bug** (a program passing the wrong size now gets a partial
+  record instead of `TOO_LONG`). `vanir_user`'s wrappers always pass `size_of` of the whole
+  record and check the returned size is at least what they need for the fields they use;
+  `abi-read-by-size` covers the cases.
+- **Every image's name changes** (new descriptors, new statement hashes). Anything that pinned a
+  hash would break; the control plane computes them from `build/slots/*.sig` at start, and
+  `expected-pcrs.py` from the same files. The full suite after R2b shows it.
+- **The PCR 13 log** records the statement hash, so `measured-*`/`slot-attest` expectations
+  change with the images; they are computed, not pinned, so they follow.
+- **Format 1 rots.** `hello` stays format 1, and `slot-unload-no-leak`, which loads it over and
+  over, keeps that path running in every suite.
+- **The kernel refuses settings it should accept, or the reverse.** The key rules are in one
+  place in each language (the kernel's `parse_descriptor`, `sign-image.py`); the fixture carries
+  12 settings with keys at the edges (1 and 16 bytes). Refusal of a malformed signed descriptor
+  isn't tested end to end (`sign-image.py` won't produce one); noted as a gap.
