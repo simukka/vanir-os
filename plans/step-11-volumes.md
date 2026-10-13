@@ -1,6 +1,6 @@
 # Step 11 plan: service volumes (RFD 3)
 
-Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3). V4 will be added here.
+Status: V1, V2 and V3 implemented (V1a–V1c, V2a–V2b, V3); V4 planned (V4a–V4c).
 
 ## Goal
 
@@ -350,6 +350,151 @@ V3 is one sub-step.
   requests; the test checks the line, not the number.
 - **Widening `notify`.** A server may now post bits to its clients. Bits carry no data and
   can't block, and a client already trusts the servers it sends to.
+
+## V4: moving a volume between nodes (RFD 3, P4 and P5)
+
+### Goal
+
+A service with a volume moves from node a to node b under write load, and its volume moves
+with it, directly between the nodes. After V4:
+
+- the control plane puts a **transfer ticket** in each node's signed desired state; the target
+  dials the source over the management network, and both check the other's key against their
+  ticket (Noise `IK`)
+- the source sends the volume as it is on disk (ciphertext, counter, tag), then catch-up rounds,
+  then mirrors each write before acknowledging it; the target checks every block with the
+  service key as it arrives
+- the target's instance starts only once the volume is mirrored, and its requests are held
+  (V3) from the moment it is routed to until it holds the epoch
+- once the source's instance has drained, the source makes its copy read-only and sends its
+  volume digest; the target takes the epoch only if its own digest matches
+- at the commit the source wipes its copy and frees the space; a target whose transfer is
+  aborted drops its partial copy
+- a failure before the handoff (the target stalls, the link drops, the digests differ) leaves
+  the source whole and the service serving there
+
+Out of scope (determination 11, a follow-up RFD): any failure after the source has made its
+copy read-only. That includes the link failing between the source's digest and the target's
+answer: then neither node may write until the control plane decides, and V4 only reports it.
+Also out: rate limiting (P5 question 1), leases (P6), resuming a dropped transfer (it starts
+again with new tickets).
+
+### What we have
+
+- **Two nodes** (`tests/two-nodes.sh`): node a's management NIC forwards host port 8081 to the
+  guest's port 7, node b's 8091. A node reaches the host as 10.0.2.2, so node b can dial node a
+  at 10.0.2.2:8081 with no new network. Nothing in the agent apps listens on port 7.
+- **The agent's Noise** (`user/noise`) is the `IK` initiator only. Its static and ephemeral
+  keys are fresh for each connection to the control plane (`control.rs`), and the handshake's
+  quote binds both. The Python side (`tools/vanir_noise.py`) has both roles; `noise-vectors`
+  checks both implementations against the cacophony vector.
+- **Desired state** is a signed text document with a generation (`control.rs`), at most 3072
+  bytes; `live <service> <slot> <hash> [drain] [epoch <n> <lease>]`, `stop`, `commit`,
+  `update`. Reports are text.
+- **Moves without volumes** (D5): `move_web` in `tools/control-plane.py` starts the service on
+  the target, routes the load balancer to it, drains and stops it on the source, and commits.
+- **`storage`**: a volume on disk is a header block, `meta_blocks` blocks of counters and tags
+  (24 bytes per data block), then the data blocks. A data block's seal binds only the volume
+  name, the volume-relative block number and its counter, so a block is valid on any disk with
+  the same service key. Volumes are allocated by a bump pointer and never freed. IPC messages
+  are at most 4 KiB (`MAX_MESSAGE`), so a block and its counter and tag take two calls.
+- **V3**: `storage` can hold a caller's reply and answer later, and may notify the agent (the
+  agent sends to it). `OP_HANDOFF` holds a candidate's requests until `OP_EPOCH`.
+- **V2**: the control plane sends a node the key of each service desired there, so the target
+  has the service key before the transfer starts.
+
+### Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| The agent's static key | one per boot instead of per connection; the handshake's quote still binds it on each connection | a ticket names the peer's key; a key that changed on every reconnection to the control plane would void tickets for no gain |
+| Tickets | desired-state lines. Source: `transfer <service> send <peer node> <peer key> epoch <n> expires <secs>`. Target: `transfer <service> receive <peer node> <addr:port> <peer key> epoch <n> expires <secs>`. Expiry is relative to when the agent applies the document. A ticket missing from a later document is withdrawn | the document is already signed per node and ordered by generation (P5) |
+| Node addresses | the control plane is told each node's management address (`--node-addr a=10.0.2.2:8081`); `two-nodes.sh` passes them | a node can't know the address the other reaches it at (NAT) |
+| Listening | the source's agent listens on management port 7 only while it holds a `send` ticket, and accepts one connection; the agent apps declare the port | P5: the serving node accepts exactly one expected connection |
+| The channel | Noise `IK`, prologue `vanir-transfer 1`: the target is the initiator (its first payload names the service), the source the responder. The source closes the connection unless the target's static key and the service match its ticket. Frames as with the control plane: 2-byte length, type byte | P5; `user/noise` gains `Responder`, and `noise-vectors` checks it against the vector |
+| Frames | `V` volume (target → source: the counters it holds, by data block; empty to start) · `B` block (b, counter, tag, ciphertext: 4128 bytes) · `R` round end (blocks sent) · `M` mirroring (from now on `B` frames are mirrored writes, each answered) · `A` ack · `D` digest · `Y` taken · `X` digests differ · `Q` abort (reason) | one connection, P5's four phases |
+| `storage`: source side | ops for the agent only (`loads = true`): `EXPORT_HEADER`, `EXPORT_META(m)` (a raw block of counters and tags, for comparing), `EXPORT_BLOCK(b)` (ciphertext, keeping its counter and tag), `EXPORT_ENTRY` (that counter and tag), `MIRROR(on/off)`, `MIRROR_PENDING`, `MIRROR_ACK`, `HAND_OVER` (read-only and flushed), `DIGEST` | two calls per block (4 KiB messages); the entry is kept with the block read, so the two always match |
+| `storage`: target side | `IMPORT_BEGIN` (service, blocks, the header's 96 meaningful bytes: makes or overwrites the volume), `IMPORT_ENTRY` (b, counter, tag), `IMPORT_BLOCK(b)` (ciphertext: decrypted with the key to check it, then written with its entry), `DIGEST`, `DROP` | the target checks every block (P4) and writes data and entry together |
+| Mirroring | in mirror mode, a write by the writer is made locally, then its reply is held; `storage` posts the agent a bit (`NOTIFY_MIRROR`), the agent fetches the block (`MIRROR_PENDING`, `EXPORT_BLOCK`, `EXPORT_ENTRY`), sends it, and on the target's `A` sends `MIRROR_ACK`, which answers the writer. One writer blocked in a call means at most one mirrored write is outstanding | acknowledged only once both have it (P4), with V3's held replies |
+| Mirror timeout | the source's agent: no `A` within 2 s, it sends `MIRROR(off)` (the held write is answered OK, it is on the source), aborts the transfer, and reports it | P4: writes stall at most that long |
+| When catch-up ends | when a round sends at most 2 blocks | volumes are small (16 blocks in the tests); any threshold works, this one ends quickly under load |
+| The target's instance | the agent starts it only once its transfer is mirroring. With a `receive` ticket, `Promote` sends `OP_HANDOFF` and routes, but the epoch waits for the source's `D` | P3's table: "for a move, the target is mirrored"; the epoch moves only after the digests match |
+| The handoff | once the source's instance has drained (the control plane has already moved the load balancer), the source's agent sends `HAND_OVER` (read-only: writes get `FENCED`), takes `DIGEST`, and sends `D`. The target compares with its own: equal, it answers `Y` and gives its instance the ticket's epoch, releasing what was held; different, it answers `X` and calls its handoff off | read-only before `D` means two writers can't happen whatever the link does |
+| Digest | SHA-256 over the header's 96 bytes and every metadata block | P1's terminology: counters and tags identify the state without decrypting |
+| After `X` | the source reports `transfer <service> refused-digest`; the control plane rolls back to the source with a new epoch (`live` with epoch n+1 on the source), which `storage` accepts | the target refused, so the source's copy is the only one; a higher epoch is the control plane's to give |
+| Commit | `commit <service>` on the source, after a handoff: `DROP` wipes the header and metadata blocks (every block reads as never written) and frees the space, then the key is forgotten (V2) | P4 |
+| Freeing | a freed volume's table entry becomes kind `FREE`, keeping its start and footprint; a new volume reuses the first free entry big enough, whole | moving back to a node would otherwise leak the space each time; no splitting keeps the table simple |
+| Reports | `transfer <service> <phase>`: `connecting`, `copying`, `mirroring`, `handed-over` (source), `taken` (target), `aborted <reason>`, `refused-digest`, `dropped` | the control plane waits on these |
+| Telemetry | events `transfer` (service, phase); counters per transfer: blocks copied, rounds, mirrored writes, longest mirror round trip | P7 |
+
+### Sub-steps
+
+#### V4a: tickets and the channel
+
+- `user/noise`: `Responder` (read `e, es, s, ss`; write `e, ee, se`), tested against the
+  vector in `noise-vectors`.
+- Agent: one static key per boot; parse `transfer` lines (withdrawn when absent); listen on
+  management port 7 with a `send` ticket; dial with a `receive` ticket; check the peer's key
+  and the service; report the phase.
+- Control plane: `--node-addr`; each node's static key from its handshake; ticket lines;
+  `two-nodes.sh` passes the addresses. Test apps: `agent-volumes.toml` with port 7 declared
+  for the agent.
+- Tests (`NODES=2`):
+  - `transfer-connect`: tickets for counter; node b connects to node a, both report
+    `connected`; the tickets are withdrawn and both close.
+  - `transfer-wrong-peer`: node a's ticket names another key; node a closes node b's
+    connection ("not the peer my ticket names") and both report it.
+
+#### V4b: copying and mirroring
+
+- `storage`: the export and import ops, `MIRROR`, `NOTIFY_MIRROR`, `DROP`, free entries.
+- Agent: bulk copy, catch-up rounds, mirroring, the mirror timeout, `DROP` on a withdrawn
+  `receive` ticket; feature `transfer-stall` (the target stops answering mirrored writes) and
+  `transfer-corrupt` (the source flips a bit in one block it sends).
+- Tests (`NODES=2`, peer counting through the load balancer, which stays on node a):
+  - `transfer-mirror`: counter under load on node a; node b copies, catches up and mirrors
+    (`copied 16 blocks in N rounds`, `mirroring`); the tickets are withdrawn; node b drops its
+    copy. No request fails, counts 1..N.
+  - `transfer-stall`: node b stops answering while mirroring; node a's writes stall at most
+    2 s, then it writes alone and reports `aborted mirror timeout`. No request fails.
+  - `transfer-corrupt`: node b refuses the block (`block 3 does not open`), aborts, and drops
+    its copy.
+
+#### V4c: the handoff and the commit
+
+- `storage`: `HAND_OVER`, `DIGEST`; writes to a handed-over volume get `FENCED`.
+- Agent: the target's instance waits for mirroring; `Promote` holds without the epoch; the
+  `D`/`Y`/`X` exchange; `commit` drops a handed-over volume. Feature
+  `transfer-skip-one-write` (the target acks one mirrored write without importing it).
+- Control plane: `move_volume` (tickets, wait for mirroring, deploy on b, route to b, stop on
+  a, wait for `taken`, commit on a) and a rollback after `refused-digest`.
+- Tests (`NODES=2`):
+  - `move-volume-under-load`: counter moves from a to b under load; no request fails, counts
+    are exactly 1..N across both nodes; node a's volume is wiped and freed after the commit;
+    node b holds epoch 2.
+  - `move-volume-digest-mismatch` (no load): node b's digest differs; no handoff; node b's
+    candidate's held write is answered `FENCED`; the control plane rolls back to node a with
+    epoch 3, and counter serves there again with its count intact.
+- Manual: the transfer (ticket lines, frames, phases, the diagram), the storage ops, the agent's
+  static key, limitations (the window after the source's digest; no resuming; no rate limit),
+  the catalogue.
+
+### Risks and how we'll know
+
+- **The agent's loop does more.** It serves the control plane, a transfer connection, the
+  mirror bit and deployments in one loop; a slow turn stalls mirrored writes. `transfer-mirror`
+  prints the longest mirror round trip.
+- **Per-boot static key.** Every attested agent test exercises the handshake;
+  `agent-unbound-key` checks the quote still binds the key.
+- **slirp between nodes.** Node b's connection goes out through its NAT to the host and back in
+  through node a's forwarded port. `transfer-connect` proves the path before anything depends on
+  it.
+- **The target's partial copy.** A dropped copy must not leave a half-written volume that a
+  later instance opens: `DROP` wipes the header first, so the volume reads as new.
+- **The window after `D`.** If the link fails after the source has handed over and before it
+  hears `Y` or `X`, neither node writes and the service is down until the control plane acts.
+  V4 reports it (`handed-over` on one side, no `taken` on the other); recovering is the
+  follow-up RFD's.
 
 ## As built
 

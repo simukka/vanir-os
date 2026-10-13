@@ -279,12 +279,15 @@ Decided 2026-10-13:
   2. *Catch-up.* The target sends the counters it holds; the source sends every block whose
      counter is higher. Rounds repeat until a round finds few enough changed blocks.
   3. *Mirroring.* Each write the source acknowledges has reached the target first.
-  4. *Handoff.* Once the source's instance has drained and its writes are flushed, the source
-     sends its volume digest. The target compares it with its own; if they match, its agent
-     gives the target's instance the epoch from its ticket, and the source's copy becomes
-     read-only (P4). If they don't, the move is aborted.
-- **Resuming.** A connection dropped before the handoff resumes with a catch-up round, from the
-  counters the target already holds, as long as the tickets are valid.
+  4. *Handoff.* Once the source's instance has drained, the source makes its copy read-only
+     (P4), flushes it, and sends its volume digest. The target compares it with its own; if they
+     match, its agent gives the target's instance the epoch from its ticket and says so. If they
+     don't, the target says that instead and the move is aborted: the control plane gives the
+     source a new epoch, since its copy is the only one. Read-only comes first so that whatever
+     the link does, two writers can't happen.
+- **Resuming.** A connection dropped before the handoff could resume with a catch-up round, from
+  the counters the target already holds. The first implementation doesn't: the control plane
+  starts again with new tickets.
 
 **Failure cases:**
 
@@ -295,6 +298,7 @@ Decided 2026-10-13:
 | A ticket expires before the handoff | Both sides abort as above; the handoff never starts after expiry. After the handoff, expiry no longer matters |
 | The digests don't match | No handoff; the move is aborted and reported, and the source keeps serving |
 | The control plane is unreachable | The transfer and handoff go ahead, because the tickets carry everything they need. The commit waits for the control plane |
+| The link fails after the source's digest, before it hears the target's answer | Neither node writes until the control plane acts; deferred to the follow-up RFD with the next row |
 | Anything after the handoff, before the commit | Deferred to a follow-up RFD (P4) |
 
 Questions:
