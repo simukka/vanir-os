@@ -1,112 +1,20 @@
 //! The event loop: `user/http`'s server, with the service's code where its routes were.
 
-use core::fmt::{self, Write};
+use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use vanir_user::net::{self, CODE_CLOSED, EV_ACCEPT, EV_CLOSED, EV_DRAIN, EV_READ, EV_WRITE, Event};
 use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
-use vanir_user::{ListenInfo, block, err, getpid, lookup, println, rdtsc, sleep, task_listen, task_name, uptime};
+use vanir_user::{block, err, getpid, lookup, println, rdtsc, sleep, task_listen, task_name, uptime};
 
-use crate::http::{BODY_LIMIT, HEADER_LIMIT, HEADER_TICKS, IDLE_TICKS, parse, reason};
-use crate::volume::{FENCED, Volume};
+use crate::ctx::{Buf, Ctx, Response, answer, settings_fit};
+use crate::http::{HEADER_LIMIT, HEADER_TICKS, IDLE_TICKS, parse, reason};
+use crate::volume::FENCED;
 use crate::{Error, Service};
 
 /// Bytes of a response: its header and body.
 const OUT: usize = 512;
-/// The most body a response carries (the rest of `OUT` is its header).
-const BODY: usize = 448;
 /// Upper bounds of the latency buckets, in milliseconds (the last bucket is everything above).
 const LATENCY_MS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
-
-/// Bytes formatted into a fixed buffer; what doesn't fit is dropped.
-struct Buf<'a> {
-    buf: &'a mut [u8],
-    len: usize,
-}
-
-impl Write for Buf<'_> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let b = s.as_bytes();
-        let n = b.len().min(self.buf.len() - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
-
-/// What a service answers: a status (200 unless set) and a body written with `write!`.
-pub struct Response {
-    status: u16,
-    body: [u8; BODY],
-    len: usize,
-}
-
-impl Response {
-    pub fn set_status(&mut self, status: u16) {
-        self.status = status;
-    }
-
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
-    pub fn body(&self) -> &[u8] {
-        &self.body[..self.len]
-    }
-}
-
-impl Write for Response {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let mut w = Buf { buf: &mut self.body, len: self.len };
-        w.write_str(s)?;
-        self.len = w.len;
-        Ok(())
-    }
-}
-
-/// What the runtime gives a service: who it is, its settings, its volume, the time.
-pub struct Ctx {
-    name: [u8; 64],
-    name_len: usize,
-    info: ListenInfo,
-    config: &'static [(&'static str, u64)],
-    exit: Option<u64>,
-}
-
-impl Ctx {
-    /// `<service> v<version> on <slot>` in a slot, else the task's name.
-    pub fn name(&self) -> &str {
-        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?")
-    }
-
-    /// The signed version running.
-    pub fn version(&self) -> u64 {
-        self.info.version
-    }
-
-    /// Setting `key`: the descriptor's value if it has one, else the default in
-    /// `Service::CONFIG` (0 for a key the service doesn't list).
-    pub fn config(&self, key: &str) -> u64 {
-        self.info
-            .setting(key)
-            .or_else(|| self.config.iter().find(|(k, _)| *k == key).map(|(_, v)| *v))
-            .unwrap_or(0)
-    }
-
-    /// Open the volume the descriptor declares (`Error::NotDeclared` without one).
-    pub fn volume(&mut self) -> Result<Volume, Error> {
-        Volume::open(self.info.volume_blocks, self.name())
-    }
-
-    /// Timer ticks (10 ms) since boot.
-    pub fn uptime(&self) -> u64 {
-        uptime()
-    }
-
-    /// Exit with `code` once the current response has gone out (after `drain()`).
-    pub fn exit_after_response(&mut self, code: u64) {
-        self.exit = Some(code);
-    }
-}
 
 #[derive(Clone, Copy)]
 struct Conn {
@@ -193,33 +101,15 @@ impl<const N: usize> Default for Runtime<N> {
 
 /// Run service `S`: what `service!` calls. Returns the exit code.
 pub fn run<S: Service, const N: usize>(rt: &mut Runtime<N>) -> u64 {
-    let mut ctx = Ctx { name: [0; 64], name_len: 0, info: ListenInfo::default(), config: S::CONFIG, exit: None };
     let mut task = [0u8; 32];
     let me = task_name(getpid(), &mut task).unwrap_or("service").len();
-    ctx.info = task_listen(getpid()).unwrap_or_default();
-    {
-        let mut w = Buf { buf: &mut ctx.name, len: 0 };
-        let slot = core::str::from_utf8(&task[..me]).unwrap_or("?");
-        if ctx.info.is_slot() {
-            let service = core::str::from_utf8(ctx.info.service()).unwrap_or("?");
-            let _ = write!(w, "{} v{} on {}", service, ctx.info.version, slot);
-        } else {
-            let _ = write!(w, "{}", slot);
-        }
-        ctx.name_len = w.len;
-    }
+    let mut ctx = Ctx::new::<S>(task_listen(getpid()).unwrap_or_default(), core::str::from_utf8(&task[..me]).unwrap_or("?"));
     rt.has_volume = ctx.info.volume_blocks > 0;
     if let Some(p) = ctx.info.ports[..(ctx.info.count as usize).min(8)].first() {
         rt.port = p[0];
     }
     // What the descriptor asks for must be what this build can do (RFD 9, P4 and P5).
-    let mut fit = true;
-    for s in ctx.info.settings() {
-        if !S::CONFIG.iter().any(|(k, _)| k.as_bytes() == s.key()) {
-            println!("{}: setting {} isn't one this service has", ctx.name(), core::str::from_utf8(s.key()).unwrap_or("?"));
-            fit = false;
-        }
-    }
+    let mut fit = settings_fit::<S>(&ctx);
     if let Some((max, _)) = ctx.info.port(rt.port)
         && max as usize > N
     {
@@ -477,33 +367,23 @@ impl<const N: usize> Runtime<N> {
                 c.started = Some(now);
                 c.started_tsc = rdtsc();
             }
-            let mut res = Response { status: 200, body: [0; BODY], len: 0 };
+            let mut res = Response::new();
             let (body_skip, keep_alive, head): (usize, bool, bool);
             let mut called = false;
             match parse(&c.buf[..c.len]) {
                 None if c.len == HEADER_LIMIT => {
-                    res.status = 431;
+                    res.set_status(431);
                     (body_skip, keep_alive, head) = (c.len, false, false);
                 }
                 None => return, // wait for the rest of the header
                 Some(Err(code)) => {
-                    res.status = code;
+                    res.set_status(code);
                     (body_skip, keep_alive, head) = (c.len, false, false);
                 }
                 Some(Ok(r)) => {
+                    called = answer(svc, ctx, &r, &mut res);
                     let length = r.content_length.unwrap_or(0);
-                    let is_head = r.method == b"HEAD";
-                    if r.chunked {
-                        res.status = 501;
-                    } else if length > BODY_LIMIT {
-                        res.status = 413;
-                    } else if r.method != b"GET" && !is_head {
-                        res.status = 405;
-                    } else {
-                        svc.request(ctx, &r, &mut res);
-                        called = true;
-                    }
-                    (body_skip, keep_alive, head) = (r.header_len + length, r.keep_alive && res.status != 413, is_head);
+                    (body_skip, keep_alive, head) = (r.header_len + length, r.keep_alive && res.status() != 413, r.method == b"HEAD");
                 }
             }
             if called {
@@ -514,7 +394,7 @@ impl<const N: usize> Runtime<N> {
             c.buf.copy_within(skip..c.len, 0);
             c.len -= skip;
             c.discard = body_skip - skip;
-            self.respond(i, res.status, res.body(), head, keep_alive, now);
+            self.respond(i, res.status(), res.body(), head, keep_alive, now);
             if !self.flush(i) || ctx.exit.is_some() {
                 return;
             }

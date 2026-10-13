@@ -8,8 +8,11 @@ test = false
 bench = false
 
 [dependencies]
-vanir-user = { path = "../lib" }
 vanir-abi = { path = "../../abi" }
+
+# The syscalls, in a slot only: on the host this crate is a test backend (src/host.rs).
+[target.'cfg(target_os = "none")'.dependencies]
+vanir-user = { path = "../lib" }
 
 [features]
 # `vanir_rt::raw`: the task's raw syscalls and IPC (vanir_user), for what the runtime doesn't

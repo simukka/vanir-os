@@ -31,15 +31,26 @@
 //!
 //! Single-threaded and without a heap: one request at a time, from fixed buffers. The connection
 //! table's size is `service!`'s `connections`.
+//!
+//! **On the host** (any target but `x86_64-unknown-none`), this crate is a test backend instead:
+//! `host::Host` runs the service's callbacks with a clock the test moves and a volume in memory,
+//! so `cargo test --target x86_64-unknown-linux-gnu -p <program>` unit-tests a service. A
+//! program builds for both with `#![cfg_attr(target_os = "none", no_std, no_main)]`.
 
-#![no_std]
+#![cfg_attr(target_os = "none", no_std)]
 
+mod ctx;
+#[cfg(not(target_os = "none"))]
+pub mod host;
 pub mod http;
+#[cfg(target_os = "none")]
 mod runtime;
 mod volume;
 
+pub use ctx::{Ctx, Response};
 pub use http::Request;
-pub use runtime::{Ctx, Response, Runtime, run};
+#[cfg(target_os = "none")]
+pub use runtime::{Runtime, run};
 pub use volume::{BLOCK_SIZE, Error, Volume};
 
 /// A service: what the runtime calls.
@@ -65,12 +76,14 @@ pub trait Service: Sized {
     /// last moment to save state.
     fn drain(&mut self, _ctx: &mut Ctx) {}
 
-    /// A volume write was refused: another instance is the writer now. Drop what is cached.
+    /// A volume write or flush was refused: another instance is the writer now. Drop what is
+    /// cached.
     fn fenced(&mut self, _ctx: &mut Ctx) {}
 }
 
 /// Declare the program's service: `service!(MyService)` or
 /// `service!(MyService, connections = 16)` (default 64).
+#[cfg(target_os = "none")]
 #[macro_export]
 macro_rules! service {
     ($svc:ty, connections = $n:expr) => {
@@ -85,21 +98,44 @@ macro_rules! service {
     };
 }
 
+/// Declare the program's service. On the host, a `main` that says how to run it: the service
+/// itself is run by its tests, through `host::Host`.
+#[cfg(not(target_os = "none"))]
+#[macro_export]
+macro_rules! service {
+    ($svc:ty, connections = $n:expr) => {
+        #[allow(dead_code)]
+        fn main() {
+            let _ = $crate::host::Host::<$svc>::new;
+            eprintln!("a service runs in a slot (make run-service); on the host, run its tests (cargo test)");
+            std::process::exit(2);
+        }
+    };
+    ($svc:ty) => {
+        $crate::service!($svc, connections = 64);
+    };
+}
+
+#[cfg(target_os = "none")]
 #[doc(hidden)]
 pub use vanir_user::entry as __entry;
 
-/// Print a line to the node's log.
+/// Print a line to the node's log (on the host, to stdout).
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => { $crate::__println!($($arg)*) };
 }
 
+#[cfg(target_os = "none")]
 #[doc(hidden)]
 pub use vanir_user::println as __println;
+#[cfg(not(target_os = "none"))]
+#[doc(hidden)]
+pub use std::println as __println;
 
 /// The task's raw syscalls and IPC (`vanir_user`), for what the runtime doesn't wrap yet. Not
 /// part of what the runtime promises (RFD 9, P3).
-#[cfg(feature = "unstable")]
+#[cfg(all(feature = "unstable", target_os = "none"))]
 pub mod raw {
     pub use vanir_user::*;
 }

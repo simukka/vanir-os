@@ -9,9 +9,11 @@
 //! is the writer) drops the cached count, so the next request goes to the volume again.
 //!
 //! An error answers 503 with storage's code (e.g. `FENCED`: this instance isn't the writer).
+//!
+//! Its tests run on the host (`cargo test -p counter --target x86_64-unknown-linux-gnu`), with
+//! `vanir_rt::host`.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(target_os = "none", no_std, no_main)]
 
 use core::fmt::Write;
 use vanir_rt::{BLOCK_SIZE, Ctx, Error, Request, Response, Service, Volume, println};
@@ -193,3 +195,95 @@ impl Service for Counter {
 }
 
 vanir_rt::service!(Counter, connections = 64);
+
+#[cfg(test)]
+mod tests {
+    use super::Counter;
+    use vanir_rt::Error;
+    use vanir_rt::host::{Host, Reply};
+
+    fn count_in(block: [u8; vanir_rt::BLOCK_SIZE]) -> u64 {
+        u64::from_le_bytes(block[..8].try_into().unwrap())
+    }
+
+    fn ok(body: &str) -> Reply {
+        Reply { status: 200, body: body.into() }
+    }
+
+    #[test]
+    fn counts_on_the_volume() {
+        let mut h = Host::<Counter>::new("counter").volume(16);
+        h.start().unwrap();
+        assert_eq!(h.get("/"), ok("hello from counter v1 on host\n"));
+        assert_eq!(h.get("/count"), ok("1\n"));
+        assert_eq!(h.get("/count"), ok("2\n"));
+        assert_eq!(count_in(h.block(0)), 2);
+        // A new instance carries on from the volume.
+        h.restart().unwrap();
+        assert_eq!(h.get("/count"), ok("3\n"));
+    }
+
+    #[test]
+    fn cached_counts_are_written_on_the_timer() {
+        let mut h = Host::<Counter>::new("counter").volume(16).setting("persist_ticks", 100);
+        h.start().unwrap();
+        for n in 1..=3 {
+            assert_eq!(h.get("/count"), ok(&format!("{n}\n")));
+        }
+        // The first count went to the volume; the next two only to memory.
+        assert_eq!((count_in(h.block(0)), h.writes()), (1, 1));
+        h.advance(99);
+        assert_eq!(count_in(h.block(0)), 1);
+        h.advance(1);
+        assert_eq!((count_in(h.block(0)), h.writes()), (3, 2));
+        // Nothing new: nothing written.
+        h.advance(500);
+        assert_eq!(h.writes(), 2);
+    }
+
+    #[test]
+    fn a_crash_loses_cached_counts_and_a_drain_keeps_them() {
+        let mut h = Host::<Counter>::new("counter").volume(16).setting("persist_ticks", 100);
+        h.start().unwrap();
+        h.get("/count");
+        h.get("/count");
+        h.restart().unwrap();
+        assert_eq!(h.get("/count"), ok("2\n"), "the second count was only in memory");
+        h.get("/count");
+        h.drain();
+        assert_eq!(count_in(h.block(0)), 3);
+    }
+
+    #[test]
+    fn a_refused_write_drops_the_cache() {
+        let mut h = Host::<Counter>::new("counter").volume(16).setting("persist_ticks", 100);
+        h.start().unwrap();
+        h.get("/count");
+        h.get("/count");
+        h.fence(true);
+        h.advance(100); // the timed write is refused
+        assert!(h.service().cached.is_none());
+        assert_eq!(h.get("/count"), Reply { status: 503, body: "FENCED\n".into() });
+        assert_eq!(count_in(h.block(0)), 1);
+        h.fence(false);
+        assert_eq!(h.get("/count"), ok("2\n"));
+    }
+
+    #[test]
+    fn the_runtime_answers_what_counter_doesnt() {
+        let mut h = Host::<Counter>::new("counter").volume(16);
+        h.start().unwrap();
+        assert_eq!(h.get("/nothing").status, 404);
+        assert_eq!(h.request(b"POST /count HTTP/1.1\r\nContent-Length: 0\r\n\r\n").status, 405);
+        assert_eq!(h.request(b"HEAD / HTTP/1.1\r\n\r\n"), ok(""));
+        assert_eq!(h.request(b"GET / HTTP/2.0\r\n\r\n").status, 505);
+        assert_eq!(count_in(h.block(0)), 0, "no request counted");
+    }
+
+    #[test]
+    fn refused_without_a_volume_or_with_a_setting_it_doesnt_have() {
+        assert_eq!(Host::<Counter>::new("counter").start().err(), Some(Error::NotDeclared));
+        let mut h = Host::<Counter>::new("counter").volume(16).setting("greeting", 1);
+        assert!(h.start().is_err());
+    }
+}

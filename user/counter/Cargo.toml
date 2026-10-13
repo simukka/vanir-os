@@ -3,9 +3,10 @@ name = "counter"
 version = "0.1.0"
 edition = "2024"
 
+# Its tests run on the host, against vanir-rt's host backend:
+#   cargo test -p counter --target x86_64-unknown-linux-gnu
 [[bin]]
 name = "counter"
-test = false
 bench = false
 
 [dependencies]
