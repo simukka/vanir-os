@@ -1,0 +1,17 @@
+[package]
+name = "vanir-rt"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+vanir-user = { path = "../lib" }
+vanir-abi = { path = "../../abi" }
+
+[features]
+# `vanir_rt::raw`: the task's raw syscalls and IPC (vanir_user), for what the runtime doesn't
+# wrap yet (RFD 9, P3). Not part of what the runtime promises.
+unstable = []

@@ -287,6 +287,7 @@ dependencies = [
 name = "http"
 version = "0.1.0"
 dependencies = [
+ "vanir-rt",
  "vanir-user",
 ]
 
@@ -650,6 +651,14 @@ dependencies = [
  "toml",
  "vanir-abi",
  "x86_64",
+]
+
+[[package]]
+name = "vanir-rt"
+version = "0.1.0"
+dependencies = [
+ "vanir-abi",
+ "vanir-user",
 ]
 
 [[package]]

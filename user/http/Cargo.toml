@@ -10,6 +10,7 @@ bench = false
 
 [dependencies]
 vanir-user = { path = "../lib" }
+vanir-rt = { path = "../rt" }
 
 [features]
 # For tests: GET /exit answers, then the task exits (with the supervisor's halt-on-exit, the run ends).

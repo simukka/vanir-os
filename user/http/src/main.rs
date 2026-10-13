@@ -37,18 +37,13 @@ use core::fmt::Write;
 use vanir_user::net::{self, CODE_CLOSED, EV_ACCEPT, EV_CLOSED, EV_DRAIN, EV_READ, EV_WRITE, Event};
 use vanir_user::telemetry::{self, DEFAULT_INTERVAL_TICKS, Record};
 use vanir_user::block::{self, BLOCK_SIZE, CODE_LOCKED};
+use vanir_rt::http::{BODY_LIMIT, HEADER_LIMIT, HEADER_TICKS, IDLE_TICKS, parse, reason};
 use vanir_user::{err, getpid, lookup, println, rdtsc, sleep, task_listen, task_name, uptime};
 
 vanir_user::entry!(main);
 
 const PORT: u16 = 80;
 const CONNECTIONS: usize = 80;
-const HEADER_LIMIT: usize = 4096;
-const BODY_LIMIT: usize = 16 * 1024;
-/// A request's header must be complete this many ticks after its first byte.
-const HEADER_TICKS: u64 = 500;
-/// A keep-alive connection idle this long between requests is closed.
-const IDLE_TICKS: u64 = 1500;
 const OUT: usize = 512;
 /// `volume-probe`: how often to try a write.
 #[cfg(feature = "volume-probe")]
@@ -172,92 +167,6 @@ fn count_cached(disk: u64, cached: &mut (Option<u64>, bool, u64)) -> Result<u64,
     let n = count_on_disk(disk)?;
     *cached = (Some(n), false, uptime() + PERSIST_TICKS);
     Ok(n)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
-fn trim(mut s: &[u8]) -> &[u8] {
-    while let [b' ' | b'\t', rest @ ..] = s {
-        s = rest;
-    }
-    while let [rest @ .., b' ' | b'\t'] = s {
-        s = rest;
-    }
-    s
-}
-
-fn parse_number(s: &[u8]) -> Option<usize> {
-    if s.is_empty() || s.len() > 18 {
-        return None;
-    }
-    s.iter().try_fold(0usize, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as usize))
-}
-
-/// What a request asks for, once its header is complete.
-struct Request<'a> {
-    method: &'a [u8],
-    path: &'a [u8],
-    keep_alive: bool,
-    content_length: Option<usize>,
-    chunked: bool,
-    /// Bytes of header, including the blank line.
-    header_len: usize,
-}
-
-fn parse(buf: &[u8]) -> Option<Result<Request<'_>, u16>> {
-    let end = find(buf, b"\r\n\r\n")? + 4;
-    let mut lines = buf[..end - 4].split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
-    let line = lines.next().unwrap_or(&[]);
-    let mut parts = line.split(|&b| b == b' ').filter(|p| !p.is_empty());
-    let (Some(method), Some(path), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
-        return Some(Err(400));
-    };
-    let mut keep_alive = version == b"HTTP/1.1";
-    if !keep_alive && version != b"HTTP/1.0" {
-        return Some(Err(505));
-    }
-    let (mut content_length, mut chunked) = (None, false);
-    for line in lines {
-        let Some(colon) = line.iter().position(|&b| b == b':') else { return Some(Err(400)) };
-        let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
-        if eq_ignore_case(name, b"connection") {
-            if eq_ignore_case(value, b"close") {
-                keep_alive = false;
-            } else if eq_ignore_case(value, b"keep-alive") {
-                keep_alive = true;
-            }
-        } else if eq_ignore_case(name, b"content-length") {
-            match parse_number(value) {
-                Some(n) => content_length = Some(n),
-                None => return Some(Err(400)),
-            }
-        } else if eq_ignore_case(name, b"transfer-encoding") {
-            chunked = true;
-        }
-    }
-    Some(Ok(Request { method, path, keep_alive, content_length, chunked, header_len: end }))
-}
-
-fn reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        413 => "Content Too Large",
-        431 => "Request Header Fields Too Large",
-        501 => "Not Implemented",
-        503 => "Service Unavailable",
-        505 => "HTTP Version Not Supported",
-        _ => "Error",
-    }
 }
 
 impl Server {
