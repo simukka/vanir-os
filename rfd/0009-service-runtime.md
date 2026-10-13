@@ -1,7 +1,7 @@
 ---
 rfd: 9
 title: A stable ABI and a runtime for writing services
-state: prediscussion
+state: discussion
 authors: simukka
 date: 2026-10-13
 labels: abi, developer-experience, deployment
@@ -22,11 +22,27 @@ This RFD proposes:
 - a **runtime crate**, `vanir-rt`: what a service author writes against (entry, lifecycle,
   typed handles for the network, the volume and telemetry, an HTTP server), on top of
   `vanir-abi`
-- **packaging**: building a service outside this repository into a signed slot image and
-  descriptor, and running it locally
+- **configuration in the signed descriptor**: settings a service reads at start
+  (`ctx.config("persist_ticks")`), so a service is configured per image rather than per build
 - an **ABI version** recorded in every image, which the kernel checks at load
 
-The proposals are drafts for discussion; nothing is decided yet.
+Building and signing services outside this repository moves to its own RFD (determination 1).
+
+## Determinations
+
+Decided in discussion (2026-10-13):
+
+1. **Packaging and outside builds move to their own RFD.** A service built outside this
+   repository needs a node to trust a slot-signing key other than the dev key, which is RFD 8's
+   question (who may deploy what). R1–R4 here work inside the repository: slot images are still
+   listed in the Makefile's `SLOT_IMAGES` and signed by `tools/sign-image.py`.
+2. **Telling the old writer that it has lost the volume is a follow-up to RFD 3**, not part of
+   this RFD. Today only the new writer is told (`block::NOTIFY_WRITER`); an instance that caches
+   what it read (the cached counter) learns it was fenced only when its next write fails. The
+   follow-up (with RFD 3's recovery after a handoff) would post the old writer a bit when a
+   higher epoch is set. The runtime will turn that bit into a `fenced` hook once it exists
+   (P3); until then a failed write is the only signal.
+3. **Configuration in the signed descriptor is in scope** (P5, was open question 7).
 
 ## Background
 
@@ -72,7 +88,7 @@ wants to deploy.
 
 ## Goals
 
-- A service can be written, built, signed and deployed without changing this repository.
+- A service can be written against `vanir-rt` alone, and configured without rebuilding it.
 - One definition of the ABI, shared by the kernel and user code, so a mismatch fails to build.
 - A service author sees only what services may use, as typed handles rather than raw ids and
   `u64` codes.
@@ -87,6 +103,7 @@ wants to deploy.
 - A general-purpose `std` port.
 - Changing what the kernel enforces: capabilities stay in the manifest and the signed
   descriptor.
+- Building, signing and trusting services outside this repository (determination 1).
 
 ## Proposals
 
@@ -109,8 +126,8 @@ but re-exports nothing from it.
 - **Records are read by size.** The caller passes its buffer size and the kernel copies
   `min(size, its own)`, returning its own size. Today `stats` refuses a smaller buffer with
   `TOO_LONG`, so an old program breaks as soon as the record grows.
-- **Images carry the version.** It goes in the slot descriptor (a new field, `abi`) or in an ELF
-  note that `sign-image.py` reads. Either way it is covered by the signature. The kernel refuses
+- **Images carry the version**, in the slot descriptor (format `VNRDSC02`, P5), so it is covered
+  by the signature. The descriptor's TOML gets `abi = "1.0"`. The kernel refuses
   an image whose major version it doesn't support, with a reason in the `rejected` event, as it
   does for a bad signature.
 - The manifest's system tasks are built with the kernel, so the check matters for slot images.
@@ -157,6 +174,16 @@ vanir_rt::service!(Counter);
   is an error, never a fault.
 - **Panics** are reported to telemetry and end the task with a code. The supervisor's crash
   policy ([RFD 7](0007-crash-policy.md)) applies as it does now.
+- **Sizes are fixed at compile time.** There is no heap, so the connection table and buffers
+  are statics, sized by associated constants of `Service` (`CONNECTIONS`, `HEADER_LIMIT`, ...)
+  with today's values as defaults. The runtime checks them against the descriptor at start
+  (e.g. `max_connections` above `CONNECTIONS` is an error, not a silent cap).
+- **Losing the volume:** the runtime calls `fenced(&mut self)` when this instance stops being
+  the writer, so a service drops what it cached. Until RFD 3's follow-up adds the bit
+  (determination 2), the runtime calls it when a volume write returns `FENCED`.
+- **An escape hatch:** `vanir_rt::raw` (behind an `unstable` feature) gives the task's raw
+  syscalls and IPC, for what the runtime doesn't wrap yet (e.g. calling another service, open
+  question 4). What services use it for shows which typed wrappers are missing.
 
 ### P4. Capabilities come from the descriptor
 
@@ -165,23 +192,43 @@ descriptor declares. `ctx.volume()` without a declared volume is `Error::NotDecl
 listening on an undeclared port can't be expressed. The kernel's checks stay as they are; this
 only makes mistakes show up early and readably.
 
-### P5. Building and packaging outside the repository
+### P5. Configuration in the signed descriptor
 
-- `vanir-rt` provides the target settings and linker script (through a `build.rs` that emits
-  the link arguments), so `cargo build --target x86_64-unknown-none` is enough.
-- `vanir-pack` (from `tools/sign-image.py sign-slot`) turns an ELF and a `Service.toml` (the
-  descriptor's fields plus `abi`) into `NAME.elf`, `NAME.desc` and `NAME.sig`. In development it
-  signs with the dev slot key; in production the signing key belongs to whoever deploys
-  ([RFD 8](0008-deployment-threats.md)).
-- **Running locally:** something like `make run-service SERVICE=path/to/NAME` boots a node with
-  the agent in script mode (as `agent/script-volume-serve` does for the load tests) and forwards
-  the service's port to the host.
-- A template repository with `counter` and `hello` as examples.
+Services are configured by cargo features today: `http/count-cached` changes every `http` in a
+build, and only someone who can edit `http` can add one. Instead, the descriptor carries
+settings, signed with the image, and the runtime hands them to the service.
+
+- **Format:** `[config]` in a slot descriptor's TOML (`tests/slots/*.toml`), with integer
+  values only for now:
+
+  ```toml
+  [config]
+  persist_ticks = 1000
+  ```
+
+- **Layout:** the 256-byte descriptor has 96 reserved bytes, not enough for the ABI version and
+  a useful number of settings. A new format, `VNRDSC02`, is 512 bytes: today's fields as they
+  are, then the ABI version (offset 160, 8 bytes), the number of settings (168, 8 bytes), and
+  up to 12 settings of a 16-byte zero-padded key and a `u64` value (176–464), the rest zero. The
+  kernel accepts both formats while any `VNRDSC01` image is in use.
+- **Reaching the service:** the kernel already copies descriptor fields to a slot's task through
+  `task_listen` (`ListenInfo`). Settings are added at the end, read by size (P2). The runtime
+  offers `ctx.config(key) -> Option<u64>`.
+- **Declared by the service:** a service lists its settings and defaults
+  (`const CONFIG: &[(&str, u64)]`). The runtime refuses to start with a setting it doesn't
+  list, so a typo in the descriptor is an error at load, not a silently ignored setting.
+- **A change of configuration is a deployment.** The descriptor's hash is in the signed
+  statement, so new settings mean a new signed version, which the agent deploys like any other
+  (drain, handoff, rollback, RFD 2). Nothing changes a running instance's settings.
+- **In this repository:** the cached counter becomes `counter` with `persist_ticks`
+  (0: write every count to the volume). The load tests boot two descriptors of one image, not
+  two builds.
 
 ### P6. Porting what exists
 
 - Move `count-cached` and the volume counter out of `http` into an example service, `counter`
-  (both modes), and keep `http` as the plain web server for the RFD 1 and 2 tests.
+  (both modes, chosen by `persist_ticks`, P5), and keep `http` as the plain web server for the
+  RFD 1 and 2 tests.
 - Keep the load tests: `counter-load` and `counter-cached-load` should give the same numbers
   through the runtime, within noise. The runtime's overhead is part of what they measure.
 
@@ -189,31 +236,35 @@ only makes mistakes show up early and readably.
 
 1. **R1:** `vanir-abi`, with the kernel and `user/lib` both using it. No change in behaviour;
    the full suite passes.
-2. **R2:** records read by size (P2), `ABI_VERSION`, and the `abi` field checked at load.
-3. **R3:** `vanir-rt` with HTTP. Port `counter` to it and compare the load tests.
-4. **R4:** `vanir-pack`, the template, and a service built outside the repository and deployed
-   through the mock control plane.
+2. **R2:** records read by size (P2), `ABI_VERSION`, descriptor format `VNRDSC02` with the ABI
+   version and settings (P5), checked at load; settings reach the task through `task_listen`.
+3. **R3:** `vanir-rt` with HTTP, `config` and the `fenced` hook (on a failed write until RFD 3's
+   follow-up). Port `counter` to it, with `persist_ticks`, and compare the load tests.
+4. **R4:** `make run-service` (a node with the agent in script mode, the service's port
+   forwarded), and the host test backend if open question 5 says so.
 
 ## Open questions
 
 1. **Names:** `vanir-rt` or `vanir-os-runtime`; and whether `vanir-sys` keeps the `vanir_user`
-   name to keep the change small.
-2. **What is promised:** only `vanir-abi`, or `vanir-rt`'s API too? Until RFDs 1 to 3 settle,
-   promising only the ABI leaves the runtime free to change.
+   name to keep the change small. (Leaning: keep `vanir_user` through R1, rename after; use
+   `vanir-rt`.)
+2. **What is promised:** only `vanir-abi`, or `vanir-rt`'s API too? (Leaning: only `vanir-abi`
+   until a second, different service has used the runtime.)
 3. **A trait or async?** A callback trait fits a single-threaded event loop and needs no heap. A
    small `no_std` executor would read more naturally for services that call other services, but
-   costs complexity.
-4. **Calling other services:** should the runtime wrap IPC to other tasks (allowed by
-   `sends`) as typed clients, or leave raw `send`/`recv` for now?
-5. **Testing on the host:** a host backend for `vanir-rt` (net and volume faked in memory)
-   would let service authors unit-test with `cargo test`. Is that worth keeping two backends?
-6. **Where the version lives:** in the descriptor (simple, already signed) or in an ELF note
-   (travels with the binary)?
-7. **Configuration:** services are configured by cargo feature today. Should the descriptor
-   carry key-value settings the runtime exposes (`ctx.config("persist_seconds")`), signed with
-   the image?
-8. **Third-party signing:** who may sign slot images for a node, and is the dev slot key ever
-   acceptable outside tests?
+   costs complexity. (Leaning: a trait.)
+4. **Calling other services:** typed clients for IPC to other tasks (allowed by `sends`), or
+   `vanir_rt::raw` until there is a second protocol to wrap? (Leaning: `raw` for now.)
+5. **Testing on the host:** a host backend for `vanir-rt` would let service authors unit-test
+   with `cargo test`. Is that worth a second backend? (Leaning: a small one: a volume faked in
+   memory, `request()` called directly, no network.)
+6. **Where the version lives:** settled by P5 unless we object: the descriptor (`VNRDSC02`),
+   not an ELF note, since the kernel already parses and verifies the descriptor.
+7. **Settings beyond integers:** strings (e.g. a name to greet) need more room than 8 bytes. Add
+   a string area to `VNRDSC02` now, or wait for a service that needs one?
+8. **Does the kernel use `vanir-abi`?** It removes the duplication, at the cost of the kernel
+   depending on a crate user code also uses. (Leaning: yes, as long as `vanir-abi` stays
+   constants and types only.)
 
 ## References
 
@@ -221,6 +272,7 @@ only makes mistakes show up early and readably.
 - [RFD 2](0002-deployment.md): slots, descriptors, signing, the agent.
 - [RFD 3](0003-service-volumes.md): volumes, writers, the writer bit.
 - [RFD 7](0007-crash-policy.md): what happens when a service crashes.
-- [RFD 8](0008-deployment-threats.md): who may deploy what.
+- [RFD 8](0008-deployment-threats.md): who may deploy what; where packaging and outside builds
+  go (determination 1).
 - `user/lib/src/lib.rs`, `kernel/src/syscall.rs`, `kernel/src/verify.rs`,
   `tools/sign-image.py`, `tests/slots/`.
