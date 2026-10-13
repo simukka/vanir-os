@@ -1663,6 +1663,20 @@ handoff off, and the control plane gives node a a new epoch)</figcaption>
 r8, r9</code>; results in <code>rax</code> (then <code>rdx</code>, <code>rsi</code>). Simple
 calls return <code>u64::MAX</code> on error; IPC calls return the IPC error codes.</p>
 
+<p>The numbers, error codes, notifications, flags, task states and the records the kernel
+writes into a task (<code>Stats</code>, <code>ListenInfo</code>, <code>Event</code>,
+<code>DeathRecord</code>) are defined once, in the <code>vanir-abi</code> crate
+(<code>abi/src/lib.rs</code>, RFD 9), which the kernel and <code>vanir_user</code> both use. It
+also holds the IPC protocols between tasks (<code>vanir_abi::proto</code>: <code>block</code>,
+<code>net</code>, <code>nic</code>, <code>console</code>, <code>telemetry</code>,
+<code>supervisor</code>, <code>attest</code>, <code>keys</code>), which the kernel doesn't read.
+<code>vanir_user</code> re-exports all of it under the paths programs use
+(<code>vanir_user::err</code>, <code>vanir_user::block::OP_READ</code>, ...). The crate is data
+only: constants, <code>#[repr(C)]</code> records, and safe functions that read them (accessors,
+names of codes); no syscalls, no <code>unsafe</code>, no dependencies. The host check
+<code>abi-snapshot</code> (<code>abi/tests/snapshot.rs</code>) pins every value and every
+record's size and field offsets, so a change shows up there before it shows up in a boot.</p>
+
 <table>
 <tr><th>Syscall</th><th>No.</th><th>Notes</th></tr>
 <tr><td><code>write(ptr, len)</code></td><td>1</td><td>to the serial port; bad pointers return an error</td></tr>
@@ -1836,12 +1850,13 @@ repository root.</p>
 <h4>Where to change what</h4>
 <table>
 <tr><th>To change&hellip;</th><th>Edit</th><th>Then check</th></tr>
-<tr><td>a syscall</td><td><code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td>docs table <a href="#syscalls">16</a></td></tr>
+<tr><td>a syscall</td><td>number in <code>abi/src/lib.rs</code> (<code>sys</code>), dispatch in <code>kernel/src/syscall.rs</code>, handler in <code>kernel/src/process.rs</code>, wrapper in <code>user/lib/src/lib.rs</code></td><td><code>abi-snapshot</code>, docs table <a href="#syscalls">16</a></td></tr>
+<tr><td>an ABI value or record (error code, flag, task state, <code>Stats</code>, ...) or an IPC protocol's ops and codes</td><td><code>abi/src/lib.rs</code> only; the kernel and <code>vanir_user</code> pick it up</td><td><code>abi-snapshot</code> (update <code>abi/tests/snapshot.rs</code> in the same commit, on purpose)</td></tr>
 <tr><td>scheduling, budgets, IPC, restarts</td><td><code>kernel/src/process.rs</code></td><td><code>ONLY='^(ipc|supervisor|restart|stale|sleep|cpu|preemption)'</code></td></tr>
 <tr><td>page tables, frames</td><td><code>kernel/src/memory.rs</code></td><td><code>no-leak</code>, <code>restart-no-leak</code>, <code>address-spaces</code></td></tr>
 <tr><td>a manifest key</td><td><code>kernel/build.rs</code>, <code>Task</code> in <code>kernel/src/process.rs</code></td><td><code>apps/README.md</code>, docs <a href="#manifests">7</a></td></tr>
 <tr><td>a device kind</td><td><code>kernel/src/pci_kinds.rs</code>, QEMU flags in <code>Makefile</code></td><td><code>device-*</code></td></tr>
-<tr><td>a kernel event</td><td><code>kernel/src/events.rs</code>, <code>user/lib</code> <code>events</code>, <code>user/telemetry</code> <code>event_line</code></td><td><code>telemetry*</code></td></tr>
+<tr><td>a kernel event</td><td>kind in <code>abi/src/lib.rs</code> (<code>events</code>), logged from the kernel (<code>events::log</code>), <code>user/telemetry</code> <code>event_line</code></td><td><code>abi-snapshot</code>, <code>telemetry*</code></td></tr>
 <tr><td>supervisor policy</td><td><code>user/supervisor/src/main.rs</code></td><td><code>supervisor-*</code>, <code>*-restart</code></td></tr>
 <tr><td>image signing</td><td><code>tools/sign-image.py</code>, <code>kernel/src/verify.rs</code></td><td><code>sig-*</code></td></tr>
 <tr><td>measurements</td><td><code>kernel/src/measure.rs</code>, <code>tools/expected-pcrs.py</code> (keep in sync)</td><td><code>measured-*</code>, <code>attest-*</code></td></tr>
@@ -1902,7 +1917,8 @@ node's telemetry lands in <code>build/cp-telemetry.log</code>),
 <code>SLOW=1</code> (skipped with <code>SLOW=0 make test</code>), <code>BENCH=1</code> (a load
 test: run only with <code>tests/run.sh --bench</code> or <code>BENCH=1</code>). A <code>BUILD_FAILS</code> list
 before the cases names manifests that must not build, with the error they must give, and
-<code>HOST_CHECKS</code> runs commands on the host alone (the Noise test vectors).</p>
+<code>HOST_CHECKS</code> runs commands on the host alone (the Noise test vectors, and
+<code>abi-snapshot</code>: the ABI's values and layouts).</p>
 
 <h4>Load tests</h4>
 <p>Load tests are skipped unless asked for, since they take a minute and report numbers rather
@@ -1961,7 +1977,7 @@ and must succeed.</p>
 
 <h2 id="tests"><span class="num">21</span>Test catalogue<a class="anchor" href="#tests">#</a></h2>
 
-<p>138 cases (and two load tests with <code>--bench</code>), one build check and one host check, run in this order. Order matters: later cases reuse the disk image, TPM state and
+<p>138 cases (and two load tests with <code>--bench</code>), one build check and two host checks (<code>noise-vectors</code>, <code>abi-snapshot</code>), run in this order. Order matters: later cases reuse the disk image, TPM state and
 attestation references earlier ones leave behind.</p>
 <table>
 <tr><th>Area</th><th>Cases</th><th>Needs</th></tr>
@@ -2014,7 +2030,8 @@ kernel/src/verify.rs      Ed25519 task image signatures; slot images and their d
 kernel/src/tpm.rs         TPM 2.0 (CRB): PCR extend/read
 kernel/src/measure.rs     measured boot into PCR 12; run-time log and PCR 13; the TPM lock
 kernel/src/syscall.rs     int 0x80 dispatch
-user/lib/                 shared runtime: entry!, syscall wrappers, println!, block/keys/telemetry protocols
+abi/                      vanir-abi: the ABI and IPC protocols, defined once (kernel and user); tests/snapshot.rs pins them
+user/lib/                 shared runtime (vanir_user): entry!, syscall wrappers, println!, protocol clients; re-exports vanir-abi
 user/hello/               greeting plus the attack tests (features)
 user/spinner/ isolation/ runaway/ sleeper/     scheduling and isolation tests
 user/echo/ client/ deadlock/                   IPC server, client, deadlock
@@ -2103,13 +2120,16 @@ fn main() -&gt; u64 {
 
 <h3 id="recipe-syscall"><span class="num">23.3</span>Add a syscall<a class="anchor" href="#recipe-syscall">#</a></h3>
 <ol>
-  <li>Pick an unused number; add <code>SYS_&lt;NAME&gt;</code> to <code>kernel/src/syscall.rs</code>
-    and a <code>dispatch</code> arm.</li>
+  <li>Pick an unused number; add <code>SYS_&lt;NAME&gt;</code> to <code>vanir_abi::sys</code>
+    (<code>abi/src/lib.rs</code>) and to <code>abi/tests/snapshot.rs</code>, and a
+    <code>dispatch</code> arm in <code>kernel/src/syscall.rs</code>.</li>
   <li>Implement the handler (in <code>kernel/src/process.rs</code> if it touches the task table).
     Read arguments from the <code>TrapFrame</code>; write results to <code>rax</code>/<code>rdx</code>/<code>rsi</code>.
     Validate every user pointer with the address space's <code>check_range</code> and copy through
     <code>usercopy</code>. Never block inside the handler: mark the task blocked and switch.</li>
-  <li>Add the same constant and a wrapper to <code>user/lib/src/lib.rs</code>.</li>
+  <li>Add a wrapper to <code>user/lib/src/lib.rs</code> (the constant is already there, through
+    <code>vanir-abi</code>). A record the call fills goes in <code>vanir-abi</code> too, with its
+    layout in the snapshot.</li>
   <li>Restrict privileged calls to the right task (as <code>restart</code> is supervisor-only)
     and return <code>NOT_ALLOWED</code> otherwise.</li>
   <li>Document it in <a href="#syscalls">16</a>.</li>
@@ -2117,11 +2137,11 @@ fn main() -&gt; u64 {
 
 <h3 id="recipe-event"><span class="num">23.4</span>Add a kernel or storage event<a class="anchor" href="#recipe-event">#</a></h3>
 <ol>
-  <li>Kernel event: a constant in <code>kernel/src/events.rs</code> (document what
-    <code>a</code>, <code>b</code>, <code>c</code> hold), <code>events::log(...)</code> at the
-    control point, the same constant in <code>user/lib</code> <code>events</code>, and a format
-    arm in <code>event_line</code> in <code>user/telemetry</code>.</li>
-  <li>Storage event: a kind constant in <code>user/lib</code> <code>telemetry</code>, a format
+  <li>Kernel event: a constant in <code>vanir_abi::events</code> (document what
+    <code>a</code>, <code>b</code>, <code>c</code> hold; add it to the snapshot),
+    <code>events::log(...)</code> at the control point in the kernel, and a format arm in
+    <code>event_line</code> in <code>user/telemetry</code>.</li>
+  <li>Storage event: a kind constant in <code>vanir_abi::proto::telemetry</code>, a format
     arm in <code>storage_line</code>, and <code>self.event(kind, block, name)</code> in
     <code>user/storage</code>.</li>
   <li>Check it with <code>tools/host-agent.py - --quiet --check --expect &lt;event&gt;=1</code>
@@ -2154,6 +2174,10 @@ fn main() -&gt; u64 {
 <ol>
   <li><strong>Every commit passes the full suite under both TCG and KVM.</strong></li>
   <li><strong>Stable Rust only.</strong> No nightly features or <code>-Z</code> flags.</li>
+  <li><strong>The ABI is defined once,</strong> in <code>vanir-abi</code>. The kernel and user
+    code never define their own copy of a syscall number, code, flag or shared record, and
+    <code>vanir-abi</code> stays data only (no syscalls, no <code>unsafe</code>, no
+    dependencies).</li>
   <li><strong>The kernel never blocks mid-syscall.</strong> Waiting means saving registers,
     marking the task blocked, and writing results into its saved frame later.</li>
   <li><strong>User pointers are untrusted.</strong> Range-checked and copied with fault recovery

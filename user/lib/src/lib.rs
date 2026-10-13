@@ -3,6 +3,10 @@
 //!
 //! A program provides its entry with `vanir_user::entry!(main)`, where `main() -> u64` returns the
 //! exit code.
+//!
+//! The ABI itself (syscall numbers, error codes, flags, shared records, and each IPC protocol's
+//! ops and codes) is defined in `vanir-abi` (`abi/src/lib.rs`), shared with the kernel, and
+//! re-exported here under the paths programs use. Add or change a value there, not here.
 
 #![no_std]
 

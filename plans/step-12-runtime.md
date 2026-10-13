@@ -1,6 +1,6 @@
 # Step 12 plan: a stable ABI and a service runtime (RFD 9)
 
-Status: R1 planned, not implemented.
+Status: R1 implemented (R1a–R1c).
 
 ## R1: one definition of the ABI (RFD 9, P1)
 
@@ -116,3 +116,39 @@ that, R1 removes only the user side's half of the duplication, and isn't worth d
 - **Host build of `vanir-abi` differs from the target build.** Both are `x86_64`, `repr(C)`
   with fixed-width fields, so layouts match; the snapshot runs on the host, and the kernel's
   `const` assertions (`size_of::<Stats>()` etc.) run on the target.
+
+### As built
+
+Where it departs from the plan:
+
+- **The snapshot's values were generated, not copied by hand.** A script read every
+  `pub const` from both copies (the kernel's and `vanir_user`'s, before the move) and evaluated
+  them: the 60 names defined on both sides agreed. Codes the kernel had only as numbers in its
+  code (task states in `state_code`, death kinds in `report_death`, `task_listen`'s flag bits,
+  `verify::Rejection`) were read from those functions. Record layouts came from compiling both
+  copies of each record on the host and printing every field's offset: the kernel's four
+  records matched `vanir_user`'s field for field.
+- **A third copy:** the kernel's `Rejection::describe` repeated `vanir_user`'s rejection
+  names. It now calls `vanir_abi::events::rejection`, and the kernel checks each `Rejection`
+  variant against `REJECT_*` at compile time.
+- **New names for numbers that had none:** `task::STATE_*`, `task::DEATH_*`, `listen::ROUTES`
+  (and `CONNECTS`, `SLOT`, `LOADS`), `events::REJECT_*`, `task::MEASUREMENT_ENTRY_LEN`,
+  `Stats::ZERO`. The kernel uses them; programs that compared against literals (e.g. the
+  supervisor's death kinds) still do, and still work.
+- **`DeathRecord::from_bytes`** reads its fields with `u64::from_le_bytes` instead of
+  `read_unaligned`, since the crate forbids `unsafe`.
+- **Records' sizes are also checked at compile time** in `vanir-abi` itself, so the target
+  build (kernel and tasks) fails if one changes, not only the host test.
+- **R1b moved code names and `block::op`/`split` with the constants** (they only read them).
+  `telemetry::Record` stayed in `vanir_user`: it is a builder, not a record (the first try of
+  the move script took it, and the scratch build caught it). Client functions stayed, each
+  protocol module re-exporting `vanir_abi::proto::<name>::*`.
+- **Results:** `abi-snapshot` pins 201 values, 13 names and 56 layout entries. No file under
+  `user/` outside `user/lib` changed. Full suite after R1a and again after R1b: 152 passed (the
+  two load tests skipped, as without `--bench`).
+- **`counter-load` after R1b** (KVM, 60 s): 1695 requests/s at 8 clients, against 1687 before
+  R1; 97,430 counts with none lost or repeated. Within noise, as expected: nothing on the
+  request path changed.
+- **RFD 9's open question 8** (the kernel uses `vanir-abi`) is what R1 assumed; it stays open in
+  the RFD until the discussion settles it.
+
